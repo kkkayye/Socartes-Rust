@@ -768,6 +768,86 @@ Index version notes for planner executor critic retrieval.\r\n\
 }
 
 #[tokio::test]
+async fn knowledge_upload_rejects_kb_that_needs_reindex_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESUPLOADREINDEXBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+stale-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+Original stale course material.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let config_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/knowledge/stale-course/config")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"needs_reindex": true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config_response.status(), http::StatusCode::OK);
+
+    let upload_boundary = "SOCARTESUPLOADBOUNDARY";
+    let upload_body = format!(
+        "--{upload_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"extra.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+New material should wait for reindex.\r\n\
+--{upload_boundary}--\r\n"
+    );
+    let upload_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/stale-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={upload_boundary}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), http::StatusCode::CONFLICT);
+    assert!(
+        json_response(upload_response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("needs reindex")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn chat_uses_selected_uploaded_course_files_as_rag_sources() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

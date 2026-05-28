@@ -1322,6 +1322,13 @@ async fn upload_knowledge_files(
     Path(name): Path<String>,
     multipart: Multipart,
 ) -> impl IntoResponse {
+    if knowledge_needs_reindex_for_upload(&state, &name) {
+        return api_error(
+            StatusCode::CONFLICT,
+            &format!("Knowledge base '{name}' needs reindex before uploading new files"),
+        )
+        .into_response();
+    }
     match save_knowledge_base_from_multipart(&state, multipart, Some(name)).await {
         Ok((name, task_id)) => Json(json!({
             "task_id": task_id,
@@ -1330,6 +1337,15 @@ async fn upload_knowledge_files(
         .into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn knowledge_needs_reindex_for_upload(state: &AppState, name: &str) -> bool {
+    merged_knowledge_config(state, name)["needs_reindex"]
+        .as_bool()
+        .unwrap_or(false)
+        || read_knowledge_metadata(state, name)
+            .and_then(|metadata| metadata["needs_reindex"].as_bool())
+            .unwrap_or(false)
 }
 
 async fn set_default_knowledge_base(
