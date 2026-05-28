@@ -385,6 +385,108 @@ planner executor critic notes\r\n\
 }
 
 #[tokio::test]
+async fn chat_uses_selected_uploaded_course_files_as_rag_sources() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESCHATBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+plot-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"rag_provider\"\r\n\r\n\
+llamaindex\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"plot-notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The lantern school rule says students must recite the blue theorem before opening the archive.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "What must students recite before opening the archive?",
+        "language": "en",
+        "tools": ["rag"],
+        "knowledge_bases": ["plot-course"],
+        "llm_selection": {
+            "profile_id": "socartes-rust",
+            "model_id": "deterministic-agent-loop"
+        }
+    });
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_result = json_response(chat_response).await;
+    let session_id = chat_result["session_id"].as_str().unwrap();
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    let sources_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("sources event");
+    let sources = sources_event["metadata"]["sources"].as_array().unwrap();
+
+    assert!(sources.iter().any(|source| {
+        source["source_id"] == "plot-course/plot-notes.md"
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("blue theorem"))
+    }));
+    let assistant_content = assistant["content"].as_str().unwrap();
+    assert!(assistant_content.contains("plot-course/plot-notes.md"));
+    assert!(assistant_content.contains("blue theorem"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn chat_sessions_are_persisted_and_manageable() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

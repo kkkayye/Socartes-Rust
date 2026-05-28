@@ -205,8 +205,16 @@ impl SocartesOrchestrator {
     }
 
     pub fn run(&self, goal: &str, learner_context: &str) -> StudyTrace {
+        self.run_with_retrieved_context(goal, learner_context, retrieve(goal))
+    }
+
+    pub fn run_with_retrieved_context(
+        &self,
+        goal: &str,
+        learner_context: &str,
+        retrieved_context: Vec<RetrievalChunk>,
+    ) -> StudyTrace {
         let plan = self.plan();
-        let retrieved_context = retrieve(goal);
         let tool_results = default_tool_results(goal);
         let draft = draft_answer(goal, learner_context, &retrieved_context, &tool_results);
         let review = review_draft(&draft);
@@ -2950,7 +2958,13 @@ fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<
         .as_str()
         .map(|language| format!("Frontend language: {language}"))
         .unwrap_or_default();
-    let trace = SocartesOrchestrator::new().run(content, &learner_context);
+    let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
+    let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases);
+    let trace = SocartesOrchestrator::new().run_with_retrieved_context(
+        content,
+        &learner_context,
+        retrieved_context,
+    );
     let ids = StreamIds::new(&session_id, &turn_id);
 
     let events = vec![
@@ -3474,6 +3488,119 @@ fn retrieve(goal: &str) -> Vec<RetrievalChunk> {
     matches
 }
 
+fn retrieve_chat_context(
+    state: &AppState,
+    goal: &str,
+    selected_knowledge_bases: &[String],
+) -> Vec<RetrievalChunk> {
+    if selected_knowledge_bases.is_empty() {
+        return retrieve(goal);
+    }
+
+    let mut chunks = Vec::new();
+    for name in selected_knowledge_bases {
+        if name == BUILTIN_KNOWLEDGE_BASE {
+            chunks.extend(retrieve(goal));
+        } else {
+            chunks.extend(retrieve_uploaded_knowledge_base(state, goal, name));
+        }
+    }
+
+    if chunks.is_empty() {
+        return retrieve(goal);
+    }
+
+    dedupe_chunks(chunks).into_iter().take(4).collect()
+}
+
+fn retrieve_uploaded_knowledge_base(
+    state: &AppState,
+    goal: &str,
+    name: &str,
+) -> Vec<RetrievalChunk> {
+    if !knowledge_base_exists(state, name) {
+        return Vec::new();
+    }
+
+    let query_terms = tokenize(goal);
+    let mut scored = Vec::new();
+    let Ok(entries) = fs::read_dir(knowledge_files_dir(state, name)) else {
+        return Vec::new();
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if !is_supported_knowledge_file(&filename) {
+            continue;
+        }
+
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let excerpt = compact_excerpt(&text, 900);
+        if excerpt.is_empty() {
+            continue;
+        }
+
+        let score = query_terms.intersection(&tokenize(&excerpt)).count();
+        scored.push((
+            score,
+            RetrievalChunk {
+                source_id: format!("{name}/{filename}"),
+                title: format!("{name} / {filename}"),
+                content: excerpt,
+                confidence: confidence_for_score(score).to_string(),
+            },
+        ));
+    }
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.source_id.cmp(&right.1.source_id))
+    });
+    scored.into_iter().take(3).map(|(_, chunk)| chunk).collect()
+}
+
+fn dedupe_chunks(chunks: Vec<RetrievalChunk>) -> Vec<RetrievalChunk> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+
+    for chunk in chunks {
+        if seen.insert(chunk.source_id.clone()) {
+            deduped.push(chunk);
+        }
+    }
+
+    deduped
+}
+
+fn compact_excerpt(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut excerpt = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
+fn confidence_for_score(score: usize) -> &'static str {
+    match score {
+        0 => "low",
+        1 => "medium",
+        _ => "high",
+    }
+}
+
 fn knowledge_base() -> Vec<RetrievalChunk> {
     vec![
         RetrievalChunk {
@@ -3539,6 +3666,12 @@ fn draft_answer(
     } else {
         format!(" Learner context: {learner_context}")
     };
+    let evidence_clause = chunks.first().map_or_else(String::new, |chunk| {
+        format!(
+            " The strongest retrieved course note says: {}",
+            chunk.content
+        )
+    });
 
     DraftAnswer {
         agent: "executor".to_string(),
@@ -3548,10 +3681,11 @@ fn draft_answer(
              evidence, the Executor combines that evidence with MCP-style tool \
              outputs, and the Critic checks whether the answer is cited and \
              complete. RAG evidence comes from {}, while MCP tool use is \
-             represented by {}.{}",
+             represented by {}.{}{}",
             citations.join(", "),
             tool_names.join(", "),
-            context_clause
+            context_clause,
+            evidence_clause
         ),
         citations,
         tool_results_used: tool_names,
