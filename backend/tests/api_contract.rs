@@ -659,6 +659,115 @@ planner executor critic notes\r\n\
 }
 
 #[tokio::test]
+async fn knowledge_reindex_creates_signature_version_and_reports_active_match() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESINDEXBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+index-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+Index version notes for planner executor critic retrieval.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/index-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let signature = reindex["signature"].as_str().expect("signature");
+    assert_eq!(signature.len(), 16);
+    assert_eq!(reindex["noop"], false);
+    assert!(
+        reindex["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("task-reindex-")
+    );
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    let course = list["knowledge_bases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|kb| kb["name"] == "index-course")
+        .expect("index-course");
+    let stats = &course["statistics"];
+    assert_eq!(stats["rag_initialized"], true);
+    assert_eq!(stats["needs_reindex"], false);
+    assert_eq!(stats["active_match"], true);
+    assert_eq!(stats["active_signature"], signature);
+    let version = &stats["index_versions"][0];
+    assert_eq!(version["version"], "version-1");
+    assert_eq!(version["signature"], signature);
+    assert_eq!(version["layout"], "flat");
+    assert_eq!(version["binding"], "rust-local");
+    assert_eq!(version["model"], "deterministic-agent-loop");
+    assert_eq!(version["dimension"], 0);
+    assert_eq!(version["base_url"], "local://socartes-rust");
+    assert_eq!(version["api_version"], "");
+    assert_eq!(version["ready"], true);
+
+    let noop_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/index-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(noop_response.status(), http::StatusCode::OK);
+    let noop = json_response(noop_response).await;
+    assert_eq!(noop["signature"], signature);
+    assert_eq!(noop["task_id"], Value::Null);
+    assert_eq!(noop["noop"], true);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn chat_uses_selected_uploaded_course_files_as_rag_sources() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

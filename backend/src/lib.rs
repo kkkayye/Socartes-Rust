@@ -20,6 +20,7 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -28,6 +29,11 @@ pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
 const MIN_RETRIEVAL_SCORE: usize = 2;
 const BUILTIN_KNOWLEDGE_BASE: &str = "socartes-rust-rag";
 const DEFAULT_RAG_PROVIDER: &str = "llamaindex";
+const RUST_EMBEDDING_BINDING: &str = "rust-local";
+const RUST_EMBEDDING_MODEL: &str = "deterministic-agent-loop";
+const RUST_EMBEDDING_DIMENSION: i64 = 0;
+const RUST_EMBEDDING_BASE_URL: &str = "local://socartes-rust";
+const RUST_EMBEDDING_API_VERSION: &str = "";
 const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] =
     &[".txt", ".md", ".markdown", ".pdf", ".json", ".csv"];
 const DEFAULT_SKILL_TAGS: &[&str] = &["style", "tool"];
@@ -1357,15 +1363,48 @@ async fn reindex_knowledge_base(
     if !knowledge_base_exists(&state, &name) {
         return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
     }
+    let signature = active_knowledge_signature();
+    let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
+    let versions = knowledge_index_versions(&knowledge_base_dir(&state, &name), &metadata);
+    if find_active_index_version(&versions)
+        .filter(|version| version["layout"].as_str() == Some("flat"))
+        .is_some()
+    {
+        return Json(json!({
+            "task_id": Value::Null,
+            "signature": signature,
+            "noop": true,
+            "message": format!(
+                "Knowledge base '{name}' already has an index for the active embedding configuration; no reindex needed."
+            )
+        }))
+        .into_response();
+    }
     let task_id = format!("task-reindex-{}", unique_id());
+    let version = match write_active_knowledge_index_version(&state, &name, &versions) {
+        Ok(version) => version,
+        Err(error) => return error.into_response(),
+    };
+    let updated_versions = {
+        let mut values = versions;
+        values.push(version);
+        values
+    };
     let metadata = json!({
         "last_indexed_at": now_seconds(),
-        "last_indexed_action": "reindex"
+        "last_indexed_action": "reindex",
+        "last_indexed_count": knowledge_files(&state, &name).unwrap_or_default().len(),
+        "embedding_signature": signature.clone(),
+        "index_versions": updated_versions,
+        "needs_reindex": false,
+        "embedding_mismatch": false
     });
     let _ = write_knowledge_metadata(&state, &name, DEFAULT_RAG_PROVIDER, Some(metadata));
     Json(json!({
         "task_id": task_id,
-        "message": format!("Re-index started for {name}")
+        "signature": signature,
+        "noop": false,
+        "message": format!("Re-indexing '{name}' in the background.")
     }))
     .into_response()
 }
@@ -5731,13 +5770,32 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
         json!({
             "created_at": now_label(),
             "last_updated": now_label(),
-            "rag_provider": DEFAULT_RAG_PROVIDER
+            "rag_provider": DEFAULT_RAG_PROVIDER,
+            "needs_reindex": true
         })
     });
+    let index_versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
+    let active_signature = active_knowledge_signature();
+    let active_match = index_versions.iter().any(|version| {
+        version["signature"].as_str() == Some(active_signature.as_str())
+            && version["ready"].as_bool().unwrap_or(false)
+    });
+    let rag_initialized = index_versions
+        .iter()
+        .any(|version| version["ready"].as_bool().unwrap_or(false));
+    let needs_reindex =
+        metadata["needs_reindex"].as_bool().unwrap_or(!active_match) && !active_match;
+    let status = if needs_reindex {
+        "needs_reindex"
+    } else if rag_initialized {
+        "ready"
+    } else {
+        "unknown"
+    };
     json!({
         "name": name,
         "is_default": default_name == name,
-        "status": "ready",
+        "status": status,
         "path": knowledge_base_dir(state, name).to_string_lossy(),
         "metadata": metadata,
         "statistics": {
@@ -5745,24 +5803,160 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
             "images": 0,
             "content_lists": 0,
             "rag_provider": metadata["rag_provider"].as_str().unwrap_or(DEFAULT_RAG_PROVIDER),
-            "rag_initialized": true,
-            "needs_reindex": false,
-            "status": "ready",
-            "active_match": true,
-            "index_versions": [
-                {
-                    "signature": format!("socartes-rust-{name}"),
-                    "model": "deterministic-agent-loop",
-                    "dimension": 0,
-                    "binding": "local-files",
-                    "created_at": metadata["created_at"].as_str().unwrap_or("local"),
-                    "ready": true,
-                    "legacy": false
-                }
-            ],
-            "active_signature": format!("socartes-rust-{name}")
+            "rag_initialized": rag_initialized,
+            "needs_reindex": needs_reindex,
+            "status": status,
+            "active_match": active_match,
+            "index_versions": index_versions,
+            "active_signature": active_signature
         }
     })
+}
+
+fn active_knowledge_signature() -> String {
+    let canonical = json!({
+        "api_version": RUST_EMBEDDING_API_VERSION,
+        "base_url": RUST_EMBEDDING_BASE_URL,
+        "binding": RUST_EMBEDDING_BINDING,
+        "dimension": RUST_EMBEDDING_DIMENSION,
+        "model": RUST_EMBEDDING_MODEL
+    });
+    let serialized = serde_json::to_string(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(serialized.as_bytes());
+    format!("{digest:x}").chars().take(16).collect()
+}
+
+fn knowledge_index_versions(kb_dir: &FsPath, metadata: &Value) -> Vec<Value> {
+    let mut versions = Vec::new();
+    if let Ok(entries) = fs::read_dir(kb_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(version_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !version_name.starts_with("version-") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(path.join("meta.json")) else {
+                continue;
+            };
+            let Ok(mut version) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            version["version"] = json!(
+                version["version"]
+                    .as_str()
+                    .unwrap_or(version_name)
+                    .to_string()
+            );
+            version["layout"] = json!(version["layout"].as_str().unwrap_or("flat"));
+            version["ready"] = json!(version["ready"].as_bool().unwrap_or(true));
+            version["legacy"] = json!(version["legacy"].as_bool().unwrap_or(false));
+            version["storage_path"] = json!(path.to_string_lossy());
+            version["version_path"] = json!(path.to_string_lossy());
+            versions.push(version);
+        }
+    }
+    versions.sort_by(|left, right| {
+        version_number(left)
+            .cmp(&version_number(right))
+            .then_with(|| left["signature"].as_str().cmp(&right["signature"].as_str()))
+    });
+    if versions.is_empty() {
+        metadata["index_versions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        versions
+    }
+}
+
+fn version_number(version: &Value) -> usize {
+    version["version"]
+        .as_str()
+        .and_then(|value| value.strip_prefix("version-"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default()
+}
+
+fn find_active_index_version(versions: &[Value]) -> Option<&Value> {
+    let signature = active_knowledge_signature();
+    versions.iter().find(|version| {
+        version["signature"].as_str() == Some(signature.as_str())
+            && version["ready"].as_bool().unwrap_or(false)
+    })
+}
+
+fn next_knowledge_version_name(versions: &[Value]) -> String {
+    let next = versions
+        .iter()
+        .filter_map(|version| version["version"].as_str())
+        .filter_map(|version| version.strip_prefix("version-"))
+        .filter_map(|suffix| suffix.parse::<usize>().ok())
+        .max()
+        .unwrap_or_default()
+        + 1;
+    format!("version-{next}")
+}
+
+fn build_active_index_version(versions: &[Value]) -> Value {
+    json!({
+        "version": next_knowledge_version_name(versions),
+        "signature": active_knowledge_signature(),
+        "binding": RUST_EMBEDDING_BINDING,
+        "model": RUST_EMBEDDING_MODEL,
+        "dimension": RUST_EMBEDDING_DIMENSION,
+        "base_url": RUST_EMBEDDING_BASE_URL,
+        "api_version": RUST_EMBEDDING_API_VERSION,
+        "layout": "flat",
+        "created_at": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "ready": true,
+        "legacy": false
+    })
+}
+
+fn write_active_knowledge_index_version(
+    state: &AppState,
+    name: &str,
+    versions: &[Value],
+) -> Result<Value, ApiError> {
+    let mut version = build_active_index_version(versions);
+    let version_name = version["version"]
+        .as_str()
+        .unwrap_or("version-1")
+        .to_string();
+    let version_dir = knowledge_base_dir(state, name).join(&version_name);
+    fs::create_dir_all(&version_dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create index version directory: {error}"),
+        )
+    })?;
+    version["storage_path"] = json!(version_dir.to_string_lossy());
+    version["version_path"] = json!(version_dir.to_string_lossy());
+    fs::write(version_dir.join("docstore.json"), "{}").map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write index version sentinel: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(&version).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize index version metadata: {error}"),
+        )
+    })?;
+    fs::write(version_dir.join("meta.json"), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write index version metadata: {error}"),
+        )
+    })?;
+    Ok(version)
 }
 
 fn read_knowledge_metadata(state: &AppState, name: &str) -> Option<Value> {
@@ -5773,7 +5967,7 @@ fn read_knowledge_metadata(state: &AppState, name: &str) -> Option<Value> {
 fn write_knowledge_metadata(
     state: &AppState,
     name: &str,
-    provider: &str,
+    _provider: &str,
     extra: Option<Value>,
 ) -> Result<(), ApiError> {
     let dir = knowledge_base_dir(state, name);
@@ -5796,9 +5990,11 @@ fn write_knowledge_metadata(
         "last_updated": now_label(),
         "last_indexed_at": now_label(),
         "last_indexed_action": "upsert",
-        "rag_provider": provider,
-        "embedding_model": "deterministic-agent-loop",
-        "embedding_dim": 0,
+        "last_indexed_count": knowledge_files(state, name).unwrap_or_default().len(),
+        "rag_provider": DEFAULT_RAG_PROVIDER,
+        "embedding_model": RUST_EMBEDDING_MODEL,
+        "embedding_dim": RUST_EMBEDDING_DIMENSION,
+        "embedding_signature": active_knowledge_signature(),
         "needs_reindex": false,
         "embedding_mismatch": false
     });

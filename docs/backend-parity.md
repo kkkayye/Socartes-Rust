@@ -85,6 +85,7 @@ python3 tools/api_parity_scan.py \
 本轮已补齐并验证的主要区域：
 
 - `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除、health、configs/config sync、default get、per-KB config、progress、linked-folder/sync-folder 管理入口
+- 课程 RAG index-version 状态：本地课程 reindex 会创建 Python-like `version-N/meta.json`，返回 `signature`/`noop`，并在 list/detail statistics 暴露 `index_versions`、`active_signature`、`active_match`、`rag_initialized`、`needs_reindex`
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
 - `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn` 和 `resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，`subscribe_session` 可回放 session 最新 turn
@@ -111,11 +112,12 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`43` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`44` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
 - `cargo test --test api_contract course`：`3` 个课程/知识库契约测试通过
+- `cargo test --test api_contract knowledge_reindex_creates_signature_version_and_reports_active_match`：课程 reindex signature/version/noop/active_match 契约测试通过
 - `cargo test --test api_contract rag_selected_uploaded_kb_returns_no_builtin_fallback_when_no_match`：选定上传课程无命中时不回退内置 RAG 的语义契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
 - `cargo test --test api_contract co_writer`：`3` 个 Co-Writer 文档、编辑、历史/tool-calls/export 契约测试通过
@@ -137,7 +139,7 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
 - `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
-- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界，但仍缺真实 LlamaIndex/embedding/vector index/version 语义；unified WS 已补已完成 turn 的 replay，仍缺运行中 turn live subscriber、真实 cancel task、真实 regenerate 语义；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
+- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界和本地 index-version 状态合同，但仍缺真实 LlamaIndex/embedding/vector search 语义；unified WS 已补已完成 turn 的 replay，仍缺运行中 turn live subscriber、真实 cancel task、真实 regenerate 语义；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
 
