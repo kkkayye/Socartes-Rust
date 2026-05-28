@@ -66,6 +66,14 @@ fn test_skills_root(knowledge_root: &Path) -> std::path::PathBuf {
         .join("skills")
 }
 
+fn test_co_writer_docs_root(knowledge_root: &Path) -> std::path::PathBuf {
+    test_data_root(knowledge_root)
+        .join("user")
+        .join("workspace")
+        .join("co-writer")
+        .join("documents")
+}
+
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("user")
 }
@@ -1858,6 +1866,163 @@ async fn page_agent_chat_completion_requires_messages_array() {
     assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
     let payload = json_response(response).await;
     assert!(payload["detail"].as_str().unwrap().contains("messages"));
+}
+
+#[tokio::test]
+async fn co_writer_documents_crud_matches_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let empty_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/documents")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(empty_response.status(), http::StatusCode::OK);
+    let empty_doc = json_response(empty_response).await;
+    let empty_id = empty_doc["id"].as_str().unwrap();
+    assert_eq!(empty_id.len(), 12);
+    assert!(empty_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_eq!(empty_doc["title"], "Untitled draft");
+    assert_eq!(empty_doc["content"], "");
+    assert!(empty_doc["created_at"].is_number());
+    assert!(empty_doc["updated_at"].is_number());
+
+    let derived_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/documents")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "# Derived Title\n\nFirst paragraph.\nSecond paragraph."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(derived_response.status(), http::StatusCode::OK);
+    let derived_doc = json_response(derived_response).await;
+    let derived_id = derived_doc["id"].as_str().unwrap();
+    assert_eq!(derived_doc["title"], "Derived Title");
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/co_writer/documents/{derived_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(get_response).await["id"], derived_id);
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/co_writer/documents/{empty_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": null,
+                        "content": "# Long Title\n\nAlpha\nBeta"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+    let updated = json_response(update_response).await;
+    assert_eq!(updated["title"], "Long Title");
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/documents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    let documents = list["documents"].as_array().unwrap();
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[0]["id"], empty_id);
+    assert!(
+        documents[0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("# Long Title  Alpha  Beta")
+    );
+
+    let manifest = test_co_writer_docs_root(&root)
+        .join(format!("doc_{empty_id}"))
+        .join("manifest.json");
+    assert!(manifest.exists());
+
+    let missing_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/documents/missingdoc999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_response).await["detail"],
+        "Document not found"
+    );
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/co_writer/documents/{derived_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(delete_response).await["deleted"], true);
+
+    let deleted_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/co_writer/documents/{derived_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]

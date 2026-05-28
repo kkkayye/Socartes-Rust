@@ -456,6 +456,7 @@ struct AppState {
     question_notebook_root: Arc<PathBuf>,
     memory_root: Arc<PathBuf>,
     skills_root: Arc<PathBuf>,
+    co_writer_docs_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -492,6 +493,14 @@ impl AppState {
         let skills_root = env::var_os("SOCARTES_SKILLS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| user_data_root.join("workspace").join("skills"));
+        let co_writer_docs_root = env::var_os("SOCARTES_CO_WRITER_DOCS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                user_data_root
+                    .join("workspace")
+                    .join("co-writer")
+                    .join("documents")
+            });
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
@@ -503,6 +512,7 @@ impl AppState {
             question_notebook_root: Arc::new(question_notebook_root),
             memory_root: Arc::new(memory_root),
             skills_root: Arc::new(skills_root),
+            co_writer_docs_root: Arc::new(co_writer_docs_root),
         }
     }
 }
@@ -662,6 +672,16 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(add_notebook_record_with_summary),
         )
         .route("/api/v1/notebook/health", get(notebook_health))
+        .route(
+            "/api/v1/co_writer/documents",
+            get(list_co_writer_documents).post(create_co_writer_document),
+        )
+        .route(
+            "/api/v1/co_writer/documents/{doc_id}",
+            get(get_co_writer_document)
+                .put(update_co_writer_document)
+                .delete(delete_co_writer_document),
+        )
         .route(
             "/api/v1/notebook/{notebook_id}",
             get(get_notebook_endpoint)
@@ -1986,6 +2006,62 @@ async fn delete_notebook_record(
     }
 }
 
+async fn list_co_writer_documents(State(state): State<AppState>) -> impl IntoResponse {
+    match co_writer_document_summaries(&state) {
+        Ok(documents) => Json(json!({ "documents": documents })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_co_writer_document(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match create_co_writer_document_value(&state, &payload) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_co_writer_document(
+    State(state): State<AppState>,
+    Path(doc_id): Path<String>,
+) -> impl IntoResponse {
+    match load_co_writer_document(&state, &doc_id) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_co_writer_document(
+    State(state): State<AppState>,
+    Path(doc_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match update_co_writer_document_value(&state, &doc_id, &payload) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_co_writer_document(
+    State(state): State<AppState>,
+    Path(doc_id): Path<String>,
+) -> impl IntoResponse {
+    match co_writer_doc_dir(&state, &doc_id) {
+        Ok(dir) if dir.exists() => match fs::remove_dir_all(&dir) {
+            Ok(()) => Json(json!({ "deleted": !dir.exists() })).into_response(),
+            Err(error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to delete document: {error}"),
+            )
+            .into_response(),
+        },
+        Ok(_) => api_error(StatusCode::NOT_FOUND, "Document not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn upsert_question_notebook_entry(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -2336,6 +2412,203 @@ fn remove_notebook_index_entry(state: &AppState, notebook_id: &str) -> std::io::
         entries.retain(|entry| entry["id"] != notebook_id);
     }
     save_notebook_index(state, &index)
+}
+
+fn co_writer_doc_dir(state: &AppState, doc_id: &str) -> Result<PathBuf, ApiError> {
+    let Some(component) = safe_storage_component(doc_id) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Document not found"));
+    };
+    Ok(state.co_writer_docs_root.join(format!("doc_{component}")))
+}
+
+fn co_writer_doc_manifest_path(state: &AppState, doc_id: &str) -> Result<PathBuf, ApiError> {
+    Ok(co_writer_doc_dir(state, doc_id)?.join("manifest.json"))
+}
+
+fn co_writer_document_id() -> String {
+    let raw = format!("{:012x}", unique_id());
+    let start = raw.len().saturating_sub(12);
+    raw[start..].to_string()
+}
+
+fn derive_co_writer_title(content: &str, fallback: &str) -> String {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let title = if line.starts_with('#') {
+            line.trim_start_matches('#').trim()
+        } else {
+            line
+        };
+        if !title.is_empty() {
+            return title.chars().take(120).collect();
+        }
+    }
+    fallback.to_string()
+}
+
+fn co_writer_preview(content: &str) -> String {
+    let cleaned = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ");
+    if cleaned.chars().count() <= 160 {
+        return cleaned;
+    }
+    let mut preview = cleaned.chars().take(160).collect::<String>();
+    preview = preview.trim_end().to_string();
+    preview.push('…');
+    preview
+}
+
+fn load_co_writer_document(state: &AppState, doc_id: &str) -> Result<Value, ApiError> {
+    let path = co_writer_doc_manifest_path(state, doc_id)?;
+    let mut document = read_json_file(&path, "Document not found")?;
+    normalize_co_writer_document(&mut document, doc_id);
+    Ok(document)
+}
+
+fn normalize_co_writer_document(document: &mut Value, fallback_id: &str) {
+    let now = now_seconds();
+    if !document["id"].is_string() {
+        document["id"] = json!(fallback_id);
+    }
+    if !document["content"].is_string() {
+        document["content"] = json!("");
+    }
+    if !document["title"].is_string() {
+        let content = document["content"].as_str().unwrap_or("");
+        document["title"] = json!(derive_co_writer_title(content, "Untitled draft"));
+    }
+    if !document["created_at"].is_number() {
+        document["created_at"] = json!(now);
+    }
+    if !document["updated_at"].is_number() {
+        document["updated_at"] = json!(now);
+    }
+}
+
+fn save_co_writer_document(state: &AppState, document: &Value) -> Result<(), ApiError> {
+    let doc_id = document["id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Document id is required"))?;
+    let path = co_writer_doc_manifest_path(state, doc_id)?;
+    write_json_file(&path, document)
+}
+
+fn create_co_writer_document_value(state: &AppState, payload: &Value) -> Result<Value, ApiError> {
+    let content = payload["content"].as_str().unwrap_or("").to_string();
+    let title = payload["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| derive_co_writer_title(&content, "Untitled draft"));
+    let mut doc_id = co_writer_document_id();
+    while co_writer_doc_manifest_path(state, &doc_id)?.exists() {
+        doc_id = co_writer_document_id();
+    }
+    let now = now_seconds();
+    let document = json!({
+        "id": doc_id,
+        "title": title,
+        "content": content,
+        "created_at": now,
+        "updated_at": now
+    });
+    save_co_writer_document(state, &document)?;
+    Ok(document)
+}
+
+fn update_co_writer_document_value(
+    state: &AppState,
+    doc_id: &str,
+    payload: &Value,
+) -> Result<Value, ApiError> {
+    let mut document = load_co_writer_document(state, doc_id)?;
+    let content_update = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let title_update = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    if let Some(title) = title_update {
+        let source_content = content_update
+            .as_deref()
+            .unwrap_or_else(|| document["content"].as_str().unwrap_or(""));
+        let trimmed = title.trim();
+        document["title"] = json!(if trimmed.is_empty() {
+            derive_co_writer_title(source_content, "Untitled draft")
+        } else {
+            trimmed.to_string()
+        });
+    }
+    if let Some(content) = content_update {
+        document["content"] = json!(content.clone());
+        if !matches!(payload.get("title"), Some(Value::String(_)))
+            && matches!(
+                document["title"].as_str(),
+                None | Some("") | Some("Untitled draft")
+            )
+        {
+            let fallback = document["title"].as_str().unwrap_or("Untitled draft");
+            document["title"] = json!(derive_co_writer_title(&content, fallback));
+        }
+    }
+    document["updated_at"] = json!(now_seconds());
+    save_co_writer_document(state, &document)?;
+    Ok(document)
+}
+
+fn co_writer_document_summaries(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    if !state.co_writer_docs_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut summaries = Vec::new();
+    let entries = fs::read_dir(&*state.co_writer_docs_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read Co-Writer documents: {error}"),
+        )
+    })?;
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(doc_id) = name.strip_prefix("doc_") else {
+            continue;
+        };
+        let Ok(document) = load_co_writer_document(state, doc_id) else {
+            continue;
+        };
+        let content = document["content"].as_str().unwrap_or("");
+        let title = document["title"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| derive_co_writer_title(content, "Untitled draft"));
+        summaries.push(json!({
+            "id": document["id"].clone(),
+            "title": title,
+            "created_at": document["created_at"].clone(),
+            "updated_at": document["updated_at"].clone(),
+            "preview": co_writer_preview(content)
+        }));
+    }
+    summaries.sort_by(|left, right| {
+        right["updated_at"]
+            .as_f64()
+            .partial_cmp(&left["updated_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(summaries)
 }
 
 fn add_notebook_record_value(
