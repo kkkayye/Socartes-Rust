@@ -78,8 +78,8 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`148`
-- 前端仍缺 Rust 覆盖的路径：`4`
+- Rust 后端路由：`151`
+- 前端仍缺 Rust 覆盖的路径：`1`
 
 本轮已补齐并验证的主要区域：
 
@@ -97,15 +97,17 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/plugins/*` Playground plugins list、tool execute、tool SSE、capability SSE 兼容入口
 - `/api/v1/page-agent/openai/v1/chat/completions` Page agent OpenAI-compatible fallback，返回 `AgentOutput` tool call，保持前端 pet/page-agent 可解析
 - `/api/v1/co_writer/documents*` Co-Writer file-backed 文档列表、创建、读取、更新、删除，兼容 12 位 hex id、标题推导、preview、`updated_at` 倒序和 `Document not found` 错误
+- `/api/v1/co_writer/edit`、`/api/v1/co_writer/automark`、`/api/v1/co_writer/edit_react/stream` Co-Writer 编辑、自动标注、selection ReAct SSE 兼容入口
 
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`32` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`33` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
-- `cargo test course_knowledge`：`2` 个课程/知识库契约测试通过
+- `cargo test --test api_contract course`：`3` 个课程/知识库契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
+- `cargo test --test api_contract co_writer_edit_automark_and_stream_match_frontend_contract`：Co-Writer 编辑、自动标注和 SSE selection edit 契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过
@@ -118,10 +120,8 @@ python3 tools/api_parity_scan.py \
 
 下一批 P0 仍未完成：
 
-- `/api/v1/co_writer/edit`
-- `/api/v1/co_writer/automark`
-- `/api/v1/co_writer/edit_react/stream`
-- 前端扫描里的 `/api/v1/book{param}` 疑似模板扫描伪影，落地前需先回看具体调用点确认是否真实路由
+- 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
+- Python-only 的 Co-Writer history/tool_calls/export、agent-config、dashboard、tour、solve sessions、vision analyze 等剩余兼容入口仍需继续补齐
 
 ## 已知限制
 

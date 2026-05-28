@@ -682,6 +682,12 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
                 .put(update_co_writer_document)
                 .delete(delete_co_writer_document),
         )
+        .route("/api/v1/co_writer/edit", post(co_writer_edit))
+        .route("/api/v1/co_writer/automark", post(co_writer_automark))
+        .route(
+            "/api/v1/co_writer/edit_react/stream",
+            post(co_writer_edit_react_stream),
+        )
         .route(
             "/api/v1/notebook/{notebook_id}",
             get(get_notebook_endpoint)
@@ -2062,6 +2068,92 @@ async fn delete_co_writer_document(
     }
 }
 
+async fn co_writer_edit(Json(payload): Json<Value>) -> impl IntoResponse {
+    match co_writer_edit_value(&payload) {
+        Ok((edited_text, operation_id)) => {
+            Json(json!({ "edited_text": edited_text, "operation_id": operation_id }))
+                .into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn co_writer_automark(Json(payload): Json<Value>) -> impl IntoResponse {
+    let text = payload["text"].as_str().unwrap_or("");
+    Json(json!({
+        "marked_text": co_writer_automark_text(text),
+        "operation_id": co_writer_operation_id("automark")
+    }))
+    .into_response()
+}
+
+async fn co_writer_edit_react_stream(Json(payload): Json<Value>) -> impl IntoResponse {
+    match co_writer_react_edit_value(&payload) {
+        Ok(result) => {
+            let operation_id = result["operation_id"].as_str().unwrap_or_default();
+            let edited_text = result["edited_text"].as_str().unwrap_or_default();
+            let tools = result["tool_traces"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let mut seq = 0_u64;
+            let mut stream_event =
+                |event_type: &str, stage: &str, content: String, metadata: Value| {
+                    seq += 1;
+                    json!({
+                        "type": event_type,
+                        "source": "co_writer_react_edit",
+                        "stage": stage,
+                        "content": content,
+                        "metadata": metadata,
+                        "session_id": "co_writer",
+                        "turn_id": operation_id,
+                        "seq": seq,
+                        "timestamp": now_seconds()
+                    })
+                };
+            let mut body = String::new();
+            body.push_str(&sse(
+                "stream",
+                stream_event(
+                    "thinking",
+                    "thinking",
+                    result["thinking"].as_str().unwrap_or_default().to_string(),
+                    json!({}),
+                ),
+            ));
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap_or("tool");
+                body.push_str(&sse(
+                    "stream",
+                    stream_event(
+                        "tool_call",
+                        "acting",
+                        name.to_string(),
+                        json!({ "args": tool["arguments"].clone() }),
+                    ),
+                ));
+                body.push_str(&sse(
+                    "stream",
+                    stream_event(
+                        "tool_result",
+                        "acting",
+                        tool["result"].as_str().unwrap_or_default().to_string(),
+                        json!({ "tool": name }),
+                    ),
+                ));
+            }
+            body.push_str(&sse(
+                "stream",
+                stream_event("content", "responding", edited_text.to_string(), json!({})),
+            ));
+            body.push_str(&sse("result", result));
+            sse_response(body).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn upsert_question_notebook_entry(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -2609,6 +2701,170 @@ fn co_writer_document_summaries(state: &AppState) -> Result<Vec<Value>, ApiError
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(summaries)
+}
+
+fn co_writer_operation_id(prefix: &str) -> String {
+    let suffix = format!("{:x}", unique_id());
+    format!(
+        "{prefix}_{}",
+        suffix.chars().rev().take(12).collect::<String>()
+    )
+}
+
+fn co_writer_edit_value(payload: &Value) -> Result<(String, String), ApiError> {
+    let text = payload["text"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Text is required"));
+    }
+    let instruction = payload["instruction"].as_str().unwrap_or("").trim();
+    let action = payload["action"].as_str().unwrap_or("rewrite");
+    let edited_text = match action {
+        "shorten" => co_writer_shorten_text(text),
+        "expand" => {
+            if instruction.is_empty() {
+                format!(
+                    "{text}\n\nAdditional context can be added here while preserving the original draft."
+                )
+            } else {
+                format!("{text}\n\nExpanded according to: {instruction}")
+            }
+        }
+        "rewrite" => {
+            if instruction.is_empty() {
+                text.to_string()
+            } else {
+                format!("{text}\n\nEdited according to: {instruction}")
+            }
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "action must be one of rewrite, shorten, or expand",
+            ));
+        }
+    };
+    Ok((edited_text, co_writer_operation_id(action)))
+}
+
+fn co_writer_shorten_text(text: &str) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= 80 {
+        return text.to_string();
+    }
+    format!("{}...", words[..80].join(" "))
+}
+
+fn co_writer_automark_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    text.lines()
+        .map(|line| {
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() {
+                String::new()
+            } else if trimmed_line.starts_with("==") && trimmed_line.ends_with("==") {
+                trimmed_line.to_string()
+            } else {
+                format!("=={trimmed_line}==")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_co_writer_tools(value: &Value) -> Vec<String> {
+    let allowed = [
+        "brainstorm",
+        "rag",
+        "web_search",
+        "code_execution",
+        "reason",
+        "paper_search",
+    ];
+    let mut normalized = Vec::new();
+    if let Some(items) = value["tools"].as_array() {
+        for item in items {
+            let Some(tool) = item.as_str().map(str::trim) else {
+                continue;
+            };
+            if allowed.contains(&tool) && !normalized.iter().any(|name| name == tool) {
+                normalized.push(tool.to_string());
+            }
+        }
+    }
+    normalized
+}
+
+fn co_writer_react_edit_value(payload: &Value) -> Result<Value, ApiError> {
+    let selected_text = payload["selected_text"]
+        .as_str()
+        .unwrap_or("")
+        .trim_matches('\n');
+    if selected_text.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Please select a text passage first.",
+        ));
+    }
+
+    let instruction = payload["instruction"].as_str().unwrap_or("").trim();
+    let mode = payload["mode"].as_str().unwrap_or("rewrite");
+    if mode == "none" && instruction.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Provide an edit instruction, or choose shorten / expand / rewrite mode.",
+        ));
+    }
+    if !matches!(mode, "rewrite" | "shorten" | "expand" | "none") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "mode must be one of rewrite, shorten, expand, or none",
+        ));
+    }
+
+    let tools = normalize_co_writer_tools(payload);
+    let edited_text = match mode {
+        "shorten" => co_writer_shorten_text(selected_text),
+        "expand" => {
+            let request = if instruction.is_empty() {
+                "add helpful detail"
+            } else {
+                instruction
+            };
+            format!("{selected_text}\n\nExpanded note: {request}")
+        }
+        "none" => format!("{selected_text}\n\nInstruction applied: {instruction}"),
+        _ => {
+            if instruction.is_empty() {
+                selected_text.to_string()
+            } else {
+                format!("{selected_text}\n\nRewritten with request: {instruction}")
+            }
+        }
+    };
+    let tool_traces = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool,
+                "arguments": {
+                    "instruction": instruction,
+                    "selected_text": selected_text,
+                    "kb_name": payload["kb_name"].clone()
+                },
+                "result": format!("{tool} completed for Co-Writer selection edit.")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "edited_text": edited_text,
+        "operation_id": co_writer_operation_id("react_edit"),
+        "thinking": format!("Prepared a {mode} edit for the selected passage."),
+        "tool_traces": tool_traces
+    }))
 }
 
 fn add_notebook_record_value(

@@ -2026,6 +2026,159 @@ async fn co_writer_documents_crud_matches_frontend_contract() {
 }
 
 #[tokio::test]
+async fn co_writer_edit_automark_and_stream_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let edit_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "text": "Original paragraph with extra detail.",
+                        "instruction": "make it concise",
+                        "action": "shorten",
+                        "source": null,
+                        "kb_name": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_response.status(), http::StatusCode::OK);
+    let edit_payload = json_response(edit_response).await;
+    assert!(edit_payload["operation_id"].as_str().unwrap().len() > 8);
+    assert!(
+        edit_payload["edited_text"]
+            .as_str()
+            .unwrap()
+            .contains("Original paragraph")
+    );
+
+    let automark_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/automark")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"text": "Key concept"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(automark_response.status(), http::StatusCode::OK);
+    let automark_payload = json_response(automark_response).await;
+    assert!(automark_payload["operation_id"].as_str().unwrap().len() > 8);
+    assert_eq!(automark_payload["marked_text"], "==Key concept==");
+
+    let stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit_react/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "selected_text": "Original sentence",
+                        "instruction": "make it clearer",
+                        "mode": "rewrite",
+                        "tools": ["brainstorm", "not-a-tool"],
+                        "kb_name": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        stream_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let stream_body = text_response(stream_response).await;
+    assert!(stream_body.contains("event: stream"));
+    assert!(stream_body.contains("\"type\":\"thinking\""));
+    assert!(stream_body.contains("\"type\":\"content\""));
+    assert!(stream_body.contains("\"stage\":\"responding\""));
+    assert!(stream_body.contains("event: result"));
+    assert!(stream_body.contains("\"edited_text\""));
+    assert!(stream_body.contains("\"tool_traces\""));
+
+    let empty_selection_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit_react/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "selected_text": "   ",
+                        "instruction": "rewrite",
+                        "mode": "rewrite",
+                        "tools": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        empty_selection_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        json_response(empty_selection_response).await["detail"],
+        "Please select a text passage first."
+    );
+
+    let missing_instruction_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit_react/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "selected_text": "Original sentence",
+                        "instruction": "",
+                        "mode": "none",
+                        "tools": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_instruction_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert!(
+        json_response(missing_instruction_response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Provide an edit instruction")
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
