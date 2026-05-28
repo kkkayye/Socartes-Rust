@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use socartes_backend::{app, app_with_knowledge_root};
 use tower::ServiceExt;
+
+static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 async fn json_response(response: axum::response::Response) -> Value {
     let bytes = response
@@ -36,8 +39,12 @@ fn unique_test_knowledge_root() -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_nanos();
+    let counter = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("socartes-test-{id}"))
+        .join(format!(
+            "socartes-test-{}-{counter}-{id}",
+            std::process::id()
+        ))
         .join("knowledge")
 }
 
@@ -748,6 +755,99 @@ The lantern school rule says students must recite the blue theorem before openin
     assert!(assistant_content.contains("blue theorem"));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn attachment_preview_route_serves_local_chat_files_like_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let attachment_dir = test_data_root(&root)
+        .join("user")
+        .join("workspace")
+        .join("chat")
+        .join("attachments")
+        .join("session-a");
+    fs::create_dir_all(&attachment_dir).unwrap();
+    fs::write(attachment_dir.join("att-1_diagram.png"), b"png-bytes").unwrap();
+    fs::write(attachment_dir.join("att-2_notes.txt"), b"notes").unwrap();
+
+    let image_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/attachments/session-a/att-1/diagram.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        image_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "image/png"
+    );
+    assert_eq!(
+        image_response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .unwrap(),
+        "private, max-age=0, must-revalidate"
+    );
+    let disposition = image_response
+        .headers()
+        .get(http::header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(disposition.starts_with("inline;"));
+    assert!(disposition.contains("filename=\"att-1_diagram.png\""));
+    assert_eq!(text_response(image_response).await, "png-bytes");
+
+    let alias_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/attachments/session-a/message-ignored/att-2/notes.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(alias_response.status(), http::StatusCode::OK);
+    assert_eq!(text_response(alias_response).await, "notes");
+
+    let missing_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/attachments/session-a/att-404/missing.pdf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_response).await["detail"],
+        "Attachment not found"
+    );
+
+    let traversal_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/attachments/../att-1/diagram.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(traversal_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]
@@ -2174,6 +2274,195 @@ async fn co_writer_edit_automark_and_stream_match_frontend_contract() {
             .unwrap()
             .contains("Provide an edit instruction")
     );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn co_writer_history_tool_calls_export_and_non_stream_react_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let empty_history_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_history_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(empty_history_response).await,
+        json!({"history": [], "total": 0})
+    );
+
+    let react_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit_react")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "selected_text": "Draft sentence",
+                        "instruction": "make it stronger",
+                        "mode": "rewrite",
+                        "tools": ["brainstorm", "not-a-tool"],
+                        "kb_name": "course-notes"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(react_response.status(), http::StatusCode::OK);
+    let react_payload = json_response(react_response).await;
+    let operation_id = react_payload["operation_id"].as_str().unwrap();
+    assert!(operation_id.len() > 8);
+    assert!(
+        react_payload["edited_text"]
+            .as_str()
+            .unwrap()
+            .contains("Draft sentence")
+    );
+    assert!(
+        react_payload["thinking"]
+            .as_str()
+            .unwrap()
+            .contains("rewrite")
+    );
+    assert_eq!(react_payload["tool_traces"].as_array().unwrap().len(), 1);
+    assert_eq!(react_payload["tool_traces"][0]["name"], "brainstorm");
+
+    let history_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert_eq!(history["total"], 1);
+    assert_eq!(history["history"][0]["id"], operation_id);
+    assert_eq!(history["history"][0]["action"], "react_edit");
+    assert_eq!(history["history"][0]["mode"], "rewrite");
+
+    let operation_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/co_writer/history/{operation_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(operation_response.status(), http::StatusCode::OK);
+    let operation = json_response(operation_response).await;
+    assert_eq!(operation["id"], operation_id);
+    assert_eq!(operation["input"]["selected_text"], "Draft sentence");
+    assert_eq!(
+        operation["output"]["edited_text"],
+        react_payload["edited_text"]
+    );
+
+    let tool_call_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/co_writer/tool_calls/{operation_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool_call_response.status(), http::StatusCode::OK);
+    let tool_call = json_response(tool_call_response).await;
+    assert_eq!(tool_call["type"], "react_tools");
+    assert_eq!(tool_call["operation_id"], operation_id);
+    assert_eq!(tool_call["tools"], json!(["brainstorm"]));
+    assert_eq!(tool_call["tool_traces"][0]["name"], "brainstorm");
+
+    let missing_operation_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/history/missing-operation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_operation_response.status(),
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_response(missing_operation_response).await["detail"],
+        "Operation not found"
+    );
+
+    let missing_tool_call_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/tool_calls/missing-operation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_tool_call_response.status(),
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_response(missing_tool_call_response).await["detail"],
+        "Tool call not found"
+    );
+
+    let export_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/export/markdown")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "# Exported\nBody",
+                        "filename": "draft.md"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        export_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/markdown"
+    );
+    assert_eq!(
+        export_response
+            .headers()
+            .get(http::header::CONTENT_DISPOSITION)
+            .unwrap(),
+        "attachment; filename=draft.md"
+    );
+    assert_eq!(text_response(export_response).await, "# Exported\nBody");
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
@@ -3881,6 +4170,350 @@ async fn settings_and_system_status_match_frontend_contract() {
     assert!(events_body.contains("\"type\":\"completed\""));
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts() {
+    let root = unique_test_knowledge_root();
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    fs::write(
+        session_root.join("legacy-session.json"),
+        json!({
+            "id": "legacy-session",
+            "session_id": "legacy-session",
+            "title": "Legacy Solve",
+            "created_at": 10.0,
+            "updated_at": 20.0,
+            "status": "idle",
+            "capability": "deep_solve",
+            "preferences": {"knowledge_bases": ["course-a"]},
+            "messages": [
+                {"role": "user", "content": "Solve this", "created_at": 11.0},
+                {"role": "assistant", "content": "Solved answer", "created_at": 12.0}
+            ],
+            "active_turns": [],
+            "compressed_summary": "short summary"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = app_with_knowledge_root(&root);
+
+    let description_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/sidebar/description")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"description": "Socartes Lab"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(description_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(description_response).await,
+        json!({"description": "Socartes Lab"})
+    );
+
+    let nav_order = json!({
+        "start": ["/", "/knowledge"],
+        "learnResearch": ["/question", "/co_writer"]
+    });
+    let nav_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/sidebar/nav-order")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"nav_order": nav_order}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nav_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(nav_response).await["nav_order"], nav_order);
+
+    let sidebar = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/sidebar")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sidebar_payload = json_response(sidebar).await;
+    assert_eq!(sidebar_payload["description"], "Socartes Lab");
+    assert_eq!(sidebar_payload["nav_order"], nav_order);
+
+    let tour_status = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/tour/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tour_status.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(tour_status).await,
+        json!({"active": false, "status": "none", "launch_at": null, "redirect_at": null})
+    );
+
+    let complete_tour = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tour/complete")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"test_results": {"llm": "ok"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete_tour.status(), http::StatusCode::OK);
+    let complete_payload = json_response(complete_tour).await;
+    assert_eq!(complete_payload["status"], "completed");
+    assert!(complete_payload["launch_at"].as_i64().unwrap() > 0);
+    assert!(complete_payload["redirect_at"].as_i64().unwrap() > 0);
+    assert!(complete_payload["env"].is_object());
+
+    let reopen_tour = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tour/reopen")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopen_tour.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(reopen_tour).await["command"],
+        "python scripts/start_tour.py"
+    );
+
+    let agents = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/agent-config/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(agents.status(), http::StatusCode::OK);
+    let agents_payload = json_response(agents).await;
+    assert_eq!(agents_payload["solve"]["icon"], "HelpCircle");
+    assert_eq!(agents_payload["co_writer"]["color"], "amber");
+
+    let missing_agent = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/agent-config/agents/unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_agent.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(missing_agent).await,
+        json!({"error": "Agent type 'unknown' not found"})
+    );
+
+    let dashboard_recent = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/dashboard/recent?type=solve&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dashboard_recent.status(), http::StatusCode::OK);
+    let activities = json_response(dashboard_recent).await;
+    assert_eq!(activities.as_array().unwrap().len(), 1);
+    assert_eq!(activities[0]["id"], "legacy-session");
+    assert_eq!(activities[0]["type"], "solve");
+    assert_eq!(activities[0]["summary"], "Solved answer");
+
+    let dashboard_entry = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/dashboard/legacy-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dashboard_entry.status(), http::StatusCode::OK);
+    let entry = json_response(dashboard_entry).await;
+    assert_eq!(entry["id"], "legacy-session");
+    assert_eq!(entry["type"], "solve");
+    assert_eq!(entry["content"]["messages"].as_array().unwrap().len(), 2);
+
+    let solve_sessions = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/solve/sessions?limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(solve_sessions.status(), http::StatusCode::OK);
+    let solve_payload = json_response(solve_sessions).await;
+    assert_eq!(solve_payload.as_array().unwrap().len(), 1);
+    assert_eq!(solve_payload[0]["session_id"], "legacy-session");
+    assert_eq!(solve_payload[0]["kb_name"], "course-a");
+    assert_eq!(solve_payload[0]["last_message"], "Solved answer");
+
+    let solve_detail = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/solve/sessions/legacy-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(solve_detail.status(), http::StatusCode::OK);
+    let solve_detail_payload = json_response(solve_detail).await;
+    assert_eq!(solve_detail_payload["session_id"], "legacy-session");
+    assert!(solve_detail_payload["token_stats"].is_object());
+
+    let missing_solve = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/solve/sessions/missing-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_solve.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_solve).await["detail"],
+        "Session not found"
+    );
+
+    let missing_dashboard = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/dashboard/missing-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_dashboard.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_dashboard).await["detail"],
+        "Entry not found"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn vision_analyze_rest_route_matches_legacy_validation_contract() {
+    let no_image_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Describe the geometry",
+                        "session_id": "vision-session"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_image_response.status(), http::StatusCode::OK);
+    let no_image = json_response(no_image_response).await;
+    assert_eq!(no_image["session_id"], "vision-session");
+    assert_eq!(no_image["has_image"], false);
+    assert_eq!(no_image["final_ggb_commands"], json!([]));
+    assert_eq!(no_image["ggb_script"], Value::Null);
+    assert_eq!(no_image["analysis_summary"]["commands_count"], 0);
+
+    let invalid_base64_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze this",
+                        "image_base64": "not-a-data-uri"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        invalid_base64_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert!(
+        json_response(invalid_base64_response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("data:image")
+    );
+
+    let image_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze this",
+                        "image_base64": "data:image/png;base64,iVBORw0KGgo="
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_response.status(), http::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        json_response(image_response).await["detail"],
+        "Vision image analysis is not implemented in the Rust backend yet"
+    );
 }
 
 #[tokio::test]

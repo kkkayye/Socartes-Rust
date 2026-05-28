@@ -451,6 +451,7 @@ struct AppState {
     book_root: Arc<PathBuf>,
     output_root: Arc<PathBuf>,
     settings_root: Arc<PathBuf>,
+    attachment_root: Arc<PathBuf>,
     tutorbot_root: Arc<PathBuf>,
     notebook_root: Arc<PathBuf>,
     question_notebook_root: Arc<PathBuf>,
@@ -478,6 +479,15 @@ impl AppState {
         let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("settings"));
+        let attachment_root = env::var_os("CHAT_ATTACHMENT_DIR")
+            .or_else(|| env::var_os("SOCARTES_ATTACHMENT_ROOT"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                user_data_root
+                    .join("workspace")
+                    .join("chat")
+                    .join("attachments")
+            });
         let tutorbot_root = env::var_os("SOCARTES_TUTORBOT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("tutorbot"));
@@ -507,6 +517,7 @@ impl AppState {
             book_root: Arc::new(book_root),
             output_root: Arc::new(output_root),
             settings_root: Arc::new(settings_root),
+            attachment_root: Arc::new(attachment_root),
             tutorbot_root: Arc::new(tutorbot_root),
             notebook_root: Arc::new(notebook_root),
             question_notebook_root: Arc::new(question_notebook_root),
@@ -607,6 +618,20 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         .route("/api/v1/settings/themes", get(settings_themes))
         .route("/api/v1/settings/sidebar", get(settings_sidebar))
         .route(
+            "/api/v1/settings/sidebar/description",
+            put(update_sidebar_description),
+        )
+        .route(
+            "/api/v1/settings/sidebar/nav-order",
+            put(update_sidebar_nav_order),
+        )
+        .route("/api/v1/settings/tour/status", get(settings_tour_status))
+        .route(
+            "/api/v1/settings/tour/complete",
+            post(complete_settings_tour),
+        )
+        .route("/api/v1/settings/tour/reopen", post(reopen_settings_tour))
+        .route(
             "/api/v1/settings/tests/{service}/start",
             post(start_settings_test),
         )
@@ -630,6 +655,19 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(system_test_embeddings),
         )
         .route("/api/v1/system/test/search", post(system_test_search))
+        .route("/api/v1/vision/analyze", post(vision_analyze))
+        .route("/api/v1/dashboard/recent", get(dashboard_recent))
+        .route("/api/v1/dashboard/{entry_id}", get(dashboard_entry))
+        .route("/api/v1/agent-config/agents", get(agent_config_agents))
+        .route(
+            "/api/v1/agent-config/agents/{agent_type}",
+            get(agent_config_agent),
+        )
+        .route("/api/v1/solve/sessions", get(list_solve_sessions))
+        .route(
+            "/api/v1/solve/sessions/{session_id}",
+            get(get_solve_session),
+        )
         .route("/api/v1/tutorbot", get(list_tutorbots).post(start_tutorbot))
         .route("/api/v1/tutorbot/recent", get(recent_tutorbots))
         .route(
@@ -683,6 +721,20 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
                 .delete(delete_co_writer_document),
         )
         .route("/api/v1/co_writer/edit", post(co_writer_edit))
+        .route("/api/v1/co_writer/edit_react", post(co_writer_edit_react))
+        .route("/api/v1/co_writer/history", get(co_writer_history))
+        .route(
+            "/api/v1/co_writer/history/{operation_id}",
+            get(co_writer_history_operation),
+        )
+        .route(
+            "/api/v1/co_writer/tool_calls/{operation_id}",
+            get(co_writer_tool_call),
+        )
+        .route(
+            "/api/v1/co_writer/export/markdown",
+            post(co_writer_export_markdown),
+        )
         .route("/api/v1/co_writer/automark", post(co_writer_automark))
         .route(
             "/api/v1/co_writer/edit_react/stream",
@@ -822,6 +874,10 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         )
         .route("/api/v1/book/ws", get(book_ws))
         .route("/api/outputs/{*file_path}", get(read_output_file))
+        .route(
+            "/api/attachments/{session_id}/{attachment_id}/{*filename}",
+            get(read_attachment_file),
+        )
         .route("/api/v1/learn", post(learn))
         .route("/api/v1/story-rag/ask", post(ask_story_rag))
         .with_state(state)
@@ -1815,6 +1871,126 @@ async fn read_output_file(
     }
 }
 
+async fn read_attachment_file(
+    State(state): State<AppState>,
+    Path((session_id, attachment_id, filename)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let (attachment_id, filename) = normalize_attachment_route_parts(&attachment_id, &filename);
+    let Some(session_id) = coerce_attachment_component(&session_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let Some(attachment_id) = coerce_attachment_component(&attachment_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let filename = coerce_attachment_filename(&filename);
+    let Some(filename) = filename.as_deref() else {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let stored_filename = format!("{attachment_id}_{filename}");
+    let target = state
+        .attachment_root
+        .join(&session_id)
+        .join(stored_filename);
+    let Ok(root) = fs::canonicalize(&*state.attachment_root) else {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let Ok(canonical) = fs::canonicalize(&target) else {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    }
+    match fs::read(&canonical) {
+        Ok(bytes) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    output_mime_type(&canonical).to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    attachment_content_disposition(
+                        canonical
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or(filename),
+                    ),
+                ),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=0, must-revalidate".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => api_error(StatusCode::NOT_FOUND, "Attachment not found").into_response(),
+    }
+}
+
+fn normalize_attachment_route_parts(attachment_id: &str, filename: &str) -> (String, String) {
+    if let Some((alias_attachment_id, alias_filename)) = filename.split_once('/')
+        && !alias_attachment_id.trim().is_empty()
+        && !alias_filename.trim().is_empty()
+    {
+        return (alias_attachment_id.to_string(), alias_filename.to_string());
+    }
+    (attachment_id.to_string(), filename.to_string())
+}
+
+fn coerce_attachment_component(value: &str) -> Option<String> {
+    let filename = coerce_attachment_filename(value)?;
+    if filename == "." || filename == ".." {
+        return None;
+    }
+    Some(filename)
+}
+
+fn coerce_attachment_filename(value: &str) -> Option<String> {
+    let base = FsPath::new(value)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(value)
+        .trim();
+    if base.is_empty() || base == "." || base == ".." || base.contains('\0') {
+        return None;
+    }
+    let cleaned = base
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if cleaned.is_empty() {
+        Some("file".to_string())
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn attachment_content_disposition(filename: &str) -> String {
+    let ascii_fallback = filename.replace(['"', '\\'], "_");
+    let encoded = percent_encode_path_segment(filename);
+    format!("inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            encoded.push(ch);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 type ApiError = (StatusCode, Json<Value>);
 
 fn api_error(status: StatusCode, detail: &str) -> ApiError {
@@ -2078,6 +2254,19 @@ async fn co_writer_edit(Json(payload): Json<Value>) -> impl IntoResponse {
     }
 }
 
+async fn co_writer_edit_react(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match co_writer_react_edit_value(&payload) {
+        Ok(result) => match save_co_writer_operation(&state, &payload, &result) {
+            Ok(()) => Json(result).into_response(),
+            Err(error) => error.into_response(),
+        },
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn co_writer_automark(Json(payload): Json<Value>) -> impl IntoResponse {
     let text = payload["text"].as_str().unwrap_or("");
     Json(json!({
@@ -2087,9 +2276,15 @@ async fn co_writer_automark(Json(payload): Json<Value>) -> impl IntoResponse {
     .into_response()
 }
 
-async fn co_writer_edit_react_stream(Json(payload): Json<Value>) -> impl IntoResponse {
+async fn co_writer_edit_react_stream(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
     match co_writer_react_edit_value(&payload) {
         Ok(result) => {
+            if let Err(error) = save_co_writer_operation(&state, &payload, &result) {
+                return error.into_response();
+            }
             let operation_id = result["operation_id"].as_str().unwrap_or_default();
             let edited_text = result["edited_text"].as_str().unwrap_or_default();
             let tools = result["tool_traces"]
@@ -2152,6 +2347,60 @@ async fn co_writer_edit_react_stream(Json(payload): Json<Value>) -> impl IntoRes
         }
         Err(error) => error.into_response(),
     }
+}
+
+async fn co_writer_history(State(state): State<AppState>) -> impl IntoResponse {
+    match load_co_writer_history(&state) {
+        Ok(history) => Json(json!({ "history": history, "total": history.len() })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn co_writer_history_operation(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> impl IntoResponse {
+    match load_co_writer_history(&state) {
+        Ok(history) => history
+            .into_iter()
+            .find(|entry| entry["id"] == operation_id)
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|| {
+                api_error(StatusCode::NOT_FOUND, "Operation not found").into_response()
+            }),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn co_writer_tool_call(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> impl IntoResponse {
+    match load_co_writer_tool_call(&state, &operation_id) {
+        Ok(tool_call) => Json(tool_call).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn co_writer_export_markdown(Json(payload): Json<Value>) -> impl IntoResponse {
+    let content = payload["content"].as_str().unwrap_or("").to_string();
+    let filename = payload["filename"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("document.md");
+    (
+        [
+            (header::CONTENT_TYPE, "text/markdown".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename={filename}"),
+            ),
+        ],
+        content,
+    )
+        .into_response()
 }
 
 async fn upsert_question_notebook_entry(
@@ -2865,6 +3114,131 @@ fn co_writer_react_edit_value(payload: &Value) -> Result<Value, ApiError> {
         "thinking": format!("Prepared a {mode} edit for the selected passage."),
         "tool_traces": tool_traces
     }))
+}
+
+fn co_writer_workspace_root(state: &AppState) -> PathBuf {
+    state
+        .co_writer_docs_root
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_else(|| (*state.co_writer_docs_root).clone())
+}
+
+fn co_writer_history_path(state: &AppState) -> PathBuf {
+    co_writer_workspace_root(state).join("history.json")
+}
+
+fn co_writer_tool_calls_dir(state: &AppState) -> PathBuf {
+    co_writer_workspace_root(state).join("tool_calls")
+}
+
+fn load_co_writer_history(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let path = co_writer_history_path(state);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read Co-Writer history: {error}"),
+        )
+    })?;
+    Ok(serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default())
+}
+
+fn save_co_writer_history(state: &AppState, history: &[Value]) -> Result<(), ApiError> {
+    write_json_file(
+        &co_writer_history_path(state),
+        &Value::Array(history.to_vec()),
+    )
+}
+
+fn save_co_writer_tool_call(
+    state: &AppState,
+    operation_id: &str,
+    tool_type: &str,
+    value: &Value,
+) -> Result<Option<String>, ApiError> {
+    if value["tool_traces"].as_array().is_none_or(Vec::is_empty) {
+        return Ok(None);
+    }
+    let Some(operation_id) = safe_storage_component(operation_id) else {
+        return Ok(None);
+    };
+    let Some(tool_type) = safe_storage_component(tool_type) else {
+        return Ok(None);
+    };
+    let path = co_writer_tool_calls_dir(state).join(format!("{operation_id}_{tool_type}.json"));
+    write_json_file(&path, value)?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+fn save_co_writer_operation(
+    state: &AppState,
+    payload: &Value,
+    result: &Value,
+) -> Result<(), ApiError> {
+    let operation_id = result["operation_id"].as_str().unwrap_or("");
+    if operation_id.is_empty() {
+        return Ok(());
+    }
+    let tools = normalize_co_writer_tools(payload);
+    let mode = payload["mode"].as_str().unwrap_or("rewrite");
+    let instruction = payload["instruction"].as_str().unwrap_or("").trim();
+    let tool_call = json!({
+        "type": "react_tools",
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "operation_id": operation_id,
+        "mode": mode,
+        "tools": tools,
+        "kb_name": payload["kb_name"].clone(),
+        "thinking": result["thinking"].clone(),
+        "tool_traces": result["tool_traces"].clone()
+    });
+    let tool_call_file = save_co_writer_tool_call(state, operation_id, "react_tools", &tool_call)?;
+    let entry = json!({
+        "id": operation_id,
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "action": "react_edit",
+        "mode": mode,
+        "tools": tools,
+        "kb_name": payload["kb_name"].clone(),
+        "input": {
+            "selected_text": payload["selected_text"].as_str().unwrap_or(""),
+            "instruction": instruction
+        },
+        "output": {
+            "edited_text": result["edited_text"].clone()
+        },
+        "tool_call_file": tool_call_file,
+        "model": "deterministic-co-writer"
+    });
+    let mut history = load_co_writer_history(state)?;
+    history.push(entry);
+    save_co_writer_history(state, &history)
+}
+
+fn load_co_writer_tool_call(state: &AppState, operation_id: &str) -> Result<Value, ApiError> {
+    let Some(operation_id) = safe_storage_component(operation_id) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Tool call not found"));
+    };
+    let dir = co_writer_tool_calls_dir(state);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Tool call not found"));
+    };
+    let prefix = format!("{operation_id}_");
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".json") {
+            return read_json_file(&entry.path(), "Tool call not found");
+        }
+    }
+    Err(api_error(StatusCode::NOT_FOUND, "Tool call not found"))
 }
 
 fn add_notebook_record_value(
@@ -5784,6 +6158,94 @@ async fn settings_sidebar(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+async fn update_sidebar_description(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let description = payload["description"].as_str().unwrap_or("").to_string();
+    let mut ui = load_ui_settings(&state);
+    ui["sidebar_description"] = json!(description);
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(json!({ "description": description })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_sidebar_nav_order(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let nav_order = payload
+        .get("nav_order")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| default_ui_settings()["sidebar_nav_order"].clone());
+    let mut ui = load_ui_settings(&state);
+    ui["sidebar_nav_order"] = nav_order.clone();
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(json!({ "nav_order": nav_order })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn settings_tour_status(State(state): State<AppState>) -> Json<Value> {
+    let path = state.settings_root.join(".tour_cache.json");
+    if let Ok(cache) = read_json_file(&path, "Tour cache not found") {
+        return Json(json!({
+            "active": true,
+            "status": cache["status"].as_str().unwrap_or("unknown"),
+            "launch_at": cache.get("launch_at").cloned().unwrap_or(Value::Null),
+            "redirect_at": cache.get("redirect_at").cloned().unwrap_or(Value::Null)
+        }));
+    }
+    Json(json!({
+        "active": false,
+        "status": "none",
+        "launch_at": Value::Null,
+        "redirect_at": Value::Null
+    }))
+}
+
+async fn complete_settings_tour(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let catalog = payload
+        .get("catalog")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| load_settings_catalog(&state));
+    if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
+        return error.into_response();
+    }
+    let env = render_settings_env(&catalog);
+    let now = now_seconds() as i64;
+    let cache = json!({
+        "status": "completed",
+        "launch_at": now + 3,
+        "redirect_at": now + 5,
+        "test_results": payload.get("test_results").cloned().unwrap_or_else(|| json!({}))
+    });
+    if let Err(error) = write_json_file(&state.settings_root.join(".tour_cache.json"), &cache) {
+        return error.into_response();
+    }
+    Json(json!({
+        "status": "completed",
+        "message": "Configuration saved. DeepTutor will restart shortly.",
+        "launch_at": now + 3,
+        "redirect_at": now + 5,
+        "env": env
+    }))
+    .into_response()
+}
+
+async fn reopen_settings_tour() -> Json<Value> {
+    Json(json!({
+        "message": "Run the terminal setup guide from the project root to re-open the guided setup.",
+        "command": "python scripts/start_tour.py"
+    }))
+}
+
 async fn start_settings_test(
     Path(service): Path<String>,
     Json(payload): Json<Value>,
@@ -5890,6 +6352,65 @@ async fn system_test_search(State(state): State<AppState>) -> Json<Value> {
         "response_time_ms": 1.0,
         "error": null
     }))
+}
+
+async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
+    let question = payload["question"].as_str().unwrap_or("").trim();
+    if question.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "question is required").into_response();
+    }
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("vision-{}", unique_id()));
+    let image_base64 = payload["image_base64"].as_str().map(str::trim);
+    let image_url = payload["image_url"].as_str().map(str::trim);
+    if image_base64.is_none_or(str::is_empty) && image_url.is_none_or(str::is_empty) {
+        return Json(json!({
+            "session_id": session_id,
+            "has_image": false,
+            "final_ggb_commands": [],
+            "ggb_script": Value::Null,
+            "analysis_summary": {
+                "image_is_reference": false,
+                "elements_count": 0,
+                "commands_count": 0
+            }
+        }))
+        .into_response();
+    }
+    if let Some(image_base64) = image_base64.filter(|value| !value.is_empty())
+        && !is_valid_image_data_uri(image_base64)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "image_base64 must be a data:image/...;base64,... URI",
+        )
+        .into_response();
+    }
+    if let Some(image_url) = image_url.filter(|value| !value.is_empty())
+        && !(image_url.starts_with("http://") || image_url.starts_with("https://"))
+    {
+        return api_error(StatusCode::BAD_REQUEST, "image_url must be an HTTP(S) URL")
+            .into_response();
+    }
+    api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "Vision image analysis is not implemented in the Rust backend yet",
+    )
+    .into_response()
+}
+
+fn is_valid_image_data_uri(value: &str) -> bool {
+    let Some((prefix, data)) = value.split_once(',') else {
+        return false;
+    };
+    if !prefix.starts_with("data:image/") || !prefix.ends_with(";base64") || data.is_empty() {
+        return false;
+    }
+    data.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 async fn list_tutorbots(State(state): State<AppState>) -> Json<Value> {
@@ -6243,6 +6764,63 @@ async fn tutorbot_ws(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_tutorbot_socket(socket, state, bot_id))
+}
+
+async fn dashboard_recent(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50);
+    let filter = query.get("type").map(String::as_str);
+    let activities = dashboard_activity_entries(&state, limit, filter);
+    Json(Value::Array(activities))
+}
+
+async fn dashboard_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<String>,
+) -> impl IntoResponse {
+    match read_session(&state, &entry_id) {
+        Ok(session) => Json(dashboard_activity_detail(&session)).into_response(),
+        Err(_) => api_error(StatusCode::NOT_FOUND, "Entry not found").into_response(),
+    }
+}
+
+async fn agent_config_agents() -> Json<Value> {
+    Json(agent_registry())
+}
+
+async fn agent_config_agent(Path(agent_type): Path<String>) -> Json<Value> {
+    let registry = agent_registry();
+    if let Some(config) = registry.get(&agent_type).cloned() {
+        Json(config)
+    } else {
+        Json(json!({ "error": format!("Agent type '{agent_type}' not found") }))
+    }
+}
+
+async fn list_solve_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20);
+    Json(Value::Array(legacy_solve_session_summaries(&state, limit)))
+}
+
+async fn get_solve_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match read_session(&state, &session_id) {
+        Ok(session) => Json(legacy_solve_session_detail(session)).into_response(),
+        Err(_) => api_error(StatusCode::NOT_FOUND, "Session not found").into_response(),
+    }
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
@@ -8373,6 +8951,180 @@ fn session_summaries(state: &AppState) -> Vec<Value> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     summaries
+}
+
+fn session_records(state: &AppState) -> Vec<Value> {
+    let mut records = Vec::new();
+    if let Ok(entries) = fs::read_dir(&*state.session_root) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(session) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            records.push(session);
+        }
+    }
+    records.sort_by(|left, right| {
+        right["updated_at"]
+            .as_f64()
+            .partial_cmp(&left["updated_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    records
+}
+
+fn session_capability(session: &Value) -> String {
+    session["capability"]
+        .as_str()
+        .or_else(|| session["preferences"]["capability"].as_str())
+        .unwrap_or("chat")
+        .to_string()
+}
+
+fn dashboard_type_from_capability(capability: &str) -> String {
+    capability
+        .strip_prefix("deep_")
+        .unwrap_or(capability)
+        .to_string()
+}
+
+fn session_last_message(session: &Value) -> String {
+    session["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find_map(|message| message["content"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn dashboard_activity_entries(
+    state: &AppState,
+    limit: usize,
+    type_filter: Option<&str>,
+) -> Vec<Value> {
+    let mut activities = Vec::new();
+    for session in session_records(state) {
+        let capability = session_capability(&session);
+        let activity_type = dashboard_type_from_capability(&capability);
+        if type_filter.is_some_and(|expected| expected != activity_type) {
+            continue;
+        }
+        let summary = session_last_message(&session)
+            .chars()
+            .take(160)
+            .collect::<String>();
+        activities.push(json!({
+            "id": session["session_id"].clone(),
+            "type": activity_type,
+            "capability": capability,
+            "title": session.get("title").cloned().unwrap_or_else(|| json!("Untitled")),
+            "timestamp": session.get("updated_at").cloned().unwrap_or_else(|| session["created_at"].clone()),
+            "summary": summary,
+            "session_ref": format!("sessions/{}", session["session_id"].as_str().unwrap_or_default()),
+            "message_count": session["messages"].as_array().map(Vec::len).unwrap_or_default(),
+            "status": session.get("status").cloned().unwrap_or_else(|| json!("idle")),
+            "active_turn_id": session.get("active_turn_id").cloned().unwrap_or(Value::Null)
+        }));
+        if activities.len() >= limit {
+            break;
+        }
+    }
+    activities
+}
+
+fn dashboard_activity_detail(session: &Value) -> Value {
+    let capability = session_capability(session);
+    json!({
+        "id": session["session_id"].clone(),
+        "type": dashboard_type_from_capability(&capability),
+        "capability": capability,
+        "title": session.get("title").cloned().unwrap_or(Value::Null),
+        "timestamp": session.get("updated_at").cloned().unwrap_or_else(|| session["created_at"].clone()),
+        "content": {
+            "messages": session["messages"].as_array().cloned().unwrap_or_default(),
+            "active_turns": session["active_turns"].as_array().cloned().unwrap_or_default(),
+            "status": session["status"].as_str().unwrap_or("idle"),
+            "summary": session["compressed_summary"].as_str().unwrap_or("")
+        }
+    })
+}
+
+fn agent_registry() -> Value {
+    json!({
+        "solve": {
+            "icon": "HelpCircle",
+            "color": "blue",
+            "label_key": "Problem Solved"
+        },
+        "question": {
+            "icon": "FileText",
+            "color": "purple",
+            "label_key": "Question Generated"
+        },
+        "research": {
+            "icon": "Search",
+            "color": "emerald",
+            "label_key": "Research Report"
+        },
+        "co_writer": {
+            "icon": "PenTool",
+            "color": "amber",
+            "label_key": "Co-Writer"
+        }
+    })
+}
+
+fn legacy_solve_session_summaries(state: &AppState, limit: usize) -> Vec<Value> {
+    session_records(state)
+        .into_iter()
+        .take(limit)
+        .map(|session| {
+            let messages = session["messages"].as_array().cloned().unwrap_or_default();
+            json!({
+                "session_id": session["session_id"].clone(),
+                "title": session.get("title").cloned().unwrap_or_else(|| json!("Untitled")),
+                "message_count": messages.len(),
+                "kb_name": legacy_session_kb_name(&session),
+                "token_stats": session.get("token_stats").cloned().unwrap_or_else(|| json!({})),
+                "created_at": session["created_at"].clone(),
+                "updated_at": session["updated_at"].clone(),
+                "last_message": session_last_message(&session)
+            })
+        })
+        .collect()
+}
+
+fn legacy_solve_session_detail(mut session: Value) -> Value {
+    if !session["kb_name"].is_string() {
+        session["kb_name"] = legacy_session_kb_name(&session);
+    }
+    if !session["token_stats"].is_object() {
+        session["token_stats"] = json!({});
+    }
+    session
+}
+
+fn legacy_session_kb_name(session: &Value) -> Value {
+    session
+        .get("kb_name")
+        .filter(|value| value.is_string())
+        .cloned()
+        .or_else(|| {
+            session["preferences"]["knowledge_bases"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .map(|value| json!(value))
+        })
+        .unwrap_or(Value::Null)
 }
 
 fn session_summary(session: &Value) -> Value {

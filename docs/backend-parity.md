@@ -78,8 +78,9 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`151`
-- 前端仍缺 Rust 覆盖的路径：`1`
+- Rust 后端路由：`169`
+- Python 原后端仍缺 Rust 覆盖的路径：`0`
+- 前端仍缺 Rust 覆盖的路径：`1`，为 `/api/v1/book{param}` 扫描伪影
 
 本轮已补齐并验证的主要区域：
 
@@ -97,17 +98,26 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/plugins/*` Playground plugins list、tool execute、tool SSE、capability SSE 兼容入口
 - `/api/v1/page-agent/openai/v1/chat/completions` Page agent OpenAI-compatible fallback，返回 `AgentOutput` tool call，保持前端 pet/page-agent 可解析
 - `/api/v1/co_writer/documents*` Co-Writer file-backed 文档列表、创建、读取、更新、删除，兼容 12 位 hex id、标题推导、preview、`updated_at` 倒序和 `Document not found` 错误
-- `/api/v1/co_writer/edit`、`/api/v1/co_writer/automark`、`/api/v1/co_writer/edit_react/stream` Co-Writer 编辑、自动标注、selection ReAct SSE 兼容入口
+- `/api/v1/co_writer/edit`、`/api/v1/co_writer/automark`、`/api/v1/co_writer/edit_react`、`/api/v1/co_writer/edit_react/stream` Co-Writer 编辑、自动标注、selection ReAct 普通响应与 SSE 兼容入口
+- `/api/v1/co_writer/history`、`/api/v1/co_writer/history/{operation_id}`、`/api/v1/co_writer/tool_calls/{operation_id}`、`/api/v1/co_writer/export/markdown` Co-Writer 历史、tool call JSON、Markdown 导出兼容入口
+- `/api/attachments/{session_id}/{attachment_id}/{filename}` chat attachment preview/download 兼容入口，并兼容旧扫描器看到的四段 alias 形态
+- `/api/v1/settings/sidebar/description`、`/api/v1/settings/sidebar/nav-order`、`/api/v1/settings/tour/status|complete|reopen` 旧设置和 tour 入口
+- `/api/v1/dashboard/recent`、`/api/v1/dashboard/{entry_id}`、`/api/v1/agent-config/agents*`、`/api/v1/solve/sessions*` legacy dashboard/agent-config/solve session 兼容入口
+- `/api/v1/vision/analyze` legacy REST surface：参数校验和无图请求兼容；真实图片分析暂返回明确 `501`
 
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`33` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`37` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
+- `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
 - `cargo test --test api_contract course`：`3` 个课程/知识库契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
-- `cargo test --test api_contract co_writer_edit_automark_and_stream_match_frontend_contract`：Co-Writer 编辑、自动标注和 SSE selection edit 契约测试通过
+- `cargo test --test api_contract co_writer`：`3` 个 Co-Writer 文档、编辑、历史/tool-calls/export 契约测试通过
+- `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
+- `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
+- `cargo test --test api_contract vision_analyze_rest_route_matches_legacy_validation_contract`：vision REST 校验和降级契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过
@@ -118,10 +128,11 @@ python3 tools/api_parity_scan.py \
 - Chromium 本地打开 `http://127.0.0.1:3011/agents`：页面 `200`，TutorBot 列表和 tabs 渲染，控制台 `0` 个 error
 - Node WebSocket 直连 `ws://127.0.0.1:8810/api/v1/tutorbot/<id>/ws`：收到 `thinking,content,done`
 
-下一批 P0 仍未完成：
+当前剩余高风险差距：
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
-- Python-only 的 Co-Writer history/tool_calls/export、agent-config、dashboard、tour、solve sessions、vision analyze 等剩余兼容入口仍需继续补齐
+- `/api/v1/vision/analyze` 的路由、校验和无图响应已补齐，但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust；这仍是语义级差距，不是路由级缺口
+- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；复杂流式、LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
 
