@@ -1,0 +1,90 @@
+# Socartes Rust Backend
+
+Socartes Rust Backend is a clean Rust rewrite of the Socartes backend prototype. It keeps the same behavior as the previous backend contract while replacing the backend implementation with Rust, Axum, Tokio, and Serde.
+
+This repository is intentionally separate from the original Socartes repository. It contains only the Rust backend implementation and its Rust contract tests.
+
+## Capabilities
+
+| Capability | Rust Implementation |
+| --- | --- |
+| Multi-Agent: Planner / Executor / Critic role separation | `SocartesOrchestrator` builds the same visible Planner -> Retriever -> Tool Adapter -> Executor -> Critic -> Reflection workflow. |
+| RAG (Retrieval-Augmented Generation) | The local RAG index returns cited chunks or refuses when source evidence is missing. |
+| MCP / Tool Use | Tool adapter records model external API, knowledge database, and filesystem operations through auditable outputs. |
+| Reflection / Self-Correction | Reflection events record critic approval and planning constraints for future answer cycles. |
+
+## Backend API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Returns backend status, service name, and version. |
+| `GET` | `/api/v1/agents` | Returns the role boundary and implementation contract for each agent. |
+| `POST` | `/api/v1/learn` | Runs the Planner -> Retriever -> Tool Adapter -> Executor -> Critic -> Reflection loop. |
+| `POST` | `/api/v1/story-rag/ask` | Tests source-grounded RAG answers against an obscure public-domain novel. |
+
+## Run Locally
+
+```bash
+cd backend
+cargo run
+```
+
+The service listens on `0.0.0.0:8000` by default. Set `PORT` to choose a different port:
+
+```bash
+PORT=8080 cargo run
+```
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/learn \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "goal": "Compare RAG agents with MCP tool-using agents.",
+    "learner_context": "Prefer a concise, citation-backed explanation."
+  }'
+```
+
+Story RAG grounding test:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/story-rag/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "What did Jenkins say was in the pajama leg?"}'
+```
+
+Expected behavior:
+
+- If the database contains the supporting chunk, the answer includes `grounded: true` and the matching `source_ids`.
+- If the database does not contain evidence, the answer refuses with `grounded: false` instead of guessing from general model knowledge.
+
+## Repository Structure
+
+```text
+.
++-- backend/
+|   +-- Cargo.toml
+|   +-- Cargo.lock
+|   +-- src/
+|   |   +-- lib.rs
+|   |   +-- main.rs
+|   +-- tests/
+|       +-- api_contract.rs
+|       +-- orchestrator_contract.rs
++-- .gitignore
++-- LICENSE
++-- README.md
+```
+
+## Verification
+
+```bash
+cd backend
+cargo fmt --check
+cargo test
+```
+
+## License
+
+MIT

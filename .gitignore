@@ -1,0 +1,4 @@
+/backend/target/
+**/*.rs.bk
+.env
+.DS_Store
