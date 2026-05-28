@@ -834,6 +834,514 @@ async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
 }
 
 #[tokio::test]
+async fn notebook_crud_and_streamed_save_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/notebook/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "RAG Notes",
+                        "description": "Saved chat outputs",
+                        "color": "#22C55E",
+                        "icon": "notebook"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+    let create_payload = json_response(create_response).await;
+    assert_eq!(create_payload["success"], true);
+    let notebook_id = create_payload["notebook"]["id"].as_str().unwrap();
+    assert_eq!(create_payload["notebook"]["name"], "RAG Notes");
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/notebook/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list_payload = json_response(list_response).await;
+    assert_eq!(list_payload["total"], 1);
+    assert_eq!(list_payload["notebooks"][0]["id"], notebook_id);
+    assert_eq!(list_payload["notebooks"][0]["record_count"], 0);
+
+    let save_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/notebook/add_record_with_summary")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "notebook_ids": [notebook_id],
+                        "record_type": "chat",
+                        "title": "Course answer",
+                        "summary": "A concise saved summary.",
+                        "user_query": "What did the course say?",
+                        "output": "The course evidence came from the uploaded notes.",
+                        "metadata": { "session_id": "chat-session-1", "ui_language": "en" },
+                        "kb_name": "course-live-check"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        save_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let save_body = text_response(save_response).await;
+    assert!(save_body.contains("\"type\":\"summary_chunk\""));
+    assert!(save_body.contains("\"type\":\"result\""));
+    assert!(save_body.contains("A concise saved summary."));
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/notebook/{notebook_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["records"].as_array().unwrap().len(), 1);
+    let record_id = detail["records"][0]["id"].as_str().unwrap();
+    assert_eq!(detail["records"][0]["type"], "chat");
+    assert_eq!(detail["records"][0]["summary"], "A concise saved summary.");
+    assert_eq!(
+        detail["records"][0]["metadata"]["session_id"],
+        "chat-session-1"
+    );
+    assert_eq!(detail["records"][0]["kb_name"], "course-live-check");
+
+    let update_record_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/v1/notebook/{notebook_id}/records/{record_id}"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Updated course answer",
+                        "summary": "Updated summary",
+                        "metadata": { "edited": true },
+                        "kb_name": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_record_response.status(), http::StatusCode::OK);
+    let update_record_payload = json_response(update_record_response).await;
+    assert_eq!(update_record_payload["success"], true);
+    assert_eq!(
+        update_record_payload["record"]["title"],
+        "Updated course answer"
+    );
+    assert_eq!(
+        update_record_payload["record"]["metadata"]["session_id"],
+        "chat-session-1"
+    );
+    assert_eq!(update_record_payload["record"]["metadata"]["edited"], true);
+    assert_eq!(update_record_payload["record"]["kb_name"], Value::Null);
+
+    let statistics_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/notebook/statistics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(statistics_response.status(), http::StatusCode::OK);
+    let statistics = json_response(statistics_response).await;
+    assert_eq!(statistics["total_notebooks"], 1);
+    assert_eq!(statistics["total_records"], 1);
+    assert_eq!(statistics["records_by_type"]["chat"], 1);
+
+    let remove_record_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/notebook/{notebook_id}/records/{record_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remove_record_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(remove_record_response).await["success"], true);
+
+    let update_notebook_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/notebook/{notebook_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "Updated RAG Notes", "color": "#6366F1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_notebook_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(update_notebook_response).await["notebook"]["name"],
+        "Updated RAG Notes"
+    );
+
+    let delete_notebook_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/notebook/{notebook_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_notebook_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_notebook_response).await["success"],
+        true
+    );
+
+    let missing_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/notebook/{notebook_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn question_notebook_entries_and_categories_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "quiz-session-1",
+                        "content": "Create a quiz source session."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+
+    let missing_upsert_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/question-notebook/entries/upsert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "missing-session",
+                        "question_id": "q1",
+                        "question": "Missing?"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_upsert_response.status(),
+        http::StatusCode::NOT_FOUND
+    );
+
+    let upsert_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/question-notebook/entries/upsert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "quiz-session-1",
+                        "question_id": "q-42",
+                        "question": "Which agent checks citations?",
+                        "question_type": "multiple_choice",
+                        "options": { "A": "Planner", "B": "Critic" },
+                        "correct_answer": "B",
+                        "explanation": "The critic reviews citation coverage.",
+                        "difficulty": "medium",
+                        "user_answer": "A",
+                        "is_correct": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upsert_response.status(), http::StatusCode::OK);
+    let entry = json_response(upsert_response).await;
+    let entry_id = entry["id"].as_i64().unwrap();
+    assert_eq!(entry["session_id"], "quiz-session-1");
+    assert_eq!(entry["session_title"], "Create a quiz source session.");
+    assert_eq!(entry["question_id"], "q-42");
+    assert_eq!(entry["options"]["B"], "Critic");
+    assert_eq!(entry["bookmarked"], false);
+
+    let lookup_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/entries/lookup/by-question?session_id=quiz-session-1&question_id=q-42")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lookup_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(lookup_response).await["id"], entry_id);
+
+    let category_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/question-notebook/categories")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name": "Wrong answers"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(category_response.status(), http::StatusCode::CREATED);
+    let category = json_response(category_response).await;
+    let category_id = category["id"].as_i64().unwrap();
+    assert_eq!(category["name"], "Wrong answers");
+    assert_eq!(category["entry_count"], 0);
+
+    let add_category_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/question-notebook/entries/{entry_id}/categories"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"category_id": category_id}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add_category_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(add_category_response).await["added"], true);
+
+    let list_filtered_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/v1/question-notebook/entries?category_id={category_id}&is_correct=false&limit=200"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_filtered_response.status(), http::StatusCode::OK);
+    let filtered = json_response(list_filtered_response).await;
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["items"][0]["id"], entry_id);
+
+    let get_entry_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/question-notebook/entries/{entry_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_entry_response.status(), http::StatusCode::OK);
+    let entry_detail = json_response(get_entry_response).await;
+    assert_eq!(entry_detail["categories"][0]["id"], category_id);
+    assert_eq!(entry_detail["categories"][0]["name"], "Wrong answers");
+
+    let update_entry_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/question-notebook/entries/{entry_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bookmarked": true,
+                        "followup_session_id": "followup-1"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_entry_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(update_entry_response).await["updated"], true);
+
+    let bookmarked_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/entries?bookmarked=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bookmarked_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(bookmarked_response).await["total"], 1);
+
+    let rename_category_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/api/v1/question-notebook/categories/{category_id}"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "Reviewed wrong answers"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_category_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(rename_category_response).await["name"],
+        "Reviewed wrong answers"
+    );
+
+    let categories_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/categories")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(categories_response.status(), http::StatusCode::OK);
+    let categories = json_response(categories_response).await;
+    assert_eq!(categories[0]["entry_count"], 1);
+
+    let remove_category_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/question-notebook/entries/{entry_id}/categories/{category_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remove_category_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(remove_category_response).await["removed"],
+        true
+    );
+
+    let delete_entry_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/question-notebook/entries/{entry_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_entry_response.status(), http::StatusCode::OK);
+
+    let delete_category_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/question-notebook/categories/{category_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_category_response.status(), http::StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_sessions_are_persisted_and_manageable() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

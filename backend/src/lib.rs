@@ -450,6 +450,8 @@ struct AppState {
     output_root: Arc<PathBuf>,
     settings_root: Arc<PathBuf>,
     tutorbot_root: Arc<PathBuf>,
+    notebook_root: Arc<PathBuf>,
+    question_notebook_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -467,13 +469,19 @@ impl AppState {
             .unwrap_or_else(|| user_data_root.join("workspace").join("book"));
         let output_root = env::var_os("SOCARTES_OUTPUT_ROOT")
             .map(PathBuf::from)
-            .unwrap_or(user_data_root);
+            .unwrap_or_else(|| user_data_root.clone());
         let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("settings"));
         let tutorbot_root = env::var_os("SOCARTES_TUTORBOT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("tutorbot"));
+        let notebook_root = env::var_os("SOCARTES_NOTEBOOK_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_data_root.join("workspace").join("notebook"));
+        let question_notebook_root = env::var_os("SOCARTES_QUESTION_NOTEBOOK_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_data_root.join("question_notebook"));
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
@@ -481,6 +489,8 @@ impl AppState {
             output_root: Arc::new(output_root),
             settings_root: Arc::new(settings_root),
             tutorbot_root: Arc::new(tutorbot_root),
+            notebook_root: Arc::new(notebook_root),
+            question_notebook_root: Arc::new(question_notebook_root),
         }
     }
 }
@@ -596,6 +606,59 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         )
         .route("/api/v1/tutorbot/{bot_id}/history", get(tutorbot_history))
         .route("/api/v1/tutorbot/{bot_id}/ws", get(tutorbot_ws))
+        .route("/api/v1/notebook/list", get(list_notebooks_endpoint))
+        .route("/api/v1/notebook/statistics", get(notebook_statistics))
+        .route("/api/v1/notebook/create", post(create_notebook_endpoint))
+        .route("/api/v1/notebook/add_record", post(add_notebook_record))
+        .route(
+            "/api/v1/notebook/add_record_with_summary",
+            post(add_notebook_record_with_summary),
+        )
+        .route("/api/v1/notebook/health", get(notebook_health))
+        .route(
+            "/api/v1/notebook/{notebook_id}",
+            get(get_notebook_endpoint)
+                .put(update_notebook_endpoint)
+                .delete(delete_notebook_endpoint),
+        )
+        .route(
+            "/api/v1/notebook/{notebook_id}/records/{record_id}",
+            put(update_notebook_record).delete(delete_notebook_record),
+        )
+        .route(
+            "/api/v1/question-notebook/entries/upsert",
+            post(upsert_question_notebook_entry),
+        )
+        .route(
+            "/api/v1/question-notebook/entries/lookup/by-question",
+            get(lookup_question_notebook_entry),
+        )
+        .route(
+            "/api/v1/question-notebook/entries",
+            get(list_question_notebook_entries),
+        )
+        .route(
+            "/api/v1/question-notebook/entries/{entry_id}",
+            get(get_question_notebook_entry)
+                .patch(update_question_notebook_entry)
+                .delete(delete_question_notebook_entry),
+        )
+        .route(
+            "/api/v1/question-notebook/entries/{entry_id}/categories",
+            post(add_question_notebook_entry_category),
+        )
+        .route(
+            "/api/v1/question-notebook/entries/{entry_id}/categories/{category_id}",
+            delete(remove_question_notebook_entry_category),
+        )
+        .route(
+            "/api/v1/question-notebook/categories",
+            get(list_question_notebook_categories).post(create_question_notebook_category),
+        )
+        .route(
+            "/api/v1/question-notebook/categories/{category_id}",
+            patch(rename_question_notebook_category).delete(delete_question_notebook_category),
+        )
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}", patch(update_session_title))
@@ -1338,6 +1401,1204 @@ type ApiError = (StatusCode, Json<Value>);
 
 fn api_error(status: StatusCode, detail: &str) -> ApiError {
     (status, Json(json!({ "detail": detail })))
+}
+
+async fn notebook_health() -> Json<Value> {
+    Json(json!({ "status": "healthy", "service": "notebook" }))
+}
+
+async fn list_notebooks_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    match list_notebook_summaries(&state) {
+        Ok(notebooks) => {
+            let total = notebooks.len();
+            Json(json!({ "notebooks": notebooks, "total": total })).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn notebook_statistics(State(state): State<AppState>) -> impl IntoResponse {
+    match notebook_statistics_value(&state) {
+        Ok(stats) => Json(stats).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_notebook_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let name = payload["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "name is required").into_response();
+    }
+    let description = payload["description"].as_str().unwrap_or("");
+    let color = payload["color"].as_str().unwrap_or("#3B82F6");
+    let icon = payload["icon"].as_str().unwrap_or("book");
+    match create_notebook_value(&state, name, description, color, icon) {
+        Ok(notebook) => Json(json!({ "success": true, "notebook": notebook })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_notebook_endpoint(
+    State(state): State<AppState>,
+    Path(notebook_id): Path<String>,
+) -> impl IntoResponse {
+    match load_notebook(&state, &notebook_id) {
+        Ok(notebook) => Json(notebook).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_notebook_endpoint(
+    State(state): State<AppState>,
+    Path(notebook_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match load_notebook(&state, &notebook_id).and_then(|mut notebook| {
+        if let Some(name) = payload["name"].as_str() {
+            notebook["name"] = json!(name);
+        }
+        if let Some(description) = payload["description"].as_str() {
+            notebook["description"] = json!(description);
+        }
+        if let Some(color) = payload["color"].as_str() {
+            notebook["color"] = json!(color);
+        }
+        if let Some(icon) = payload["icon"].as_str() {
+            notebook["icon"] = json!(icon);
+        }
+        notebook["updated_at"] = json!(now_seconds());
+        save_notebook(&state, &notebook)?;
+        touch_notebook_index_entry(&state, &notebook)?;
+        Ok(notebook_summary(&notebook))
+    }) {
+        Ok(notebook) => Json(json!({ "success": true, "notebook": notebook })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_notebook_endpoint(
+    State(state): State<AppState>,
+    Path(notebook_id): Path<String>,
+) -> impl IntoResponse {
+    let path = match notebook_file_path(&state, &notebook_id) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    if !path.exists() {
+        return api_error(StatusCode::NOT_FOUND, "Notebook not found").into_response();
+    }
+    match fs::remove_file(path).and_then(|_| remove_notebook_index_entry(&state, &notebook_id)) {
+        Ok(()) => Json(json!({
+            "success": true,
+            "message": "Notebook deleted successfully"
+        }))
+        .into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to delete notebook: {error}"),
+        )
+        .into_response(),
+    }
+}
+
+async fn add_notebook_record(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match add_notebook_record_value(&state, &payload) {
+        Ok((record, added_to_notebooks, summary)) => Json(json!({
+            "success": true,
+            "summary": summary,
+            "record": record,
+            "added_to_notebooks": added_to_notebooks
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn add_notebook_record_with_summary(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let body = match add_notebook_record_value(&state, &payload) {
+        Ok((record, added_to_notebooks, summary)) => {
+            format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"type": "summary_chunk", "content": summary}),
+                json!({
+                    "type": "result",
+                    "success": true,
+                    "summary": summary,
+                    "record": record,
+                    "added_to_notebooks": added_to_notebooks
+                })
+            )
+        }
+        Err((_, Json(error))) => {
+            let detail = error["detail"]
+                .as_str()
+                .unwrap_or("Failed to save to notebook");
+            format!("data: {}\n\n", json!({"type": "error", "detail": detail}))
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn update_notebook_record(
+    State(state): State<AppState>,
+    Path((notebook_id, record_id)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match update_notebook_record_value(&state, &notebook_id, &record_id, &payload) {
+        Ok(record) => Json(json!({ "success": true, "record": record })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_notebook_record(
+    State(state): State<AppState>,
+    Path((notebook_id, record_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match load_notebook(&state, &notebook_id).and_then(|mut notebook| {
+        let records = notebook["records"]
+            .as_array_mut()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Record not found"))?;
+        let before = records.len();
+        records.retain(|record| record["id"] != record_id);
+        if records.len() == before {
+            return Err(api_error(StatusCode::NOT_FOUND, "Record not found"));
+        }
+        notebook["updated_at"] = json!(now_seconds());
+        save_notebook(&state, &notebook)?;
+        touch_notebook_index_entry(&state, &notebook)?;
+        Ok(())
+    }) {
+        Ok(()) => Json(json!({
+            "success": true,
+            "message": "Record removed successfully"
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn upsert_question_notebook_entry(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match upsert_question_entry_value(&state, &payload) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_question_notebook_entries(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> impl IntoResponse {
+    match list_question_entries_value(&state, &query) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn lookup_question_notebook_entry(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(session_id) = query.get("session_id") else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "session_id is required")
+            .into_response();
+    };
+    let Some(question_id) = query.get("question_id") else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "question_id is required")
+            .into_response();
+    };
+    match find_question_entry(&state, session_id, question_id) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "Entry not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_question_notebook_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<i64>,
+) -> impl IntoResponse {
+    match get_question_entry_by_id(&state, entry_id, true) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "Entry not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_question_notebook_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<i64>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let has_bookmarked = payload.get("bookmarked").and_then(Value::as_bool).is_some();
+    let has_followup = payload
+        .get("followup_session_id")
+        .and_then(Value::as_str)
+        .is_some();
+    if !has_bookmarked && !has_followup {
+        return api_error(StatusCode::BAD_REQUEST, "No fields to update").into_response();
+    }
+    match update_question_entry_value(&state, entry_id, &payload) {
+        Ok(true) => Json(json!({ "updated": true, "id": entry_id })).into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Entry not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_question_notebook_entry(
+    State(state): State<AppState>,
+    Path(entry_id): Path<i64>,
+) -> impl IntoResponse {
+    match delete_question_entry_value(&state, entry_id) {
+        Ok(true) => Json(json!({ "deleted": true, "id": entry_id })).into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Entry not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn add_question_notebook_entry_category(
+    State(state): State<AppState>,
+    Path(entry_id): Path<i64>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let Some(category_id) = payload["category_id"].as_i64() else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "category_id is required")
+            .into_response();
+    };
+    match add_question_entry_category_value(&state, entry_id, category_id) {
+        Ok(()) => Json(json!({
+            "added": true,
+            "entry_id": entry_id,
+            "category_id": category_id
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn remove_question_notebook_entry_category(
+    State(state): State<AppState>,
+    Path((entry_id, category_id)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    match remove_question_entry_category_value(&state, entry_id, category_id) {
+        Ok(true) => Json(json!({
+            "removed": true,
+            "entry_id": entry_id,
+            "category_id": category_id
+        }))
+        .into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Link not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_question_notebook_categories(State(state): State<AppState>) -> impl IntoResponse {
+    match list_question_categories_value(&state) {
+        Ok(categories) => Json(Value::Array(categories)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_question_notebook_category(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let name = payload["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "name is required").into_response();
+    }
+    match create_question_category_value(&state, name) {
+        Ok(category) => (StatusCode::CREATED, Json(category)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn rename_question_notebook_category(
+    State(state): State<AppState>,
+    Path(category_id): Path<i64>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let name = payload["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "name is required").into_response();
+    }
+    match rename_question_category_value(&state, category_id, name) {
+        Ok(true) => {
+            Json(json!({ "updated": true, "id": category_id, "name": name })).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Category not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_question_notebook_category(
+    State(state): State<AppState>,
+    Path(category_id): Path<i64>,
+) -> impl IntoResponse {
+    match delete_question_category_value(&state, category_id) {
+        Ok(true) => Json(json!({ "deleted": true, "id": category_id })).into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Category not found").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn notebook_index_path(state: &AppState) -> PathBuf {
+    state.notebook_root.join("notebooks_index.json")
+}
+
+fn notebook_file_path(state: &AppState, notebook_id: &str) -> Result<PathBuf, ApiError> {
+    let Some(component) = safe_storage_component(notebook_id) else {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid notebook id"));
+    };
+    Ok(state.notebook_root.join(format!("{component}.json")))
+}
+
+fn read_json_file(path: &FsPath, missing_detail: &str) -> Result<Value, ApiError> {
+    let text =
+        fs::read_to_string(path).map_err(|_| api_error(StatusCode::NOT_FOUND, missing_detail))?;
+    serde_json::from_str(&text).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to parse JSON: {error}"),
+        )
+    })
+}
+
+fn write_json_file(path: &FsPath, value: &Value) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create data directory: {error}"),
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize JSON: {error}"),
+        )
+    })?;
+    fs::write(path, bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write JSON: {error}"),
+        )
+    })
+}
+
+fn load_notebook_index(state: &AppState) -> Value {
+    read_json_file(&notebook_index_path(state), "Notebook index not found")
+        .unwrap_or_else(|_| json!({ "notebooks": [] }))
+}
+
+fn save_notebook_index(state: &AppState, index: &Value) -> std::io::Result<()> {
+    if let Some(parent) = notebook_index_path(state).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(index)?;
+    fs::write(notebook_index_path(state), bytes)
+}
+
+fn load_notebook(state: &AppState, notebook_id: &str) -> Result<Value, ApiError> {
+    let path = notebook_file_path(state, notebook_id)?;
+    let mut notebook = read_json_file(&path, "Notebook not found")?;
+    normalize_notebook(&mut notebook);
+    Ok(notebook)
+}
+
+fn normalize_notebook(notebook: &mut Value) {
+    let now = now_seconds();
+    if !notebook["records"].is_array() {
+        notebook["records"] = json!([]);
+    }
+    if !notebook["description"].is_string() {
+        notebook["description"] = json!("");
+    }
+    if !notebook["color"].is_string() {
+        notebook["color"] = json!("#3B82F6");
+    }
+    if !notebook["icon"].is_string() {
+        notebook["icon"] = json!("book");
+    }
+    if !notebook["created_at"].is_number() {
+        notebook["created_at"] = json!(now);
+    }
+    if !notebook["updated_at"].is_number() {
+        notebook["updated_at"] = json!(now);
+    }
+}
+
+fn save_notebook(state: &AppState, notebook: &Value) -> Result<(), ApiError> {
+    let notebook_id = notebook["id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Notebook id is required"))?;
+    let path = notebook_file_path(state, notebook_id)?;
+    write_json_file(&path, notebook)
+}
+
+fn create_notebook_value(
+    state: &AppState,
+    name: &str,
+    description: &str,
+    color: &str,
+    icon: &str,
+) -> Result<Value, ApiError> {
+    let mut notebook_id = short_storage_id();
+    while notebook_file_path(state, &notebook_id)?.exists() {
+        notebook_id = short_storage_id();
+    }
+    let now = now_seconds();
+    let notebook = json!({
+        "id": notebook_id,
+        "name": name,
+        "description": description,
+        "created_at": now,
+        "updated_at": now,
+        "records": [],
+        "color": color,
+        "icon": icon
+    });
+    save_notebook(state, &notebook)?;
+    touch_notebook_index_entry(state, &notebook)?;
+    Ok(notebook)
+}
+
+fn list_notebook_summaries(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let mut notebooks = Vec::new();
+    let index = load_notebook_index(state);
+    for entry in index["notebooks"].as_array().cloned().unwrap_or_default() {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        if let Ok(notebook) = load_notebook(state, id) {
+            notebooks.push(notebook_summary(&notebook));
+        }
+    }
+    notebooks.sort_by(|left, right| {
+        right["updated_at"]
+            .as_f64()
+            .partial_cmp(&left["updated_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(notebooks)
+}
+
+fn notebook_summary(notebook: &Value) -> Value {
+    json!({
+        "id": notebook["id"].clone(),
+        "name": notebook["name"].clone(),
+        "description": notebook["description"].clone(),
+        "created_at": notebook["created_at"].clone(),
+        "updated_at": notebook["updated_at"].clone(),
+        "record_count": notebook["records"].as_array().map(Vec::len).unwrap_or(0),
+        "color": notebook["color"].clone(),
+        "icon": notebook["icon"].clone()
+    })
+}
+
+fn touch_notebook_index_entry(state: &AppState, notebook: &Value) -> Result<(), ApiError> {
+    let mut index = load_notebook_index(state);
+    if !index["notebooks"].is_array() {
+        index["notebooks"] = json!([]);
+    }
+    let summary = notebook_summary(notebook);
+    let notebook_id = summary["id"].as_str().unwrap_or_default();
+    if let Some(entries) = index["notebooks"].as_array_mut() {
+        if let Some(existing) = entries.iter_mut().find(|entry| entry["id"] == notebook_id) {
+            *existing = summary;
+        } else {
+            entries.push(summary);
+        }
+    }
+    save_notebook_index(state, &index).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write notebook index: {error}"),
+        )
+    })
+}
+
+fn remove_notebook_index_entry(state: &AppState, notebook_id: &str) -> std::io::Result<()> {
+    let mut index = load_notebook_index(state);
+    if let Some(entries) = index["notebooks"].as_array_mut() {
+        entries.retain(|entry| entry["id"] != notebook_id);
+    }
+    save_notebook_index(state, &index)
+}
+
+fn add_notebook_record_value(
+    state: &AppState,
+    payload: &Value,
+) -> Result<(Value, Vec<String>, String), ApiError> {
+    let notebook_ids = as_string_array(&payload["notebook_ids"]);
+    let record_type = payload["record_type"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "record_type is required"))?;
+    if !matches!(
+        record_type,
+        "solve" | "question" | "research" | "chat" | "co_writer" | "tutorbot"
+    ) {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unsupported record_type",
+        ));
+    }
+    let title = payload["title"].as_str().unwrap_or("Untitled record");
+    let user_query = payload["user_query"].as_str().unwrap_or("");
+    let output = payload["output"].as_str().unwrap_or("");
+    let summary = payload["summary"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| generated_notebook_summary(title, user_query, output));
+    let metadata = if payload["metadata"].is_object() {
+        payload["metadata"].clone()
+    } else {
+        json!({})
+    };
+    let kb_name = payload.get("kb_name").cloned().unwrap_or(Value::Null);
+    let record = json!({
+        "id": short_storage_id(),
+        "type": record_type,
+        "title": title,
+        "summary": summary,
+        "user_query": user_query,
+        "output": output,
+        "metadata": metadata,
+        "created_at": now_seconds(),
+        "kb_name": kb_name
+    });
+
+    let mut added_to_notebooks = Vec::new();
+    for notebook_id in notebook_ids {
+        let Ok(mut notebook) = load_notebook(state, &notebook_id) else {
+            continue;
+        };
+        if let Some(records) = notebook["records"].as_array_mut() {
+            records.push(record.clone());
+        } else {
+            notebook["records"] = json!([record.clone()]);
+        }
+        notebook["updated_at"] = json!(now_seconds());
+        save_notebook(state, &notebook)?;
+        touch_notebook_index_entry(state, &notebook)?;
+        added_to_notebooks.push(notebook_id);
+    }
+    Ok((record, added_to_notebooks, summary))
+}
+
+fn update_notebook_record_value(
+    state: &AppState,
+    notebook_id: &str,
+    record_id: &str,
+    payload: &Value,
+) -> Result<Value, ApiError> {
+    let mut notebook = load_notebook(state, notebook_id)?;
+    let records = notebook["records"]
+        .as_array_mut()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Record not found"))?;
+    let record = records
+        .iter_mut()
+        .find(|record| record["id"] == record_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Record not found"))?;
+    if let Some(title) = payload["title"].as_str() {
+        record["title"] = json!(title);
+    }
+    if let Some(summary) = payload["summary"].as_str() {
+        record["summary"] = json!(summary.trim());
+    }
+    if let Some(user_query) = payload["user_query"].as_str() {
+        record["user_query"] = json!(user_query);
+    }
+    if let Some(output) = payload["output"].as_str() {
+        record["output"] = json!(output);
+    }
+    if payload["metadata"].is_object() {
+        merge_object_value(&mut record["metadata"], &payload["metadata"]);
+    }
+    if payload.get("kb_name").is_some() {
+        record["kb_name"] = payload["kb_name"].clone();
+    }
+    let updated_record = record.clone();
+    notebook["updated_at"] = json!(now_seconds());
+    save_notebook(state, &notebook)?;
+    touch_notebook_index_entry(state, &notebook)?;
+    Ok(updated_record)
+}
+
+fn notebook_statistics_value(state: &AppState) -> Result<Value, ApiError> {
+    let notebooks = list_notebook_summaries(state)?;
+    let mut records_by_type = json!({
+        "solve": 0,
+        "question": 0,
+        "research": 0,
+        "chat": 0,
+        "co_writer": 0,
+        "tutorbot": 0
+    });
+    let mut total_records = 0usize;
+    for summary in &notebooks {
+        let Some(id) = summary["id"].as_str() else {
+            continue;
+        };
+        let Ok(notebook) = load_notebook(state, id) else {
+            continue;
+        };
+        for record in notebook["records"].as_array().into_iter().flatten() {
+            total_records += 1;
+            if let Some(record_type) = record["type"].as_str() {
+                let current = records_by_type[record_type].as_i64().unwrap_or(0);
+                records_by_type[record_type] = json!(current + 1);
+            }
+        }
+    }
+    Ok(json!({
+        "total_notebooks": notebooks.len(),
+        "total_records": total_records,
+        "records_by_type": records_by_type,
+        "recent_notebooks": notebooks.into_iter().take(5).collect::<Vec<_>>()
+    }))
+}
+
+fn generated_notebook_summary(title: &str, user_query: &str, output: &str) -> String {
+    let source = [title, user_query, output]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or("Saved Socartes record");
+    let mut summary = source.trim().replace('\n', " ");
+    if summary.chars().count() > 240 {
+        summary = summary.chars().take(240).collect();
+    }
+    summary
+}
+
+fn question_store_path(state: &AppState) -> PathBuf {
+    state.question_notebook_root.join("store.json")
+}
+
+fn load_question_store(state: &AppState) -> Value {
+    let mut store = read_json_file(
+        &question_store_path(state),
+        "Question notebook store not found",
+    )
+    .unwrap_or_else(|_| {
+        json!({
+            "next_entry_id": 1,
+            "next_category_id": 1,
+            "entries": [],
+            "categories": [],
+            "links": []
+        })
+    });
+    normalize_question_store(&mut store);
+    store
+}
+
+fn normalize_question_store(store: &mut Value) {
+    if !store["entries"].is_array() {
+        store["entries"] = json!([]);
+    }
+    if !store["categories"].is_array() {
+        store["categories"] = json!([]);
+    }
+    if !store["links"].is_array() {
+        store["links"] = json!([]);
+    }
+    if !store["next_entry_id"].is_i64() && !store["next_entry_id"].is_u64() {
+        let next = store["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["id"].as_i64())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        store["next_entry_id"] = json!(next);
+    }
+    if !store["next_category_id"].is_i64() && !store["next_category_id"].is_u64() {
+        let next = store["categories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|category| category["id"].as_i64())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        store["next_category_id"] = json!(next);
+    }
+}
+
+fn save_question_store(state: &AppState, store: &Value) -> Result<(), ApiError> {
+    write_json_file(&question_store_path(state), store)
+}
+
+fn upsert_question_entry_value(state: &AppState, payload: &Value) -> Result<Value, ApiError> {
+    let session_id = payload["session_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "session_id is required"))?;
+    let question_id = payload["question_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "question_id is required"))?;
+    let question = payload["question"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "question is required"))?;
+    let session = read_session(state, session_id).map_err(|_| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Session not found: {session_id}"),
+        )
+    })?;
+    let mut store = load_question_store(state);
+    let now = now_seconds();
+    let existing_position = store["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .position(|entry| entry["session_id"] == session_id && entry["question_id"] == question_id);
+    let entry = {
+        if let Some(position) = existing_position {
+            let entries = store["entries"].as_array_mut().expect("entries array");
+            let existing = &mut entries[position];
+            existing["user_answer"] = payload["user_answer"].as_str().unwrap_or("").into();
+            existing["is_correct"] = json!(payload["is_correct"].as_bool().unwrap_or(false));
+            existing["updated_at"] = json!(now);
+            existing.clone()
+        } else {
+            let entry_id = store["next_entry_id"].as_i64().unwrap_or(1);
+            store["next_entry_id"] = json!(entry_id + 1);
+            let entry = json!({
+                "id": entry_id,
+                "session_id": session_id,
+                "session_title": session["title"].as_str().unwrap_or(""),
+                "question_id": question_id,
+                "question": question,
+                "question_type": payload["question_type"].as_str().unwrap_or(""),
+                "options": if payload["options"].is_object() { payload["options"].clone() } else { json!({}) },
+                "correct_answer": payload["correct_answer"].as_str().unwrap_or(""),
+                "explanation": payload["explanation"].as_str().unwrap_or(""),
+                "difficulty": payload["difficulty"].as_str().unwrap_or(""),
+                "user_answer": payload["user_answer"].as_str().unwrap_or(""),
+                "is_correct": payload["is_correct"].as_bool().unwrap_or(false),
+                "bookmarked": false,
+                "followup_session_id": "",
+                "created_at": now,
+                "updated_at": now
+            });
+            store["entries"]
+                .as_array_mut()
+                .expect("entries array")
+                .push(entry.clone());
+            entry
+        }
+    };
+    save_question_store(state, &store)?;
+    Ok(question_entry_response(state, &entry, false, &store))
+}
+
+fn list_question_entries_value(
+    state: &AppState,
+    query: &BTreeMap<String, String>,
+) -> Result<Value, ApiError> {
+    let store = load_question_store(state);
+    let category_id = query
+        .get("category_id")
+        .and_then(|value| value.parse::<i64>().ok());
+    let bookmarked = query
+        .get("bookmarked")
+        .and_then(|value| parse_bool_query(value));
+    let is_correct = query
+        .get("is_correct")
+        .and_then(|value| parse_bool_query(value));
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let links = store["links"].as_array().cloned().unwrap_or_default();
+    let mut entries = store["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            if let Some(category_id) = category_id {
+                let entry_id = entry["id"].as_i64().unwrap_or_default();
+                if !links.iter().any(|link| {
+                    link["entry_id"].as_i64() == Some(entry_id)
+                        && link["category_id"].as_i64() == Some(category_id)
+                }) {
+                    return false;
+                }
+            }
+            if let Some(bookmarked) = bookmarked
+                && entry["bookmarked"].as_bool().unwrap_or(false) != bookmarked
+            {
+                return false;
+            }
+            if let Some(is_correct) = is_correct
+                && entry["is_correct"].as_bool().unwrap_or(false) != is_correct
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right["created_at"]
+            .as_f64()
+            .partial_cmp(&left["created_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total = entries.len();
+    let items = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entry| question_entry_response(state, &entry, false, &store))
+        .collect::<Vec<_>>();
+    Ok(json!({ "items": items, "total": total }))
+}
+
+fn find_question_entry(
+    state: &AppState,
+    session_id: &str,
+    question_id: &str,
+) -> Result<Option<Value>, ApiError> {
+    let store = load_question_store(state);
+    Ok(store["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["session_id"] == session_id && entry["question_id"] == question_id)
+        .map(|entry| question_entry_response(state, entry, false, &store)))
+}
+
+fn get_question_entry_by_id(
+    state: &AppState,
+    entry_id: i64,
+    include_categories: bool,
+) -> Result<Option<Value>, ApiError> {
+    let store = load_question_store(state);
+    Ok(store["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["id"].as_i64() == Some(entry_id))
+        .map(|entry| question_entry_response(state, entry, include_categories, &store)))
+}
+
+fn update_question_entry_value(
+    state: &AppState,
+    entry_id: i64,
+    payload: &Value,
+) -> Result<bool, ApiError> {
+    let mut store = load_question_store(state);
+    let Some(entries) = store["entries"].as_array_mut() else {
+        return Ok(false);
+    };
+    let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry["id"].as_i64() == Some(entry_id))
+    else {
+        return Ok(false);
+    };
+    if let Some(bookmarked) = payload["bookmarked"].as_bool() {
+        entry["bookmarked"] = json!(bookmarked);
+    }
+    if let Some(followup_session_id) = payload["followup_session_id"].as_str() {
+        entry["followup_session_id"] = json!(followup_session_id);
+    }
+    entry["updated_at"] = json!(now_seconds());
+    save_question_store(state, &store)?;
+    Ok(true)
+}
+
+fn delete_question_entry_value(state: &AppState, entry_id: i64) -> Result<bool, ApiError> {
+    let mut store = load_question_store(state);
+    let Some(entries) = store["entries"].as_array_mut() else {
+        return Ok(false);
+    };
+    let before = entries.len();
+    entries.retain(|entry| entry["id"].as_i64() != Some(entry_id));
+    if entries.len() == before {
+        return Ok(false);
+    }
+    if let Some(links) = store["links"].as_array_mut() {
+        links.retain(|link| link["entry_id"].as_i64() != Some(entry_id));
+    }
+    save_question_store(state, &store)?;
+    Ok(true)
+}
+
+fn list_question_categories_value(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let store = load_question_store(state);
+    let links = store["links"].as_array().cloned().unwrap_or_default();
+    let mut categories = store["categories"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|category| {
+            let category_id = category["id"].as_i64().unwrap_or_default();
+            let entry_count = links
+                .iter()
+                .filter(|link| link["category_id"].as_i64() == Some(category_id))
+                .count();
+            json!({
+                "id": category_id,
+                "name": category["name"].as_str().unwrap_or(""),
+                "created_at": category["created_at"].as_f64().unwrap_or_default(),
+                "entry_count": entry_count
+            })
+        })
+        .collect::<Vec<_>>();
+    categories.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["name"].as_str().unwrap_or(""))
+    });
+    Ok(categories)
+}
+
+fn create_question_category_value(state: &AppState, name: &str) -> Result<Value, ApiError> {
+    let mut store = load_question_store(state);
+    if store["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|category| category["name"].as_str() == Some(name))
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Category name already exists",
+        ));
+    }
+    let category_id = store["next_category_id"].as_i64().unwrap_or(1);
+    store["next_category_id"] = json!(category_id + 1);
+    let category = json!({
+        "id": category_id,
+        "name": name,
+        "created_at": now_seconds(),
+        "entry_count": 0
+    });
+    store["categories"]
+        .as_array_mut()
+        .expect("categories array")
+        .push(category.clone());
+    save_question_store(state, &store)?;
+    Ok(category)
+}
+
+fn rename_question_category_value(
+    state: &AppState,
+    category_id: i64,
+    name: &str,
+) -> Result<bool, ApiError> {
+    let mut store = load_question_store(state);
+    if store["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|category| {
+            category["id"].as_i64() != Some(category_id) && category["name"].as_str() == Some(name)
+        })
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Category name already exists",
+        ));
+    }
+    let Some(categories) = store["categories"].as_array_mut() else {
+        return Ok(false);
+    };
+    let Some(category) = categories
+        .iter_mut()
+        .find(|category| category["id"].as_i64() == Some(category_id))
+    else {
+        return Ok(false);
+    };
+    category["name"] = json!(name);
+    save_question_store(state, &store)?;
+    Ok(true)
+}
+
+fn delete_question_category_value(state: &AppState, category_id: i64) -> Result<bool, ApiError> {
+    let mut store = load_question_store(state);
+    let Some(categories) = store["categories"].as_array_mut() else {
+        return Ok(false);
+    };
+    let before = categories.len();
+    categories.retain(|category| category["id"].as_i64() != Some(category_id));
+    if categories.len() == before {
+        return Ok(false);
+    }
+    if let Some(links) = store["links"].as_array_mut() {
+        links.retain(|link| link["category_id"].as_i64() != Some(category_id));
+    }
+    save_question_store(state, &store)?;
+    Ok(true)
+}
+
+fn add_question_entry_category_value(
+    state: &AppState,
+    entry_id: i64,
+    category_id: i64,
+) -> Result<(), ApiError> {
+    let mut store = load_question_store(state);
+    let entry_exists = store["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entry| entry["id"].as_i64() == Some(entry_id));
+    if !entry_exists {
+        return Err(api_error(StatusCode::NOT_FOUND, "Entry not found"));
+    }
+    let category_exists = store["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|category| category["id"].as_i64() == Some(category_id));
+    if !category_exists {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to add to category",
+        ));
+    }
+    let links = store["links"].as_array_mut().expect("links array");
+    if !links.iter().any(|link| {
+        link["entry_id"].as_i64() == Some(entry_id)
+            && link["category_id"].as_i64() == Some(category_id)
+    }) {
+        links.push(json!({ "entry_id": entry_id, "category_id": category_id }));
+    }
+    save_question_store(state, &store)
+}
+
+fn remove_question_entry_category_value(
+    state: &AppState,
+    entry_id: i64,
+    category_id: i64,
+) -> Result<bool, ApiError> {
+    let mut store = load_question_store(state);
+    let Some(links) = store["links"].as_array_mut() else {
+        return Ok(false);
+    };
+    let before = links.len();
+    links.retain(|link| {
+        !(link["entry_id"].as_i64() == Some(entry_id)
+            && link["category_id"].as_i64() == Some(category_id))
+    });
+    if links.len() == before {
+        return Ok(false);
+    }
+    save_question_store(state, &store)?;
+    Ok(true)
+}
+
+fn question_entry_response(
+    state: &AppState,
+    entry: &Value,
+    include_categories: bool,
+    store: &Value,
+) -> Value {
+    let session_id = entry["session_id"].as_str().unwrap_or("");
+    let session_title = read_session(state, session_id)
+        .ok()
+        .and_then(|session| session["title"].as_str().map(ToString::to_string))
+        .or_else(|| entry["session_title"].as_str().map(ToString::to_string))
+        .unwrap_or_default();
+    let entry_id = entry["id"].as_i64().unwrap_or_default();
+    let mut value = json!({
+        "id": entry_id,
+        "session_id": session_id,
+        "session_title": session_title,
+        "question_id": entry["question_id"].as_str().unwrap_or(""),
+        "question": entry["question"].as_str().unwrap_or(""),
+        "question_type": entry["question_type"].as_str().unwrap_or(""),
+        "options": if entry["options"].is_object() { entry["options"].clone() } else { json!({}) },
+        "correct_answer": entry["correct_answer"].as_str().unwrap_or(""),
+        "explanation": entry["explanation"].as_str().unwrap_or(""),
+        "difficulty": entry["difficulty"].as_str().unwrap_or(""),
+        "user_answer": entry["user_answer"].as_str().unwrap_or(""),
+        "is_correct": entry["is_correct"].as_bool().unwrap_or(false),
+        "bookmarked": entry["bookmarked"].as_bool().unwrap_or(false),
+        "followup_session_id": entry["followup_session_id"].as_str().unwrap_or(""),
+        "created_at": entry["created_at"].as_f64().unwrap_or_default(),
+        "updated_at": entry["updated_at"].as_f64().unwrap_or_default()
+    });
+    if include_categories {
+        value["categories"] = json!(question_entry_categories(entry_id, store));
+    }
+    value
+}
+
+fn question_entry_categories(entry_id: i64, store: &Value) -> Vec<Value> {
+    let links = store["links"].as_array().cloned().unwrap_or_default();
+    let categories = store["categories"].as_array().cloned().unwrap_or_default();
+    let mut result = links
+        .into_iter()
+        .filter(|link| link["entry_id"].as_i64() == Some(entry_id))
+        .filter_map(|link| {
+            let category_id = link["category_id"].as_i64()?;
+            let category = categories
+                .iter()
+                .find(|category| category["id"].as_i64() == Some(category_id))?;
+            Some(json!({
+                "id": category_id,
+                "name": category["name"].as_str().unwrap_or("")
+            }))
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["name"].as_str().unwrap_or(""))
+    });
+    result
+}
+
+fn parse_bool_query(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn short_storage_id() -> String {
+    let raw = format!("{:x}", unique_id());
+    let start = raw.len().saturating_sub(8);
+    raw[start..].to_string()
 }
 
 fn book_dir(state: &AppState, book_id: &str) -> PathBuf {
