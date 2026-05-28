@@ -3439,6 +3439,200 @@ async fn chat_sessions_are_persisted_and_manageable() {
 }
 
 #[tokio::test]
+async fn chat_ws_subscribe_turn_replays_persisted_events_after_seq() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain replayable Socartes turn events.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut first_events = Vec::new();
+    while let Some(message) = socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                first_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        first_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+    let session_id = first_events[0]["session_id"].as_str().unwrap().to_string();
+    let turn_id = first_events[0]["turn_id"].as_str().unwrap().to_string();
+    socket.close(None).await.unwrap();
+
+    let (mut replay_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    replay_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 3
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut replay_events = Vec::new();
+    while let Some(message) = replay_socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                replay_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        replay_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6, 7]
+    );
+    assert!(
+        replay_events
+            .iter()
+            .all(|event| event["session_id"] == session_id)
+    );
+    assert!(
+        replay_events
+            .iter()
+            .all(|event| event["turn_id"] == turn_id)
+    );
+    assert_eq!(replay_events.last().unwrap()["type"], "done");
+    assert_eq!(
+        replay_events.last().unwrap()["metadata"]["status"],
+        "completed"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_resume_from_replays_tail_events_for_existing_turn() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let request_body = json!({
+        "type": "start_turn",
+        "content": "Explain resumable Socartes turn events.",
+        "language": "en",
+        "knowledge_bases": ["socartes-rust-rag"]
+    });
+
+    let turn_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let turn = json_response(turn_response).await;
+    let turn_id = turn["turn_id"].as_str().unwrap().to_string();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "resume_from",
+                "turn_id": turn_id,
+                "seq": 5
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut replay_events = Vec::new();
+    while let Some(message) = socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                replay_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        replay_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![6, 7]
+    );
+    assert_eq!(replay_events[0]["type"], "stage_end");
+    assert_eq!(replay_events[1]["type"], "done");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_frontend_bootstrap_reads_file_backed_books_and_outputs() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

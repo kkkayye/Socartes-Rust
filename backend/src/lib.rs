@@ -19,7 +19,7 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -8946,7 +8946,31 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
                 )
                 .await;
             }
-            "ping" | "subscribe_turn" | "subscribe_session" | "resume_from" | "unsubscribe" => {}
+            "subscribe_turn" => {
+                replay_turn_events(&mut socket, &state, &payload).await;
+            }
+            "resume_from" => {
+                replay_turn_events(&mut socket, &state, &payload).await;
+            }
+            "subscribe_session" => {
+                replay_session_events(&mut socket, &state, &payload).await;
+            }
+            "ping" => {
+                let _ = send_stream_event(
+                    &mut socket,
+                    stream_event(
+                        "pong",
+                        "rust-backend",
+                        "protocol",
+                        "",
+                        json!({}),
+                        StreamIds::empty(),
+                        1,
+                    ),
+                )
+                .await;
+            }
+            "unsubscribe" => {}
             _ => {
                 let _ = send_stream_event(
                     &mut socket,
@@ -8964,6 +8988,85 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+async fn replay_turn_events(socket: &mut WebSocket, state: &AppState, payload: &Value) {
+    let Some(turn_id) = payload["turn_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        let _ = send_protocol_error(socket, "turn_id is required").await;
+        return;
+    };
+    let after_seq = replay_after_seq(payload);
+    match read_turn_events(state, turn_id, after_seq) {
+        Ok(events) => {
+            for event in events {
+                if send_stream_event(socket, event).await.is_err() {
+                    break;
+                }
+            }
+        }
+        Err(error) => {
+            let _ = send_api_error_as_stream(socket, error).await;
+        }
+    }
+}
+
+async fn replay_session_events(socket: &mut WebSocket, state: &AppState, payload: &Value) {
+    let Some(session_id) = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        let _ = send_protocol_error(socket, "session_id is required").await;
+        return;
+    };
+    let after_seq = replay_after_seq(payload);
+    match latest_session_turn_events(state, session_id, after_seq) {
+        Ok(events) => {
+            for event in events {
+                if send_stream_event(socket, event).await.is_err() {
+                    break;
+                }
+            }
+        }
+        Err(error) => {
+            let _ = send_api_error_as_stream(socket, error).await;
+        }
+    }
+}
+
+async fn send_api_error_as_stream(
+    socket: &mut WebSocket,
+    (_status, Json(body)): ApiError,
+) -> Result<(), axum::Error> {
+    let detail = body["detail"]
+        .as_str()
+        .unwrap_or("WebSocket replay failed.");
+    send_protocol_error(socket, detail).await
+}
+
+async fn send_protocol_error(socket: &mut WebSocket, detail: &str) -> Result<(), axum::Error> {
+    send_stream_event(
+        socket,
+        stream_event(
+            "error",
+            "rust-backend",
+            "protocol",
+            detail,
+            json!({ "turn_terminal": false, "status": "failed" }),
+            StreamIds::empty(),
+            1,
+        ),
+    )
+    .await
+}
+
+fn replay_after_seq(payload: &Value) -> u64 {
+    payload["after_seq"]
+        .as_u64()
+        .or_else(|| payload["seq"].as_u64())
+        .unwrap_or_default()
 }
 
 async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
@@ -9103,6 +9206,60 @@ fn write_session(state: &AppState, session_id: &str, session: &Value) -> Result<
             &format!("Failed to write session: {error}"),
         )
     })
+}
+
+fn read_turn_events(
+    state: &AppState,
+    turn_id: &str,
+    after_seq: u64,
+) -> Result<Vec<Value>, ApiError> {
+    for session in session_records(state) {
+        if let Some(events) = turn_events_from_session(&session, turn_id, after_seq) {
+            return Ok(events);
+        }
+    }
+    Err(api_error(StatusCode::NOT_FOUND, "Turn not found"))
+}
+
+fn latest_session_turn_events(
+    state: &AppState,
+    session_id: &str,
+    after_seq: u64,
+) -> Result<Vec<Value>, ApiError> {
+    let session = read_session(state, session_id)?;
+    let Some(turn_id) = latest_turn_id(&session) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Turn not found"));
+    };
+    turn_events_from_session(&session, &turn_id, after_seq)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found"))
+}
+
+fn latest_turn_id(session: &Value) -> Option<String> {
+    session["turns"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .and_then(|turn| turn["id"].as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            session["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .find_map(|message| message["metadata"]["turn_id"].as_str())
+                .map(ToString::to_string)
+        })
+}
+
+fn turn_events_from_session(session: &Value, turn_id: &str, after_seq: u64) -> Option<Vec<Value>> {
+    let events = session["turn_events"][turn_id].as_array()?;
+    Some(
+        events
+            .iter()
+            .filter(|event| event["seq"].as_u64().unwrap_or_default() > after_seq)
+            .cloned()
+            .collect(),
+    )
 }
 
 fn session_summaries(state: &AppState) -> Vec<Value> {
@@ -9395,6 +9552,7 @@ fn persist_chat_turn(
     session["updated_at"] = json!(now);
     session["status"] = json!("completed");
     session["active_turns"] = json!([]);
+    session["active_turn_id"] = Value::Null;
     session["preferences"] = json!({
         "capability": payload["capability"].clone(),
         "tools": as_string_array(&payload["tools"]),
@@ -9402,6 +9560,25 @@ fn persist_chat_turn(
         "language": payload["language"].as_str().unwrap_or("en"),
         "llm_selection": payload["llm_selection"].clone()
     });
+    let turn_record = json!({
+        "id": turn_id,
+        "session_id": session_id,
+        "status": "completed",
+        "started_at": now,
+        "completed_at": now,
+        "event_count": events.len()
+    });
+    if let Some(turns) = session["turns"].as_array_mut() {
+        turns.push(turn_record);
+    } else {
+        session["turns"] = json!([turn_record]);
+    }
+    if !session["turn_events"].is_object() {
+        session["turn_events"] = Value::Object(Map::new());
+    }
+    if let Some(turn_events) = session["turn_events"].as_object_mut() {
+        turn_events.insert(turn_id.to_string(), Value::Array(events.to_vec()));
+    }
 
     write_session(state, session_id, &session)
 }

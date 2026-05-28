@@ -86,6 +86,7 @@ python3 tools/api_parity_scan.py \
 
 - `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除、health、configs/config sync、default get、per-KB config、progress、linked-folder/sync-folder 管理入口
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
+- `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn` 和 `resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，`subscribe_session` 可回放 session 最新 turn
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
@@ -109,7 +110,7 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`40` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`42` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
@@ -119,6 +120,7 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
 - `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、真实 WS 握手和事件序列契约测试通过
+- `cargo test --test api_contract chat_ws_`：`2` 个 unified chat WebSocket 真实握手、turn event 持久化、`subscribe_turn`/`resume_from` 回放契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过
@@ -133,7 +135,7 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
 - `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
-- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；复杂流式、LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
+- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；unified WS 已补已完成 turn 的 replay，仍缺运行中 turn live subscriber、真实 cancel task、真实 regenerate 语义；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
 
