@@ -508,6 +508,13 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         .route("/docs/oauth2-redirect", get(swagger_oauth2_redirect))
         .route("/redoc", get(redoc_docs))
         .route("/api/v1/agents", get(agents))
+        .route("/api/v1/knowledge/health", get(knowledge_health))
+        .route("/api/v1/knowledge/configs", get(get_knowledge_configs))
+        .route(
+            "/api/v1/knowledge/configs/sync",
+            post(sync_knowledge_configs),
+        )
+        .route("/api/v1/knowledge/default", get(get_default_knowledge_base))
         .route("/api/v1/knowledge/list", get(knowledge_list))
         .route("/api/v1/knowledge/rag-providers", get(rag_providers))
         .route(
@@ -523,10 +530,38 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             "/api/v1/knowledge/tasks/{task_id}/stream",
             get(knowledge_task_stream),
         )
+        .route(
+            "/api/v1/knowledge/{name}/config",
+            get(get_knowledge_config).put(update_knowledge_config),
+        )
         .route("/api/v1/knowledge/{name}/files", get(list_knowledge_files))
         .route(
             "/api/v1/knowledge/{name}/files/{*file_path}",
             get(read_knowledge_file),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/progress",
+            get(get_knowledge_progress),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/progress/clear",
+            post(clear_knowledge_progress),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/link-folder",
+            post(link_knowledge_folder),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/linked-folders",
+            get(list_linked_knowledge_folders),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/linked-folders/{folder_id}",
+            delete(unlink_knowledge_folder),
+        )
+        .route(
+            "/api/v1/knowledge/{name}/sync-folder/{folder_id}",
+            post(sync_knowledge_folder),
         )
         .route(
             "/api/v1/knowledge/{name}/upload",
@@ -766,6 +801,70 @@ async fn knowledge_list(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+async fn knowledge_health(State(state): State<AppState>) -> Json<Value> {
+    let config_file = knowledge_config_path(&state);
+    let base_dir = state.knowledge_root.join("bases");
+    Json(json!({
+        "status": "ok",
+        "config_file": config_file.to_string_lossy(),
+        "config_exists": config_file.exists(),
+        "base_dir": base_dir.to_string_lossy(),
+        "base_dir_exists": base_dir.exists(),
+        "knowledge_bases_count": knowledge_base_summaries(&state).len()
+    }))
+}
+
+async fn get_default_knowledge_base(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "default_kb": read_default_knowledge_base(&state) }))
+}
+
+async fn get_knowledge_configs(State(state): State<AppState>) -> Json<Value> {
+    Json(load_knowledge_config_store(&state))
+}
+
+async fn sync_knowledge_configs(State(state): State<AppState>) -> impl IntoResponse {
+    let mut store = load_knowledge_config_store(&state);
+    let mut knowledge_bases = store["knowledge_bases"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    let bases_dir = state.knowledge_root.join("bases");
+    if let Ok(entries) = fs::read_dir(bases_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+                continue;
+            };
+            let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
+            let mut config = knowledge_bases
+                .remove(&name)
+                .filter(|value| value.is_object())
+                .unwrap_or_else(|| default_knowledge_base_config(&state, &name));
+            if let Some(description) = metadata["description"].as_str() {
+                config["description"] = json!(description);
+            }
+            if let Some(search_mode) = metadata["search_mode"].as_str() {
+                config["search_mode"] = json!(search_mode);
+            }
+            config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+            knowledge_bases.insert(name, config);
+        }
+    }
+
+    store["knowledge_bases"] = Value::Object(knowledge_bases);
+    match write_knowledge_config_store(&state, &store) {
+        Ok(()) => Json(json!({
+            "status": "success",
+            "message": "Configurations synced from metadata files"
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn rag_providers() -> Json<Value> {
     Json(json!({
         "providers": [
@@ -785,6 +884,51 @@ async fn supported_file_types() -> Json<Value> {
         "max_file_size_bytes": 100 * 1024 * 1024,
         "max_pdf_size_bytes": 50 * 1024 * 1024
     }))
+}
+
+async fn get_knowledge_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    Json(json!({
+        "kb_name": name,
+        "config": merged_knowledge_config(&state, &name)
+    }))
+}
+
+async fn update_knowledge_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut store = load_knowledge_config_store(&state);
+    let mut config = merged_knowledge_config(&state, &name);
+    if let Some(object) = payload.as_object() {
+        for (key, value) in object {
+            config[key] = if key == "rag_provider" {
+                json!(DEFAULT_RAG_PROVIDER)
+            } else {
+                value.clone()
+            };
+        }
+    }
+    config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+
+    if let Some(object) = store["knowledge_bases"].as_object_mut() {
+        object.insert(name.clone(), config.clone());
+    } else {
+        store["knowledge_bases"] = json!({ name.clone(): config.clone() });
+    }
+
+    match write_knowledge_config_store(&state, &store) {
+        Ok(()) => Json(json!({
+            "status": "success",
+            "kb_name": name,
+            "config": config
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn list_knowledge_files(
@@ -820,6 +964,210 @@ async fn read_knowledge_file(
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         Err(_) => api_error(StatusCode::NOT_FOUND, "File not found").into_response(),
     }
+}
+
+async fn get_knowledge_progress(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let path = knowledge_progress_path(&state, &name);
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(progress) => Json(progress).into_response(),
+            Err(error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Invalid progress JSON: {error}"),
+            )
+            .into_response(),
+        },
+        Err(_) => Json(json!({
+            "status": "not_started",
+            "message": "Initialization not started"
+        }))
+        .into_response(),
+    }
+}
+
+async fn clear_knowledge_progress(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let path = knowledge_progress_path(&state, &name);
+    if path.exists()
+        && let Err(error) = fs::remove_file(path)
+    {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to clear progress: {error}"),
+        )
+        .into_response();
+    }
+    Json(json!({
+        "status": "success",
+        "message": format!("Progress cleared for {name}")
+    }))
+    .into_response()
+}
+
+async fn link_knowledge_folder(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if !knowledge_base_exists(&state, &name) {
+        return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
+    }
+    let Some(folder_path) = payload["folder_path"].as_str().map(str::trim) else {
+        return api_error(StatusCode::BAD_REQUEST, "folder_path is required").into_response();
+    };
+    if folder_path.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "folder_path is required").into_response();
+    }
+    let path = expand_user_path(folder_path);
+    if !path.is_dir() {
+        return api_error(StatusCode::BAD_REQUEST, "Linked folder not found").into_response();
+    }
+
+    let mut folders = load_linked_knowledge_folders(&state, &name);
+    if let Some(existing) = folders
+        .iter()
+        .find(|folder| folder["path"].as_str() == Some(path.to_string_lossy().as_ref()))
+        .cloned()
+    {
+        return Json(existing).into_response();
+    }
+
+    let folder = json!({
+        "id": format!("folder-{}", unique_id()),
+        "path": path.to_string_lossy(),
+        "added_at": now_label(),
+        "file_count": count_supported_files_in_dir(&path)
+    });
+    folders.push(folder.clone());
+    match write_linked_knowledge_folders(&state, &name, &folders) {
+        Ok(()) => Json(folder).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_linked_knowledge_folders(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if !knowledge_base_exists(&state, &name) {
+        return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
+    }
+    Json(Value::Array(load_linked_knowledge_folders(&state, &name))).into_response()
+}
+
+async fn unlink_knowledge_folder(
+    State(state): State<AppState>,
+    Path((name, folder_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !knowledge_base_exists(&state, &name) {
+        return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
+    }
+    let mut folders = load_linked_knowledge_folders(&state, &name);
+    let original_len = folders.len();
+    folders.retain(|folder| folder["id"].as_str() != Some(folder_id.as_str()));
+    if folders.len() == original_len {
+        return api_error(StatusCode::NOT_FOUND, "Folder not found").into_response();
+    }
+    match write_linked_knowledge_folders(&state, &name, &folders) {
+        Ok(()) => Json(json!({
+            "message": "Folder unlinked successfully",
+            "folder_id": folder_id
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn sync_knowledge_folder(
+    State(state): State<AppState>,
+    Path((name, folder_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !knowledge_base_exists(&state, &name) {
+        return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
+    }
+    let Some(folder) = load_linked_knowledge_folders(&state, &name)
+        .into_iter()
+        .find(|folder| folder["id"].as_str() == Some(folder_id.as_str()))
+    else {
+        return api_error(StatusCode::NOT_FOUND, "Linked folder not found").into_response();
+    };
+    let Some(folder_path) = folder["path"].as_str() else {
+        return api_error(StatusCode::BAD_REQUEST, "Linked folder path is invalid").into_response();
+    };
+    let source_dir = PathBuf::from(folder_path);
+    if !source_dir.is_dir() {
+        return api_error(StatusCode::BAD_REQUEST, "Linked folder not found").into_response();
+    }
+
+    let mut synced = Vec::new();
+    if let Ok(entries) = fs::read_dir(&source_dir) {
+        let target_dir = knowledge_files_dir(&state, &name);
+        if let Err(error) = fs::create_dir_all(&target_dir) {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create knowledge file directory: {error}"),
+            )
+            .into_response();
+        }
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(filename) = entry.file_name().to_str().and_then(safe_filename) else {
+                continue;
+            };
+            if !is_supported_knowledge_file(&filename) {
+                continue;
+            }
+            if fs::copy(&path, target_dir.join(&filename)).is_ok() {
+                synced.push(filename);
+            }
+        }
+    }
+
+    if synced.is_empty() {
+        return Json(json!({
+            "message": "No new or modified files to sync",
+            "files": [],
+            "file_count": 0
+        }))
+        .into_response();
+    }
+
+    let task_id = format!("kb_upload-{}", unique_id());
+    let progress = json!({
+        "task_id": task_id,
+        "stage": "completed",
+        "message": format!("Synced {} files from linked folder", synced.len()),
+        "percent": 100,
+        "current": synced.len(),
+        "total": synced.len(),
+        "timestamp": now_label()
+    });
+    let _ = write_knowledge_progress(&state, &name, &progress);
+    let _ = write_knowledge_metadata(
+        &state,
+        &name,
+        DEFAULT_RAG_PROVIDER,
+        Some(json!({ "last_indexed_action": "sync-folder" })),
+    );
+
+    Json(json!({
+        "message": format!("Syncing {} files from linked folder", synced.len()),
+        "folder_path": folder_path,
+        "new_files": synced.len(),
+        "modified_files": 0,
+        "file_count": synced.len(),
+        "files": synced,
+        "task_id": task_id
+    }))
+    .into_response()
 }
 
 async fn create_knowledge_base(
@@ -4171,12 +4519,197 @@ fn default_knowledge_path(state: &AppState) -> PathBuf {
     state.knowledge_root.join("default.txt")
 }
 
+fn knowledge_config_path(state: &AppState) -> PathBuf {
+    state.knowledge_root.join("kb_config.json")
+}
+
+fn knowledge_progress_path(state: &AppState, name: &str) -> PathBuf {
+    knowledge_base_dir(state, name).join("progress.json")
+}
+
+fn linked_knowledge_folders_path(state: &AppState, name: &str) -> PathBuf {
+    knowledge_base_dir(state, name).join("linked_folders.json")
+}
+
 fn read_default_knowledge_base(state: &AppState) -> String {
     fs::read_to_string(default_knowledge_path(state))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| knowledge_base_exists(state, value))
         .unwrap_or_else(|| BUILTIN_KNOWLEDGE_BASE.to_string())
+}
+
+fn default_knowledge_config_store(state: &AppState) -> Value {
+    json!({
+        "defaults": {
+            "default_kb": read_default_knowledge_base(state),
+            "rag_provider": DEFAULT_RAG_PROVIDER,
+            "search_mode": "hybrid"
+        },
+        "knowledge_bases": {}
+    })
+}
+
+fn load_knowledge_config_store(state: &AppState) -> Value {
+    let mut store = fs::read_to_string(knowledge_config_path(state))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| default_knowledge_config_store(state));
+    if !store["defaults"].is_object() {
+        store["defaults"] = json!({});
+    }
+    if !store["knowledge_bases"].is_object() {
+        store["knowledge_bases"] = json!({});
+    }
+    store["defaults"]["default_kb"] = json!(read_default_knowledge_base(state));
+    store["defaults"]["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+    if store["defaults"]["search_mode"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty()
+    {
+        store["defaults"]["search_mode"] = json!("hybrid");
+    }
+    store
+}
+
+fn write_knowledge_config_store(state: &AppState, store: &Value) -> Result<(), ApiError> {
+    fs::create_dir_all(&*state.knowledge_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create knowledge config directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(store).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize knowledge config: {error}"),
+        )
+    })?;
+    fs::write(knowledge_config_path(state), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write knowledge config: {error}"),
+        )
+    })
+}
+
+fn default_knowledge_base_config(state: &AppState, name: &str) -> Value {
+    json!({
+        "default_kb": read_default_knowledge_base(state),
+        "rag_provider": DEFAULT_RAG_PROVIDER,
+        "search_mode": "hybrid",
+        "needs_reindex": false,
+        "path": name,
+        "description": format!("Knowledge base: {name}")
+    })
+}
+
+fn merged_knowledge_config(state: &AppState, name: &str) -> Value {
+    let store = load_knowledge_config_store(state);
+    let mut config = default_knowledge_base_config(state, name);
+    if let Some(stored) = store["knowledge_bases"]
+        .get(name)
+        .and_then(Value::as_object)
+    {
+        for (key, value) in stored {
+            config[key] = value.clone();
+        }
+    }
+    config["default_kb"] = json!(read_default_knowledge_base(state));
+    config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+    if config["search_mode"].as_str().unwrap_or("").is_empty() {
+        config["search_mode"] = json!("hybrid");
+    }
+    config["needs_reindex"] = json!(config["needs_reindex"].as_bool().unwrap_or(false));
+    config
+}
+
+fn write_knowledge_progress(
+    state: &AppState,
+    name: &str,
+    progress: &Value,
+) -> Result<(), ApiError> {
+    let dir = knowledge_base_dir(state, name);
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create knowledge base directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(progress).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize progress: {error}"),
+        )
+    })?;
+    fs::write(knowledge_progress_path(state, name), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write progress: {error}"),
+        )
+    })
+}
+
+fn load_linked_knowledge_folders(state: &AppState, name: &str) -> Vec<Value> {
+    fs::read_to_string(linked_knowledge_folders_path(state, name))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn write_linked_knowledge_folders(
+    state: &AppState,
+    name: &str,
+    folders: &[Value],
+) -> Result<(), ApiError> {
+    let dir = knowledge_base_dir(state, name);
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create knowledge base directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(folders).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize linked folders: {error}"),
+        )
+    })?;
+    fs::write(linked_knowledge_folders_path(state, name), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write linked folders: {error}"),
+        )
+    })
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    PathBuf::from(path)
+}
+
+fn count_supported_files_in_dir(path: &FsPath) -> usize {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
+        .filter(|name| is_supported_knowledge_file(name))
+        .count()
 }
 
 fn knowledge_base_exists(state: &AppState, name: &str) -> bool {

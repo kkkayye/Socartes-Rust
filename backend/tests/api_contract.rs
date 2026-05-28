@@ -258,6 +258,251 @@ async fn course_knowledge_frontend_bootstrap_endpoints_are_available() {
 }
 
 #[tokio::test]
+async fn knowledge_python_config_progress_and_linked_folder_endpoints_match_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let health_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_response.status(), http::StatusCode::OK);
+    let health = json_response(health_response).await;
+    assert_eq!(health["status"], "ok");
+    assert!(
+        health["config_file"]
+            .as_str()
+            .unwrap()
+            .ends_with("kb_config.json")
+    );
+    assert_eq!(health["base_dir_exists"], false);
+
+    let default_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(default_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(default_response).await["default_kb"],
+        "socartes-rust-rag"
+    );
+
+    let configs_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/configs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(configs_response.status(), http::StatusCode::OK);
+    let configs = json_response(configs_response).await;
+    assert_eq!(configs["defaults"]["rag_provider"], "llamaindex");
+    assert_eq!(configs["defaults"]["search_mode"], "hybrid");
+    assert!(configs["knowledge_bases"].is_object());
+
+    let boundary = "SOCARTESCONFIGBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+python-contract-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+rust replacement notes\r\n\
+--{boundary}--\r\n"
+    );
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let config_update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/knowledge/python-contract-course/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "search_mode": "semantic",
+                        "description": "Python config compatibility",
+                        "needs_reindex": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config_update_response.status(), http::StatusCode::OK);
+    let updated_config = json_response(config_update_response).await;
+    assert_eq!(updated_config["status"], "success");
+    assert_eq!(updated_config["kb_name"], "python-contract-course");
+    assert_eq!(updated_config["config"]["search_mode"], "semantic");
+    assert_eq!(updated_config["config"]["needs_reindex"], true);
+
+    let config_get_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/python-contract-course/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config_get_response.status(), http::StatusCode::OK);
+    let config_get = json_response(config_get_response).await;
+    assert_eq!(config_get["config"]["default_kb"], "socartes-rust-rag");
+    assert_eq!(config_get["config"]["rag_provider"], "llamaindex");
+    assert_eq!(
+        config_get["config"]["description"],
+        "Python config compatibility"
+    );
+
+    let progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/python-contract-course/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(progress_response).await,
+        json!({"status": "not_started", "message": "Initialization not started"})
+    );
+
+    let linked_dir = test_data_root(&root).join("linked-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    fs::write(linked_dir.join("linked.md"), "linked source").unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/python-contract-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().unwrap();
+    assert_eq!(
+        linked["path"].as_str().unwrap(),
+        linked_dir.to_string_lossy()
+    );
+    assert_eq!(linked["file_count"], 1);
+
+    let folders_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/python-contract-course/linked-folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folders_response.status(), http::StatusCode::OK);
+    let folders = json_response(folders_response).await;
+    assert_eq!(folders.as_array().unwrap().len(), 1);
+    assert_eq!(folders[0]["id"], folder_id);
+
+    let sync_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/python-contract-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::OK);
+    let sync = json_response(sync_response).await;
+    assert_eq!(sync["file_count"], 1);
+    assert!(sync["task_id"].as_str().unwrap().starts_with("kb_upload-"));
+
+    let clear_progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/python-contract-course/progress/clear")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_progress_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(clear_progress_response).await["message"],
+        "Progress cleared for python-contract-course"
+    );
+
+    let unlink_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/knowledge/python-contract-course/linked-folders/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlink_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(unlink_response).await["message"],
+        "Folder unlinked successfully"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn course_knowledge_mutation_workflow_matches_frontend_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

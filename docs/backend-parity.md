@@ -78,12 +78,12 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`113`
+- Rust 后端路由：`125`
 - 前端仍缺 Rust 覆盖的路径：`18`
 
 本轮已补齐并验证的主要区域：
 
-- `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除
+- `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除、health、configs/config sync、default get、per-KB config、progress、linked-folder/sync-folder 管理入口
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
@@ -95,10 +95,11 @@ python3 tools/api_parity_scan.py \
 
 已运行的验证：
 
-- `cargo test`：`23` 个测试通过
+- `cargo test`：`24` 个测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `cargo test course_knowledge`：`2` 个课程/知识库契约测试通过
+- `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
 - `cargo test book_`：`4` 个 Book/Notebook 相关契约测试通过
 - Chromium 本地打开 `http://127.0.0.1:3011/book?book=<id>`：页面 `200`，reader 正文渲染，控制台 `0` 个 error
 - Chromium 本地打开 `http://127.0.0.1:3011/settings`：页面 `200`，settings/status/catalog 渲染，控制台 `0` 个 error
