@@ -86,7 +86,7 @@ python3 tools/api_parity_scan.py \
 
 - `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除、health、configs/config sync、default get、per-KB config、progress、linked-folder/sync-folder 管理入口
 - 课程 RAG index-version 状态：本地课程 reindex 会创建 Python-like `version-N/meta.json`，返回 `signature`/`noop`，并在 list/detail statistics 暴露 `index_versions`、`active_signature`、`active_match`、`rag_initialized`、`needs_reindex`
-- 课程上传 reindex 防护：当课程配置或 metadata 标记 `needs_reindex` 时，`/api/v1/knowledge/{name}/upload` 返回 `409`，避免在 stale index 上继续增量写入
+- 课程上传 reindex 防护：当课程配置或 metadata 标记 `needs_reindex` 时，`/api/v1/knowledge/{name}/upload` 返回 `409`，避免在 stale index 上继续增量写入；完成 reindex 后会清除 `needs_reindex`/`embedding_mismatch` 并允许继续上传课程文件
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
 - `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn` 和 `resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，`subscribe_session` 可回放 session 最新 turn

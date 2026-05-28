@@ -823,6 +823,7 @@ New material should wait for reindex.\r\n\
 --{upload_boundary}--\r\n"
     );
     let upload_response = app
+        .clone()
         .oneshot(
             http::Request::builder()
                 .method("POST")
@@ -843,6 +844,60 @@ New material should wait for reindex.\r\n\
             .unwrap()
             .contains("needs reindex")
     );
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/stale-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(reindex_response).await["noop"], false);
+
+    let config_get_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/stale-course/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config_get_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(config_get_response).await["config"]["needs_reindex"],
+        false
+    );
+
+    let upload_after_reindex_boundary = "SOCARTESUPLOADAFTERREINDEX";
+    let upload_after_reindex_body = format!(
+        "--{upload_after_reindex_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"extra.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+New material can be uploaded after reindex.\r\n\
+--{upload_after_reindex_boundary}--\r\n"
+    );
+    let upload_after_reindex_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/stale-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={upload_after_reindex_boundary}"),
+                )
+                .body(Body::from(upload_after_reindex_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_after_reindex_response.status(), http::StatusCode::OK);
 
     let _ = std::fs::remove_dir_all(root);
 }

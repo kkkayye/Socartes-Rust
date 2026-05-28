@@ -1386,6 +1386,9 @@ async fn reindex_knowledge_base(
         .filter(|version| version["layout"].as_str() == Some("flat"))
         .is_some()
     {
+        if let Err(error) = clear_knowledge_reindex_flags(&state, &name) {
+            return error.into_response();
+        }
         return Json(json!({
             "task_id": Value::Null,
             "signature": signature,
@@ -1416,6 +1419,9 @@ async fn reindex_knowledge_base(
         "embedding_mismatch": false
     });
     let _ = write_knowledge_metadata(&state, &name, DEFAULT_RAG_PROVIDER, Some(metadata));
+    if let Err(error) = clear_knowledge_reindex_flags(&state, &name) {
+        return error.into_response();
+    }
     Json(json!({
         "task_id": task_id,
         "signature": signature,
@@ -1423,6 +1429,20 @@ async fn reindex_knowledge_base(
         "message": format!("Re-indexing '{name}' in the background.")
     }))
     .into_response()
+}
+
+fn clear_knowledge_reindex_flags(state: &AppState, name: &str) -> Result<(), ApiError> {
+    let mut store = load_knowledge_config_store(state);
+    let mut config = merged_knowledge_config(state, name);
+    config["needs_reindex"] = json!(false);
+    config["embedding_mismatch"] = json!(false);
+    config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+    if let Some(object) = store["knowledge_bases"].as_object_mut() {
+        object.insert(name.to_string(), config);
+    } else {
+        store["knowledge_bases"] = json!({ name: config });
+    }
+    write_knowledge_config_store(state, &store)
 }
 
 async fn knowledge_task_stream(Path(task_id): Path<String>) -> impl IntoResponse {
