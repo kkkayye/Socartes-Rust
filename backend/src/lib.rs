@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
+    io::Write,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -9,13 +10,14 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        Multipart, Path, State,
+        Multipart, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{delete, get, patch, post, put},
 };
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -28,6 +30,14 @@ const BUILTIN_KNOWLEDGE_BASE: &str = "socartes-rust-rag";
 const DEFAULT_RAG_PROVIDER: &str = "llamaindex";
 const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] =
     &[".txt", ".md", ".markdown", ".pdf", ".json", ".csv"];
+const TUTORBOT_EDITABLE_FILES: &[&str] = &[
+    "SOUL.md",
+    "USER.md",
+    "TOOLS.md",
+    "AGENTS.md",
+    "HEARTBEAT.md",
+];
+const SECRET_MASK: &str = "***";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StudyRequest {
@@ -144,6 +154,21 @@ pub struct StoryAnswer {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoryQuestion {
     pub question: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TutorBotRecentQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TutorBotHistoryQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TutorBotDetailQuery {
+    include_secrets: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +449,7 @@ struct AppState {
     book_root: Arc<PathBuf>,
     output_root: Arc<PathBuf>,
     settings_root: Arc<PathBuf>,
+    tutorbot_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -445,12 +471,16 @@ impl AppState {
         let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("settings"));
+        let tutorbot_root = env::var_os("SOCARTES_TUTORBOT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("tutorbot"));
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
             book_root: Arc::new(book_root),
             output_root: Arc::new(output_root),
             settings_root: Arc::new(settings_root),
+            tutorbot_root: Arc::new(tutorbot_root),
         }
     }
 }
@@ -533,6 +563,39 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(system_test_embeddings),
         )
         .route("/api/v1/system/test/search", post(system_test_search))
+        .route("/api/v1/tutorbot", get(list_tutorbots).post(start_tutorbot))
+        .route("/api/v1/tutorbot/recent", get(recent_tutorbots))
+        .route(
+            "/api/v1/tutorbot/channels/schema",
+            get(tutorbot_channel_schema),
+        )
+        .route(
+            "/api/v1/tutorbot/souls",
+            get(list_tutorbot_souls).post(create_tutorbot_soul),
+        )
+        .route(
+            "/api/v1/tutorbot/souls/{soul_id}",
+            get(get_tutorbot_soul)
+                .put(update_tutorbot_soul)
+                .delete(delete_tutorbot_soul),
+        )
+        .route(
+            "/api/v1/tutorbot/{bot_id}",
+            get(get_tutorbot)
+                .patch(update_tutorbot)
+                .delete(stop_tutorbot),
+        )
+        .route(
+            "/api/v1/tutorbot/{bot_id}/destroy",
+            delete(destroy_tutorbot),
+        )
+        .route("/api/v1/tutorbot/{bot_id}/files", get(list_tutorbot_files))
+        .route(
+            "/api/v1/tutorbot/{bot_id}/files/{filename}",
+            get(read_tutorbot_file).put(write_tutorbot_file),
+        )
+        .route("/api/v1/tutorbot/{bot_id}/history", get(tutorbot_history))
+        .route("/api/v1/tutorbot/{bot_id}/ws", get(tutorbot_ws))
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}", patch(update_session_title))
@@ -2146,6 +2209,690 @@ fn safe_filename(value: &str) -> Option<String> {
     safe_storage_component(filename)
 }
 
+fn tutorbot_dir(state: &AppState, bot_id: &str) -> PathBuf {
+    let component = safe_storage_component(bot_id).unwrap_or_else(|| "invalid".to_string());
+    state.tutorbot_root.join(component)
+}
+
+fn tutorbot_config_path(state: &AppState, bot_id: &str) -> PathBuf {
+    tutorbot_dir(state, bot_id).join("config.json")
+}
+
+fn tutorbot_workspace_dir(state: &AppState, bot_id: &str) -> PathBuf {
+    tutorbot_dir(state, bot_id).join("workspace")
+}
+
+fn tutorbot_sessions_dir(state: &AppState, bot_id: &str) -> PathBuf {
+    tutorbot_workspace_dir(state, bot_id).join("sessions")
+}
+
+fn tutorbot_exists(state: &AppState, bot_id: &str) -> bool {
+    tutorbot_config_path(state, bot_id).is_file()
+}
+
+fn read_tutorbot_config(state: &AppState, bot_id: &str) -> Option<Value> {
+    let text = fs::read_to_string(tutorbot_config_path(state, bot_id)).ok()?;
+    let parsed = serde_json::from_str::<Value>(&text).ok()?;
+    Some(normalize_tutorbot_config(bot_id, parsed))
+}
+
+fn write_tutorbot_config(state: &AppState, bot_id: &str, config: &Value) -> Result<(), ApiError> {
+    let dir = tutorbot_dir(state, bot_id);
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(config).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize TutorBot config: {error}"),
+        )
+    })?;
+    fs::write(tutorbot_config_path(state, bot_id), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write TutorBot config: {error}"),
+        )
+    })
+}
+
+fn default_tutorbot_config(bot_id: &str) -> Value {
+    json!({
+        "name": bot_id,
+        "description": "",
+        "persona": "",
+        "channels": {
+            "send_progress": true,
+            "send_tool_hints": false
+        },
+        "model": null,
+        "llm_selection": null,
+        "running": false,
+        "started_at": null,
+        "last_reload_error": null
+    })
+}
+
+fn normalize_tutorbot_config(bot_id: &str, mut config: Value) -> Value {
+    if !config.is_object() {
+        config = default_tutorbot_config(bot_id);
+    }
+    let default = default_tutorbot_config(bot_id);
+    for key in [
+        "name",
+        "description",
+        "persona",
+        "channels",
+        "model",
+        "llm_selection",
+        "running",
+        "started_at",
+        "last_reload_error",
+    ] {
+        if config.get(key).is_none() {
+            config[key] = default[key].clone();
+        }
+    }
+    if !config["channels"].is_object() {
+        config["channels"] = default["channels"].clone();
+    }
+    config
+}
+
+fn apply_tutorbot_payload(config: &mut Value, payload: &Value, merge_channels: bool) {
+    for key in ["name", "description", "persona", "model"] {
+        if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+            config[key] = value.clone();
+        }
+    }
+    if let Some(value) = payload.get("llm_selection") {
+        config["llm_selection"] = value.clone();
+    }
+    if let Some(channels) = payload.get("channels").filter(|value| value.is_object()) {
+        config["channels"] = if merge_channels {
+            merge_masked_json_secrets(channels, &config["channels"])
+        } else {
+            channels.clone()
+        };
+    }
+}
+
+fn tutorbot_detail(bot_id: &str, config: &Value, mask_secrets: bool) -> Value {
+    json!({
+        "bot_id": bot_id,
+        "name": config["name"].as_str().unwrap_or(bot_id),
+        "description": config["description"].as_str().unwrap_or(""),
+        "persona": config["persona"].as_str().unwrap_or(""),
+        "channels": if mask_secrets { mask_json_secrets(&config["channels"], None) } else { config["channels"].clone() },
+        "model": config["model"].clone(),
+        "llm_selection": config["llm_selection"].clone(),
+        "running": config["running"].as_bool().unwrap_or(false),
+        "started_at": config["started_at"].clone(),
+        "last_reload_error": config["last_reload_error"].clone()
+    })
+}
+
+fn tutorbot_summary(bot_id: &str, config: &Value) -> Value {
+    json!({
+        "bot_id": bot_id,
+        "name": config["name"].as_str().unwrap_or(bot_id),
+        "description": config["description"].as_str().unwrap_or(""),
+        "persona": config["persona"].as_str().unwrap_or(""),
+        "channels": tutorbot_channel_names(&config["channels"]),
+        "model": config["model"].clone(),
+        "llm_selection": config["llm_selection"].clone(),
+        "running": config["running"].as_bool().unwrap_or(false),
+        "started_at": config["started_at"].clone(),
+        "last_reload_error": config["last_reload_error"].clone()
+    })
+}
+
+fn tutorbot_summaries(state: &AppState) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(&*state.tutorbot_root) else {
+        return Vec::new();
+    };
+    let mut bots = entries
+        .flatten()
+        .filter_map(|entry| {
+            let bot_id = entry.file_name().to_string_lossy().to_string();
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            read_tutorbot_config(state, &bot_id).map(|config| tutorbot_summary(&bot_id, &config))
+        })
+        .collect::<Vec<_>>();
+    bots.sort_by(|left, right| {
+        left["bot_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["bot_id"].as_str().unwrap_or(""))
+    });
+    bots
+}
+
+fn tutorbot_channel_names(channels: &Value) -> Vec<String> {
+    channels
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, value)| {
+                    key.as_str() != "send_progress"
+                        && key.as_str() != "send_tool_hints"
+                        && value.is_object()
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ensure_tutorbot_workspace(
+    state: &AppState,
+    bot_id: &str,
+    config: &Value,
+) -> Result<(), ApiError> {
+    let workspace = tutorbot_workspace_dir(state, bot_id);
+    fs::create_dir_all(tutorbot_sessions_dir(state, bot_id)).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot workspace: {error}"),
+        )
+    })?;
+    for filename in TUTORBOT_EDITABLE_FILES {
+        let path = workspace.join(filename);
+        if !path.exists() {
+            let content = default_tutorbot_file(filename, bot_id, config);
+            fs::write(path, content).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to seed TutorBot profile file: {error}"),
+                )
+            })?;
+        }
+    }
+    if let Some(persona) = config["persona"].as_str().filter(|value| !value.is_empty()) {
+        let soul_path = workspace.join("SOUL.md");
+        fs::write(soul_path, persona).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write SOUL.md: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn default_tutorbot_file(filename: &str, bot_id: &str, config: &Value) -> String {
+    match filename {
+        "SOUL.md" => config["persona"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!("# Soul\n\nI am {bot_id}, a Socartes TutorBot focused on learning support.")
+            }),
+        "USER.md" => "# User\n\nLearning preferences and user context live here.\n".to_string(),
+        "TOOLS.md" => {
+            "# Tools\n\nAvailable tools are surfaced through Socartes compatibility APIs.\n"
+                .to_string()
+        }
+        "AGENTS.md" => {
+            "# Agent Instructions\n\nRespond with grounded, concise tutoring help.\n".to_string()
+        }
+        "HEARTBEAT.md" => {
+            "# Heartbeat\n\nPeriodic proactive guidance can be recorded here.\n".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn is_tutorbot_editable_file(filename: &str) -> bool {
+    TUTORBOT_EDITABLE_FILES.contains(&filename)
+}
+
+fn read_tutorbot_workspace_file(state: &AppState, bot_id: &str, filename: &str) -> Option<String> {
+    if !is_tutorbot_editable_file(filename) {
+        return None;
+    }
+    fs::read_to_string(tutorbot_workspace_dir(state, bot_id).join(filename)).ok()
+}
+
+fn write_tutorbot_workspace_file(
+    state: &AppState,
+    bot_id: &str,
+    filename: &str,
+    content: &str,
+) -> Result<(), ApiError> {
+    if !is_tutorbot_editable_file(filename) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Not an editable file: {filename}"),
+        ));
+    }
+    if !tutorbot_exists(state, bot_id) {
+        return Err(api_error(StatusCode::NOT_FOUND, "Bot not found"));
+    }
+    let path = tutorbot_workspace_dir(state, bot_id).join(filename);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create TutorBot workspace: {error}"),
+            )
+        })?;
+    }
+    fs::write(path, content).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write TutorBot file: {error}"),
+        )
+    })
+}
+
+fn secret_reveal_enabled() -> bool {
+    env::var("ALLOW_SECRET_REVEAL")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "encrypt_key",
+    ]
+    .iter()
+    .any(|hint| lowered.contains(hint))
+}
+
+fn mask_json_secrets(value: &Value, key_hint: Option<&str>) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), mask_json_secrets(value, Some(key))))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| mask_json_secrets(value, key_hint))
+                .collect(),
+        ),
+        Value::String(text) if key_hint.is_some_and(is_secret_key) && !text.is_empty() => {
+            json!(SECRET_MASK)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn merge_masked_json_secrets(incoming: &Value, current: &Value) -> Value {
+    merge_masked_json_secrets_with_key(incoming, current, None)
+}
+
+fn merge_masked_json_secrets_with_key(
+    incoming: &Value,
+    current: &Value,
+    key_hint: Option<&str>,
+) -> Value {
+    match incoming {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        merge_masked_json_secrets_with_key(value, &current[key], Some(key)),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    merge_masked_json_secrets_with_key(value, &current[index], key_hint)
+                })
+                .collect(),
+        ),
+        Value::String(text)
+            if key_hint.is_some_and(is_secret_key)
+                && text == SECRET_MASK
+                && current
+                    .as_str()
+                    .is_some_and(|existing| !existing.is_empty()) =>
+        {
+            current.clone()
+        }
+        _ => incoming.clone(),
+    }
+}
+
+fn load_tutorbot_souls(state: &AppState) -> Vec<Value> {
+    let path = state.tutorbot_root.join("_souls.json");
+    if !path.exists() {
+        let defaults = default_tutorbot_souls();
+        let _ = save_tutorbot_souls(state, &defaults);
+        return defaults;
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn save_tutorbot_souls(state: &AppState, souls: &[Value]) -> Result<(), ApiError> {
+    fs::create_dir_all(&*state.tutorbot_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(souls).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize souls: {error}"),
+        )
+    })?;
+    fs::write(state.tutorbot_root.join("_souls.json"), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write souls: {error}"),
+        )
+    })
+}
+
+fn default_tutorbot_souls() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "default-tutorbot",
+            "name": "Default TutorBot",
+            "content": "# Soul\n\nI am TutorBot, a personal learning companion.\n\n## Personality\n\n- Helpful and friendly\n- Clear, encouraging, and patient\n- Adapts explanations to the user's level\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions"
+        }),
+        json!({
+            "id": "math-tutor",
+            "name": "Math Tutor",
+            "content": "# Soul\n\nI am a math tutor specializing in clear, step-by-step problem solving.\n\n## Teaching Style\n\n- Break complex problems into small steps\n- Use visual representations when possible\n- Always verify final answers"
+        }),
+        json!({
+            "id": "coding-assistant",
+            "name": "Coding Assistant",
+            "content": "# Soul\n\nI am a coding assistant focused on helping developers write better software.\n\n## Approach\n\n- Read before writing\n- Suggest tests alongside implementations\n- Prefer standard patterns over clever tricks"
+        }),
+        json!({
+            "id": "research-helper",
+            "name": "Research Helper",
+            "content": "# Soul\n\nI am a research assistant helping users explore academic topics in depth.\n\n## Approach\n\n- Decompose broad questions\n- Distinguish facts from open questions\n- Suggest further reading"
+        }),
+    ]
+}
+
+fn tutorbot_history_messages(state: &AppState, bot_id: &str, limit: usize) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(tutorbot_sessions_dir(state, bot_id)) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut messages = Vec::new();
+    for path in paths {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let role = value["role"].as_str().unwrap_or("");
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            let Some(content) = normalize_history_content(&value["content"]) else {
+                continue;
+            };
+            value["content"] = json!(content);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("reasoning_content");
+            }
+            messages.push(value);
+        }
+    }
+    let start = messages.len().saturating_sub(limit);
+    messages[start..].to_vec()
+}
+
+fn normalize_history_content(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Array(values) => {
+            let content = values
+                .iter()
+                .filter_map(normalize_history_content)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!content.is_empty()).then_some(content)
+        }
+        Value::Object(object) => ["text", "content", "message", "alt"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+            .map(ToString::to_string)
+            .or_else(|| {
+                (object.get("type").and_then(Value::as_str) == Some("image"))
+                    .then(|| "[image]".to_string())
+            }),
+        _ => None,
+    }
+}
+
+fn recent_tutorbot_summaries(state: &AppState, limit: usize) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(&*state.tutorbot_root) else {
+        return Vec::new();
+    };
+    let mut recent = Vec::new();
+    for entry in entries.flatten() {
+        let bot_id = entry.file_name().to_string_lossy().to_string();
+        if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let history = tutorbot_history_messages(state, &bot_id, usize::MAX);
+        let Some(last_message) = history.last() else {
+            continue;
+        };
+        let updated_at = last_message["timestamp"]
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(now_rfc3339);
+        let sort_key = last_message["timestamp_ms"].as_u64().unwrap_or_default();
+        let config = read_tutorbot_config(state, &bot_id)
+            .unwrap_or_else(|| default_tutorbot_config(&bot_id));
+        recent.push((
+            sort_key,
+            json!({
+                "bot_id": bot_id,
+                "name": config["name"].as_str().unwrap_or(&bot_id),
+                "running": config["running"].as_bool().unwrap_or(false),
+                "last_message": last_message["content"].as_str().unwrap_or("").chars().take(200).collect::<String>(),
+                "updated_at": updated_at
+            }),
+        ));
+    }
+    recent.sort_by(|left, right| right.0.cmp(&left.0));
+    recent
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect()
+}
+
+fn append_tutorbot_history(
+    state: &AppState,
+    bot_id: &str,
+    chat_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<(), ApiError> {
+    let sessions = tutorbot_sessions_dir(state, bot_id);
+    fs::create_dir_all(&sessions).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot session directory: {error}"),
+        )
+    })?;
+    let file = safe_storage_component(chat_id).unwrap_or_else(|| "web".to_string());
+    let path = sessions.join(format!("{file}.jsonl"));
+    let mut handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to open TutorBot history: {error}"),
+            )
+        })?;
+    let timestamp = now_rfc3339();
+    let timestamp_ms = current_epoch_millis();
+    let line = json!({
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+        "timestamp_ms": timestamp_ms
+    })
+    .to_string();
+    writeln!(handle, "{line}").map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write TutorBot history: {error}"),
+        )
+    })
+}
+
+async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: String) {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        let _ = socket
+            .send(Message::Text(
+                json!({"type": "error", "content": "Invalid bot id"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+
+    let Some(mut config) = read_tutorbot_config(&state, &bot_id) else {
+        let _ = socket
+            .send(Message::Text(
+                json!({"type": "error", "content": "Bot not found"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+
+    if !config["running"].as_bool().unwrap_or(false) {
+        config["running"] = json!(true);
+        config["started_at"] = json!(now_rfc3339());
+        let _ = write_tutorbot_config(&state, &bot_id, &config);
+    }
+
+    while let Some(Ok(message)) = socket.recv().await {
+        let Message::Text(text) = message else {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+            let _ = socket
+                .send(Message::Text(
+                    json!({"type": "error", "content": "Invalid JSON"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            continue;
+        };
+        let content = payload["content"].as_str().unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        let chat_id = payload["chat_id"].as_str().unwrap_or("web");
+        let _ = append_tutorbot_history(&state, &bot_id, chat_id, "user", content);
+        let _ = socket
+            .send(Message::Text(
+                json!({"type": "thinking", "content": "TutorBot is reading the local profile and conversation history."})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let response = tutorbot_chat_response(&bot_id, &config, content);
+        let _ = append_tutorbot_history(&state, &bot_id, chat_id, "assistant", &response);
+        if socket
+            .send(Message::Text(
+                json!({"type": "content", "content": response})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if socket
+            .send(Message::Text(json!({"type": "done"}).to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn tutorbot_chat_response(bot_id: &str, config: &Value, content: &str) -> String {
+    let name = config["name"].as_str().unwrap_or(bot_id);
+    let persona = config["persona"].as_str().unwrap_or("").trim();
+    let persona_clause = if persona.is_empty() {
+        "using the default Socartes tutor profile".to_string()
+    } else {
+        format!("using this profile: {}", compact_excerpt(persona, 220))
+    };
+    format!(
+        "{name} received: \"{content}\". I am responding through the Rust TutorBot compatibility runtime, {persona_clause}."
+    )
+}
+
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn knowledge_base_dir(state: &AppState, name: &str) -> PathBuf {
     let component = safe_storage_component(name).unwrap_or_else(|| "invalid".to_string());
     state.knowledge_root.join("bases").join(component)
@@ -2776,6 +3523,359 @@ async fn system_test_search(State(state): State<AppState>) -> Json<Value> {
         "response_time_ms": 1.0,
         "error": null
     }))
+}
+
+async fn list_tutorbots(State(state): State<AppState>) -> Json<Value> {
+    Json(Value::Array(tutorbot_summaries(&state)))
+}
+
+async fn start_tutorbot(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let Some(bot_id) = payload["bot_id"].as_str().and_then(safe_storage_component) else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "bot_id is required").into_response();
+    };
+
+    let mut config =
+        read_tutorbot_config(&state, &bot_id).unwrap_or_else(|| default_tutorbot_config(&bot_id));
+    apply_tutorbot_payload(&mut config, &payload, false);
+    config["running"] = json!(true);
+    config["started_at"] = json!(now_rfc3339());
+    config["last_reload_error"] = Value::Null;
+
+    if let Err(error) = ensure_tutorbot_workspace(&state, &bot_id, &config) {
+        return error.into_response();
+    }
+    match write_tutorbot_config(&state, &bot_id, &config) {
+        Ok(()) => Json(tutorbot_detail(&bot_id, &config, true)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn recent_tutorbots(
+    State(state): State<AppState>,
+    Query(query): Query<TutorBotRecentQuery>,
+) -> Json<Value> {
+    let limit = query.limit.unwrap_or(3).clamp(1, 50);
+    Json(Value::Array(recent_tutorbot_summaries(&state, limit)))
+}
+
+async fn tutorbot_channel_schema() -> Json<Value> {
+    Json(json!({
+        "channels": {
+            "telegram": {
+                "name": "telegram",
+                "display_name": "Telegram",
+                "default_config": {
+                    "enabled": false,
+                    "token": "",
+                    "allow_from": ["*"]
+                },
+                "secret_fields": ["token"],
+                "json_schema": {
+                    "type": "object",
+                    "description": "Telegram bot channel settings.",
+                    "properties": {
+                        "enabled": { "type": "boolean", "title": "Enabled", "default": false },
+                        "token": { "type": "string", "title": "Bot token", "default": "" },
+                        "allow_from": {
+                            "type": "array",
+                            "title": "Allowed chats",
+                            "items": { "type": "string" },
+                            "default": ["*"]
+                        }
+                    }
+                }
+            },
+            "web": {
+                "name": "web",
+                "display_name": "Web Chat",
+                "default_config": { "enabled": true },
+                "secret_fields": [],
+                "json_schema": {
+                    "type": "object",
+                    "description": "Built-in browser chat channel.",
+                    "properties": {
+                        "enabled": { "type": "boolean", "title": "Enabled", "default": true }
+                    }
+                }
+            }
+        },
+        "global": {
+            "secret_fields": [],
+            "json_schema": {
+                "type": "object",
+                "properties": {
+                    "send_progress": { "type": "boolean", "title": "Stream progress text", "default": true },
+                    "send_tool_hints": { "type": "boolean", "title": "Stream tool hints", "default": false }
+                }
+            }
+        }
+    }))
+}
+
+async fn list_tutorbot_souls(State(state): State<AppState>) -> Json<Value> {
+    Json(Value::Array(load_tutorbot_souls(&state)))
+}
+
+async fn create_tutorbot_soul(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let id = payload["id"].as_str().unwrap_or("").trim();
+    let name = payload["name"].as_str().unwrap_or("").trim();
+    let content = payload["content"].as_str().unwrap_or("");
+    if safe_storage_component(id).is_none() || name.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "id and name are required")
+            .into_response();
+    }
+
+    let mut souls = load_tutorbot_souls(&state);
+    if souls.iter().any(|soul| soul["id"] == id) {
+        return api_error(StatusCode::CONFLICT, &format!("Soul '{id}' already exists"))
+            .into_response();
+    }
+
+    let entry = json!({ "id": id, "name": name, "content": content });
+    souls.push(entry.clone());
+    match save_tutorbot_souls(&state, &souls) {
+        Ok(()) => Json(entry).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_tutorbot_soul(
+    State(state): State<AppState>,
+    Path(soul_id): Path<String>,
+) -> impl IntoResponse {
+    let souls = load_tutorbot_souls(&state);
+    match souls.into_iter().find(|soul| soul["id"] == soul_id) {
+        Some(soul) => Json(soul).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "Soul not found").into_response(),
+    }
+}
+
+async fn update_tutorbot_soul(
+    State(state): State<AppState>,
+    Path(soul_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut souls = load_tutorbot_souls(&state);
+    let Some(index) = souls.iter().position(|soul| soul["id"] == soul_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Soul not found").into_response();
+    };
+    if let Some(name) = payload["name"].as_str() {
+        souls[index]["name"] = json!(name);
+    }
+    if let Some(content) = payload["content"].as_str() {
+        souls[index]["content"] = json!(content);
+    }
+    let updated = souls[index].clone();
+    match save_tutorbot_souls(&state, &souls) {
+        Ok(()) => Json(updated).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_tutorbot_soul(
+    State(state): State<AppState>,
+    Path(soul_id): Path<String>,
+) -> impl IntoResponse {
+    let mut souls = load_tutorbot_souls(&state);
+    let before = souls.len();
+    souls.retain(|soul| soul["id"] != soul_id);
+    if souls.len() == before {
+        return api_error(StatusCode::NOT_FOUND, "Soul not found").into_response();
+    }
+    match save_tutorbot_souls(&state, &souls) {
+        Ok(()) => Json(json!({ "id": soul_id, "deleted": true })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_tutorbot(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+    Query(query): Query<TutorBotDetailQuery>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    match read_tutorbot_config(&state, &bot_id) {
+        Some(config) => Json(tutorbot_detail(
+            &bot_id,
+            &config,
+            !(query.include_secrets.unwrap_or(false) && secret_reveal_enabled()),
+        ))
+        .into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "Bot not found").into_response(),
+    }
+}
+
+async fn update_tutorbot(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    let Some(mut config) = read_tutorbot_config(&state, &bot_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
+    };
+
+    apply_tutorbot_payload(&mut config, &payload, true);
+    if let Some(persona) = payload["persona"].as_str()
+        && let Err(error) = write_tutorbot_workspace_file(&state, &bot_id, "SOUL.md", persona)
+    {
+        return error.into_response();
+    }
+    match write_tutorbot_config(&state, &bot_id, &config) {
+        Ok(()) => Json(tutorbot_detail(&bot_id, &config, true)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn stop_tutorbot(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    let Some(mut config) = read_tutorbot_config(&state, &bot_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found or not running").into_response();
+    };
+    if !config["running"].as_bool().unwrap_or(false) {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found or not running").into_response();
+    }
+    config["running"] = json!(false);
+    config["started_at"] = Value::Null;
+    match write_tutorbot_config(&state, &bot_id, &config) {
+        Ok(()) => Json(json!({ "bot_id": bot_id, "stopped": true })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn destroy_tutorbot(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    let path = tutorbot_dir(&state, &bot_id);
+    if !path.exists() {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Json(json!({ "bot_id": bot_id, "destroyed": true })).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to delete bot: {error}"),
+        )
+        .into_response(),
+    }
+}
+
+async fn list_tutorbot_files(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    if !tutorbot_exists(&state, &bot_id) {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
+    }
+    Json(Value::Object(
+        TUTORBOT_EDITABLE_FILES
+            .iter()
+            .map(|filename| {
+                (
+                    (*filename).to_string(),
+                    json!(
+                        read_tutorbot_workspace_file(&state, &bot_id, filename).unwrap_or_default()
+                    ),
+                )
+            })
+            .collect(),
+    ))
+    .into_response()
+}
+
+async fn read_tutorbot_file(
+    State(state): State<AppState>,
+    Path((bot_id, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    if !is_tutorbot_editable_file(&filename) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Not an editable file: {filename}"),
+        )
+        .into_response();
+    }
+    if !tutorbot_exists(&state, &bot_id) {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
+    }
+    Json(json!({
+        "filename": filename,
+        "content": read_tutorbot_workspace_file(&state, &bot_id, &filename).unwrap_or_default()
+    }))
+    .into_response()
+}
+
+async fn write_tutorbot_file(
+    State(state): State<AppState>,
+    Path((bot_id, filename)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    let content = payload["content"].as_str().unwrap_or("");
+    match write_tutorbot_workspace_file(&state, &bot_id, &filename, content) {
+        Ok(()) => {
+            if filename == "SOUL.md"
+                && let Some(mut config) = read_tutorbot_config(&state, &bot_id)
+            {
+                config["persona"] = json!(content);
+                let _ = write_tutorbot_config(&state, &bot_id, &config);
+            }
+            Json(json!({ "filename": filename, "saved": true })).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn tutorbot_history(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+    Query(query): Query<TutorBotHistoryQuery>,
+) -> impl IntoResponse {
+    let Some(bot_id) = safe_storage_component(&bot_id) else {
+        return api_error(StatusCode::BAD_REQUEST, "Invalid bot id").into_response();
+    };
+    if !tutorbot_exists(&state, &bot_id) {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
+    }
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    Json(Value::Array(tutorbot_history_messages(
+        &state, &bot_id, limit,
+    )))
+    .into_response()
+}
+
+async fn tutorbot_ws(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_tutorbot_socket(socket, state, bot_id))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {

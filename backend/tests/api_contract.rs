@@ -487,6 +487,353 @@ The lantern school rule says students must recite the blue theorem before openin
 }
 
 #[tokio::test]
+async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let empty_list = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_list.status(), http::StatusCode::OK);
+    assert_eq!(json_response(empty_list).await, json!([]));
+
+    let souls_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/souls")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(souls_response.status(), http::StatusCode::OK);
+    let souls = json_response(souls_response).await;
+    assert!(souls.as_array().unwrap().len() >= 3);
+    assert!(souls.as_array().unwrap().iter().any(|soul| {
+        soul["id"] == "default-tutorbot" && soul["content"].as_str().unwrap().contains("# Soul")
+    }));
+
+    let create_soul_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot/souls")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "exam-coach",
+                        "name": "Exam Coach",
+                        "content": "# Soul\n\nCoach for exams."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_soul_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(create_soul_response).await["id"],
+        "exam-coach"
+    );
+
+    let duplicate_soul_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot/souls")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"id": "exam-coach", "name": "Exam Coach", "content": "again"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_soul_response.status(), http::StatusCode::CONFLICT);
+
+    let update_soul_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/tutorbot/souls/exam-coach")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "Exam Coach Plus", "content": "# Soul\n\nUpdated."}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_soul_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(update_soul_response).await["name"],
+        "Exam Coach Plus"
+    );
+
+    let schema_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/channels/schema")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(schema_response.status(), http::StatusCode::OK);
+    let schema = json_response(schema_response).await;
+    assert!(schema["channels"].is_object());
+    assert!(schema["global"]["json_schema"].is_object());
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "exam-bot",
+                        "name": "Exam Bot",
+                        "description": "Exam support",
+                        "persona": "# Soul\n\nFocus on evidence.",
+                        "channels": {
+                            "send_progress": true,
+                            "telegram": {"enabled": true, "token": "secret-token"}
+                        },
+                        "llm_selection": {"profile_id": "socartes-rust", "model_id": "deterministic-agent-loop"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+    let bot = json_response(create_bot_response).await;
+    assert_eq!(bot["bot_id"], "exam-bot");
+    assert_eq!(bot["running"], true);
+    assert_eq!(bot["channels"]["telegram"]["token"], "***");
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    assert_eq!(list[0]["bot_id"], "exam-bot");
+    assert!(
+        list[0]["channels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("telegram"))
+    );
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/exam-bot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["channels"]["telegram"]["token"], "***");
+
+    let files_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/exam-bot/files")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_response.status(), http::StatusCode::OK);
+    let files = json_response(files_response).await;
+    assert!(
+        files["SOUL.md"]
+            .as_str()
+            .unwrap()
+            .contains("Focus on evidence")
+    );
+    assert!(files["USER.md"].is_string());
+    assert!(files["TOOLS.md"].is_string());
+    assert!(files["AGENTS.md"].is_string());
+    assert!(files["HEARTBEAT.md"].is_string());
+
+    let save_file_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/tutorbot/exam-bot/files/USER.md")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"content": "Learner likes short answers."}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save_file_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(save_file_response).await["saved"], true);
+
+    let read_file_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/exam-bot/files/USER.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_file_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(read_file_response).await["content"],
+        "Learner likes short answers."
+    );
+
+    let patch_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/tutorbot/exam-bot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "persona": "# Soul\n\nUpdated persona.",
+                        "channels": {
+                            "send_progress": true,
+                            "send_tool_hints": true,
+                            "telegram": {"enabled": true, "token": "***"}
+                        },
+                        "model": "local-test-model"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_response.status(), http::StatusCode::OK);
+    let patched = json_response(patch_response).await;
+    assert_eq!(patched["persona"], "# Soul\n\nUpdated persona.");
+    assert_eq!(patched["channels"]["telegram"]["token"], "***");
+    assert_eq!(patched["model"], "local-test-model");
+
+    let history_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/exam-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    let stop_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/tutorbot/exam-bot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(stop_response).await["stopped"], true);
+
+    let restart_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"bot_id": "exam-bot"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restart_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(restart_response).await["running"], true);
+
+    let recent_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/recent?limit=3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recent_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(recent_response).await, json!([]));
+
+    let destroy_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/tutorbot/exam-bot/destroy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(destroy_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(destroy_response).await["destroyed"], true);
+
+    let deleted_soul_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/tutorbot/souls/exam-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_soul_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(deleted_soul_response).await["deleted"], true);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_sessions_are_persisted_and_manageable() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

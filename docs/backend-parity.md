@@ -71,15 +71,15 @@ python3 tools/api_parity_scan.py \
 python3 tools/api_parity_scan.py \
   --rust-root /home/coobabm/Socartes-Rust \
   --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor \
-  > /tmp/socartes-api-parity-after-book2.json
+  > /tmp/socartes-api-parity-after-tutorbot.json
 ```
 
 当前计数：
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`72`
-- 前端仍缺 Rust 覆盖的路径：`39`
+- Rust 后端路由：`90`
+- 前端仍缺 Rust 覆盖的路径：`29`
 
 本轮已补齐并验证的主要区域：
 
@@ -89,18 +89,20 @@ python3 tools/api_parity_scan.py \
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
 - `/api/v1/system*` status/runtime-topology/test LLM/test embeddings/test search 兼容入口
+- `/api/v1/tutorbot*` TutorBot 列表、创建/启动、停止/销毁、详情/PATCH、recent、souls CRUD、channels schema、profile 文件、history、WebSocket 最小聊天入口
 
 已运行的验证：
 
-- `cargo test`：`19` 个测试通过
+- `cargo test`：`21` 个测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - Chromium 本地打开 `http://127.0.0.1:3011/book?book=<id>`：页面 `200`，reader 正文渲染，控制台 `0` 个 error
 - Chromium 本地打开 `http://127.0.0.1:3011/settings`：页面 `200`，settings/status/catalog 渲染，控制台 `0` 个 error
+- Chromium 本地打开 `http://127.0.0.1:3011/agents`：页面 `200`，TutorBot 列表和 tabs 渲染，控制台 `0` 个 error
+- Node WebSocket 直连 `ws://127.0.0.1:8810/api/v1/tutorbot/<id>/ws`：收到 `thinking,content,done`
 
 下一批 P0 仍未完成：
 
-- `/api/v1/tutorbot/*` 和 `/api/v1/tutorbot/{id}/ws`
 - `/api/v1/plugins/list` 与 tool/capability stream
 - `/api/v1/co_writer/*`
 - `/api/v1/notebook/*`
