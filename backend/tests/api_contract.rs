@@ -761,6 +761,121 @@ The lantern school rule says students must recite the blue theorem before openin
 }
 
 #[tokio::test]
+async fn rag_selected_uploaded_kb_returns_no_builtin_fallback_when_no_match() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESNOFALLBACKBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+plot-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"plot-notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The lantern school rule says students must recite the blue theorem before opening the archive.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "How do ocean tides work?",
+        "language": "en",
+        "tools": ["rag"],
+        "knowledge_bases": ["plot-course"]
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let session_id = json_response(chat_response).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    let sources_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("sources event");
+    let sources = sources_event["metadata"]["sources"].as_array().unwrap();
+    assert!(sources.is_empty());
+    let assistant_content = assistant["content"].as_str().unwrap();
+    assert!(!assistant_content.contains("rag-index-18"));
+    assert!(!assistant_content.contains("workflow-note-01"));
+
+    let plugin_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "ocean tides", "kb_name": "plot-course"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    assert_eq!(plugin["sources"], json!([]));
+    assert!(
+        plugin["content"]
+            .as_str()
+            .unwrap()
+            .contains("No Socartes knowledge base passages matched query")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn attachment_preview_route_serves_local_chat_files_like_python_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

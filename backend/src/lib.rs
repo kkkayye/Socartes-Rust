@@ -9888,10 +9888,6 @@ fn retrieve_chat_context(
         }
     }
 
-    if chunks.is_empty() {
-        return retrieve(goal);
-    }
-
     dedupe_chunks(chunks).into_iter().take(4).collect()
 }
 
@@ -9933,6 +9929,9 @@ fn retrieve_uploaded_knowledge_base(
         }
 
         let score = query_terms.intersection(&tokenize(&excerpt)).count();
+        if score == 0 {
+            continue;
+        }
         scored.push((
             score,
             RetrievalChunk {
