@@ -1,7 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -403,6 +407,10 @@ pub fn app() -> Router {
         .route("/docs/oauth2-redirect", get(swagger_oauth2_redirect))
         .route("/redoc", get(redoc_docs))
         .route("/api/v1/agents", get(agents))
+        .route("/api/v1/knowledge/list", get(knowledge_list))
+        .route("/api/v1/settings/llm-options", get(llm_options))
+        .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/ws", get(chat_ws))
         .route("/api/v1/learn", post(learn))
         .route("/api/v1/story-rag/ask", post(ask_story_rag))
 }
@@ -443,6 +451,281 @@ async fn learn(Json(request): Json<StudyRequest>) -> impl IntoResponse {
 
 async fn ask_story_rag(Json(request): Json<StoryQuestion>) -> Json<StoryAnswer> {
     Json(haunted_pajamas_index().ask(&request.question))
+}
+
+async fn knowledge_list() -> Json<Value> {
+    Json(json!({
+        "knowledge_bases": [
+            {
+                "name": "socartes-rust-rag",
+                "is_default": true,
+                "status": "ready",
+                "metadata": {
+                    "description": "Built-in Socartes Rust RAG notes for local frontend smoke tests."
+                },
+                "statistics": {
+                    "chunks": knowledge_base().len()
+                }
+            }
+        ]
+    }))
+}
+
+async fn llm_options() -> Json<Value> {
+    Json(json!({
+        "active": {
+            "profile_id": "socartes-rust",
+            "model_id": "deterministic-agent-loop"
+        },
+        "options": [
+            {
+                "profile_id": "socartes-rust",
+                "profile_name": "Socartes Rust",
+                "model_id": "deterministic-agent-loop",
+                "model_name": "Deterministic Agent Loop",
+                "model": "deterministic-agent-loop",
+                "provider": "rust",
+                "context_window": 8192,
+                "is_active_default": true
+            }
+        ]
+    }))
+}
+
+async fn list_sessions() -> Json<Value> {
+    Json(json!({ "sessions": [] }))
+}
+
+async fn chat_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_chat_socket)
+}
+
+async fn handle_chat_socket(mut socket: WebSocket) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let Message::Text(text) = message else {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            continue;
+        };
+
+        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+            let _ = send_stream_event(
+                &mut socket,
+                stream_event(
+                    "error",
+                    "rust-backend",
+                    "parse",
+                    "Invalid WebSocket JSON message.",
+                    json!({ "turn_terminal": true, "status": "failed" }),
+                    StreamIds::empty(),
+                    1,
+                ),
+            )
+            .await;
+            continue;
+        };
+
+        match payload["type"].as_str().unwrap_or_default() {
+            "start_turn" | "message" => {
+                run_chat_turn(&mut socket, &payload).await;
+            }
+            "regenerate" => {
+                let fallback = json!({
+                    "type": "start_turn",
+                    "content": "Regenerate the previous Socartes answer.",
+                    "session_id": payload["session_id"].as_str()
+                });
+                run_chat_turn(&mut socket, &fallback).await;
+            }
+            "cancel_turn" => {
+                let _ = send_stream_event(
+                    &mut socket,
+                    stream_event(
+                        "done",
+                        "rust-backend",
+                        "",
+                        "",
+                        json!({ "status": "cancelled" }),
+                        StreamIds {
+                            session_id: payload["session_id"].as_str(),
+                            turn_id: payload["turn_id"].as_str(),
+                        },
+                        1,
+                    ),
+                )
+                .await;
+            }
+            "ping" | "subscribe_turn" | "subscribe_session" | "resume_from" | "unsubscribe" => {}
+            _ => {
+                let _ = send_stream_event(
+                    &mut socket,
+                    stream_event(
+                        "error",
+                        "rust-backend",
+                        "protocol",
+                        "Unsupported WebSocket message type.",
+                        json!({ "turn_terminal": true, "status": "failed" }),
+                        StreamIds::empty(),
+                        1,
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn run_chat_turn(socket: &mut WebSocket, payload: &Value) {
+    let content = payload["content"]
+        .as_str()
+        .unwrap_or("Explain the Socartes Rust agent loop.");
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    let turn_id = format!("rust-turn-{}", unique_id());
+    let learner_context = payload["language"]
+        .as_str()
+        .map(|language| format!("Frontend language: {language}"))
+        .unwrap_or_default();
+    let trace = SocartesOrchestrator::new().run(content, &learner_context);
+    let ids = StreamIds::new(&session_id, &turn_id);
+
+    let events = [
+        stream_event(
+            "session",
+            "rust-backend",
+            "",
+            "",
+            json!({ "session_id": session_id, "turn_id": turn_id }),
+            ids,
+            1,
+        ),
+        stream_event(
+            "stage_start",
+            "planner",
+            "planner",
+            "Planner decomposed the request for the Rust Socartes loop.",
+            json!({}),
+            ids,
+            2,
+        ),
+        stream_event(
+            "sources",
+            "retriever",
+            "retriever",
+            "Retrieved Socartes RAG context.",
+            json!({ "sources": trace.retrieved_context }),
+            ids,
+            3,
+        ),
+        stream_event(
+            "tool_result",
+            "tool_adapter",
+            "tool_adapter",
+            "MCP-style tool adapters returned auditable outputs.",
+            json!({ "tool_results": trace.tool_results }),
+            ids,
+            4,
+        ),
+        stream_event(
+            "content",
+            "executor",
+            "executor",
+            &trace.final_answer,
+            json!({ "citations": trace.draft.citations }),
+            ids,
+            5,
+        ),
+        stream_event(
+            "stage_end",
+            "critic",
+            "critic",
+            "Critic approved the cited answer and reflection trace.",
+            json!({ "review": trace.review }),
+            ids,
+            6,
+        ),
+        stream_event(
+            "done",
+            "rust-backend",
+            "",
+            "",
+            json!({ "status": "completed" }),
+            ids,
+            7,
+        ),
+    ];
+
+    for event in events {
+        if send_stream_event(socket, event).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn stream_event(
+    event_type: &str,
+    source: &str,
+    stage: &str,
+    content: &str,
+    metadata: Value,
+    ids: StreamIds<'_>,
+    seq: u64,
+) -> Value {
+    json!({
+        "type": event_type,
+        "source": source,
+        "stage": stage,
+        "content": content,
+        "metadata": metadata,
+        "session_id": ids.session_id,
+        "turn_id": ids.turn_id,
+        "seq": seq,
+        "timestamp": now_seconds()
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StreamIds<'a> {
+    session_id: Option<&'a str>,
+    turn_id: Option<&'a str>,
+}
+
+impl<'a> StreamIds<'a> {
+    fn new(session_id: &'a str, turn_id: &'a str) -> Self {
+        Self {
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            session_id: None,
+            turn_id: None,
+        }
+    }
+}
+
+async fn send_stream_event(socket: &mut WebSocket, event: Value) -> Result<(), axum::Error> {
+    socket.send(Message::Text(event.to_string().into())).await
+}
+
+fn now_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
+}
+
+fn unique_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 async fn openapi_json() -> Json<Value> {

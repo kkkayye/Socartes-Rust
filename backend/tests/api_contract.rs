@@ -118,6 +118,51 @@ async fn agents_endpoint_documents_each_backend_worker() {
 }
 
 #[tokio::test]
+async fn live_chat_frontend_bootstrap_endpoints_are_available() {
+    let knowledge_response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(knowledge_response.status(), http::StatusCode::OK);
+    let knowledge_payload = json_response(knowledge_response).await;
+    assert!(knowledge_payload["knowledge_bases"].is_array());
+
+    let llm_response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/llm-options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(llm_response.status(), http::StatusCode::OK);
+    let llm_payload = json_response(llm_response).await;
+    assert!(llm_payload["options"].is_array());
+
+    let sessions_response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions?limit=50&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sessions_response.status(), http::StatusCode::OK);
+    let sessions_payload = json_response(sessions_response).await;
+    assert!(sessions_payload["sessions"].is_array());
+}
+
+#[tokio::test]
 async fn story_rag_endpoint_returns_grounded_source_id() {
     let response = app()
         .oneshot(
