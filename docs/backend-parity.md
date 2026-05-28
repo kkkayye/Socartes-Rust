@@ -78,8 +78,8 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`138`
-- 前端仍缺 Rust 覆盖的路径：`9`
+- Rust 后端路由：`143`
+- 前端仍缺 Rust 覆盖的路径：`6`
 
 本轮已补齐并验证的主要区域：
 
@@ -94,16 +94,20 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/question-notebook/*` 题目 Notebook entries、lookup/upsert、分类 CRUD、entry/category 关联与筛选
 - `/api/v1/memory*` two-file public memory：`SUMMARY.md`/`PROFILE.md` 快照、单文件保存/清空、从会话刷新、缺失 session/非法 file 错误兼容
 - `/api/v1/skills*` file-backed `SKILL.md` 管理：技能 list/detail/create/update/rename/delete、默认 tag 词表、tag create/rename/delete、tag 级联重写、frontmatter scalar 转义、symlink 目录拒绝、前端 JSON DELETE 合同
+- `/api/v1/plugins/*` Playground plugins list、tool execute、tool SSE、capability SSE 兼容入口
+- `/api/v1/page-agent/openai/v1/chat/completions` Page agent OpenAI-compatible fallback，返回 `AgentOutput` tool call，保持前端 pet/page-agent 可解析
 
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`31` 个测试通过
+- `cargo test`：`31` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `cargo test course_knowledge`：`2` 个课程/知识库契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
+- `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
+- `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过
 - `cargo test book_`：`4` 个 Book/Notebook 相关契约测试通过
 - Chromium 本地打开 `http://127.0.0.1:3011/book?book=<id>`：页面 `200`，reader 正文渲染，控制台 `0` 个 error
 - Chromium 本地打开 `http://127.0.0.1:3011/settings`：页面 `200`，settings/status/catalog 渲染，控制台 `0` 个 error
@@ -112,9 +116,8 @@ python3 tools/api_parity_scan.py \
 
 下一批 P0 仍未完成：
 
-- `/api/v1/plugins/list` 与 tool/capability stream
 - `/api/v1/co_writer/*`
-- `/api/v1/page-agent/openai/v1/chat/completions`
+- 前端扫描里的 `/api/v1/book{param}` 疑似模板扫描伪影，落地前需先回看具体调用点确认是否真实路由
 
 ## 已知限制
 

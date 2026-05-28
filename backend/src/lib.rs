@@ -719,6 +719,23 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         .route("/api/v1/memory", get(get_memory).put(update_memory))
         .route("/api/v1/memory/refresh", post(refresh_memory))
         .route("/api/v1/memory/clear", post(clear_memory))
+        .route("/api/v1/plugins/list", get(list_plugins))
+        .route(
+            "/api/v1/page-agent/openai/v1/chat/completions",
+            post(page_agent_chat_completion),
+        )
+        .route(
+            "/api/v1/plugins/tools/{tool_name}/execute",
+            post(execute_plugin_tool),
+        )
+        .route(
+            "/api/v1/plugins/tools/{tool_name}/execute-stream",
+            post(execute_plugin_tool_stream),
+        )
+        .route(
+            "/api/v1/plugins/capabilities/{capability_name}/execute-stream",
+            post(execute_plugin_capability_stream),
+        )
         .route("/api/v1/skills/list", get(list_skills))
         .route("/api/v1/skills/create", post(create_skill))
         .route("/api/v1/skills/tags/list", get(list_skill_tags))
@@ -5862,6 +5879,557 @@ async fn clear_memory(
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+async fn page_agent_chat_completion(Json(payload): Json<Value>) -> impl IntoResponse {
+    if !matches!(payload.get("messages"), Some(Value::Array(_))) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "messages must be an array",
+        )
+        .into_response();
+    }
+
+    let model = payload["model"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("deeptutor-page-agent-fallback");
+    let arguments = json!({
+        "type": "done",
+        "message": "Page agent LLM tool-calling is not configured. Configure an OpenAI-compatible chat provider to enable page actions."
+    });
+    let arguments_text = serde_json::to_string(&arguments).unwrap_or_else(|_| {
+        "{\"type\":\"done\",\"message\":\"Page agent unavailable\"}".to_string()
+    });
+
+    Json(json!({
+        "id": format!("chatcmpl-page-agent-{}", unique_id()),
+        "object": "chat.completion",
+        "created": now_seconds() as u64,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": format!("call_{}", unique_id()),
+                            "type": "function",
+                            "function": {
+                                "name": "AgentOutput",
+                                "arguments": arguments_text
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }))
+    .into_response()
+}
+
+async fn list_plugins() -> Json<Value> {
+    Json(json!({
+        "tools": plugin_tool_definitions(),
+        "capabilities": plugin_capability_manifests(),
+        "plugins": []
+    }))
+}
+
+async fn execute_plugin_tool(
+    State(state): State<AppState>,
+    Path(tool_name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let params = plugin_request_params(&payload);
+    match plugin_tool_result(&state, &tool_name, params) {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn execute_plugin_tool_stream(
+    State(state): State<AppState>,
+    Path(tool_name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let params = plugin_request_params(&payload);
+    let mut body = String::new();
+    body.push_str(&sse(
+        "process_log",
+        json!({
+            "level": "INFO",
+            "message": format!("Executing tool {tool_name}"),
+            "logger": "deeptutor.playground.stdout",
+            "timestamp": now_seconds(),
+            "context": { "capability": "playground", "sink": "ui" }
+        }),
+    ));
+
+    match plugin_tool_result(&state, &tool_name, params) {
+        Ok(mut result) => {
+            result["elapsed_ms"] = json!(1);
+            body.push_str(&sse("result", result));
+        }
+        Err((_, Json(error))) => {
+            body.push_str(&sse(
+                "error",
+                json!({
+                    "detail": error["detail"].as_str().unwrap_or("Tool execution failed"),
+                    "elapsed_ms": 1
+                }),
+            ));
+        }
+    }
+
+    sse_response(body)
+}
+
+async fn execute_plugin_capability_stream(
+    State(state): State<AppState>,
+    Path(capability_name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut body = String::new();
+    body.push_str(&sse(
+        "process_log",
+        json!({
+            "level": "INFO",
+            "message": format!("Executing capability {capability_name}"),
+            "logger": "deeptutor.playground.stdout",
+            "timestamp": now_seconds(),
+            "context": { "capability": capability_name, "sink": "ui" }
+        }),
+    ));
+
+    if !plugin_capability_names().contains(&capability_name.as_str()) {
+        body.push_str(&sse(
+            "error",
+            json!({
+                "detail": format!("Capability {capability_name:?} not found"),
+                "elapsed_ms": 1
+            }),
+        ));
+        return sse_response(body);
+    }
+
+    let request = json!({
+        "type": "start_turn",
+        "content": payload["content"].as_str().unwrap_or_default(),
+        "tools": payload["tools"].clone(),
+        "knowledge_bases": payload["knowledge_bases"].clone(),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "capability": capability_name
+    });
+    let (_session_id, turn_id, events) = execute_chat_turn(&state, &request);
+    let mut final_data = json!({});
+    for event in events {
+        if event["type"] == "done" {
+            continue;
+        }
+        if event["type"] == "content" {
+            final_data["content"] = event["content"].clone();
+        }
+        body.push_str(&sse("stream", event));
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "turn_id": turn_id,
+                "result": final_data
+            },
+            "elapsed_ms": 1
+        }),
+    ));
+
+    sse_response(body)
+}
+
+fn plugin_request_params(payload: &Value) -> Value {
+    payload
+        .get("params")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn plugin_tool_result(state: &AppState, tool_name: &str, params: Value) -> Result<Value, ApiError> {
+    if !plugin_tool_names().contains(&tool_name) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Tool '{tool_name}' not found"),
+        ));
+    }
+
+    let (success, content, sources, metadata) = match tool_name {
+        "brainstorm" => {
+            let topic = string_param(&params, "topic").unwrap_or("the current Socartes task");
+            let context = string_param(&params, "context").unwrap_or("");
+            (
+                true,
+                format!(
+                    "Brainstorm for {topic}: define the learning goal, retrieve course evidence, run the agent workflow, and check the answer. {context}"
+                ),
+                json!([]),
+                json!({ "tool": "brainstorm", "topic": topic, "context": context }),
+            )
+        }
+        "rag" => {
+            let query = string_param(&params, "query").unwrap_or_default();
+            let kb_names = string_param(&params, "kb_name")
+                .filter(|value| !value.is_empty())
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_else(|| vec![read_default_knowledge_base(state)]);
+            let chunks = retrieve_chat_context(state, query, &kb_names);
+            let content = if chunks.is_empty() {
+                format!("No Socartes knowledge base passages matched query: {query}")
+            } else {
+                chunks
+                    .iter()
+                    .map(|chunk| format!("{}: {}", chunk.source_id, chunk.content))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            let sources = Value::Array(
+                chunks
+                    .iter()
+                    .map(|chunk| {
+                        json!({
+                            "type": "rag",
+                            "source_id": chunk.source_id,
+                            "title": chunk.title,
+                            "content": chunk.content,
+                            "confidence": chunk.confidence
+                        })
+                    })
+                    .collect(),
+            );
+            (
+                true,
+                content,
+                sources,
+                json!({ "provider": DEFAULT_RAG_PROVIDER, "query": query, "knowledge_bases": kb_names }),
+            )
+        }
+        "web_search" => {
+            let query = string_param(&params, "query").unwrap_or_default();
+            (
+                true,
+                format!(
+                    "Web search compatibility result for '{query}'. Configure a live search provider for network retrieval."
+                ),
+                json!([{ "type": "web", "title": "Socartes Rust compatibility search", "url": "" }]),
+                json!({ "provider": "compatibility", "query": query }),
+            )
+        }
+        "code_execution" => {
+            let intent = string_param(&params, "intent")
+                .or_else(|| string_param(&params, "query"))
+                .unwrap_or("Run a Socartes calculation");
+            let code = string_param(&params, "code").unwrap_or("");
+            (
+                true,
+                if code.is_empty() {
+                    format!("Code execution compatibility accepted intent: {intent}")
+                } else {
+                    format!("Code execution compatibility accepted code for intent '{intent}'.")
+                },
+                json!([]),
+                json!({ "intent": intent, "code": code, "exit_code": 0, "artifacts": [] }),
+            )
+        }
+        "reason" => {
+            let query = string_param(&params, "query").unwrap_or_default();
+            let context = string_param(&params, "context").unwrap_or("");
+            (
+                true,
+                format!(
+                    "Reasoned answer for '{query}' using Socartes planner/executor/critic structure. {context}"
+                ),
+                json!([]),
+                json!({ "query": query, "context": context }),
+            )
+        }
+        "paper_search" => {
+            let query = string_param(&params, "query").unwrap_or_default();
+            (
+                true,
+                format!("No arXiv preprints were fetched in compatibility mode for query: {query}"),
+                json!([]),
+                json!({ "provider": "arxiv", "query": query, "papers": [] }),
+            )
+        }
+        "geogebra_analysis" => {
+            let question = string_param(&params, "question").unwrap_or_default();
+            (
+                true,
+                format!("GeoGebra compatibility analysis received question: {question}"),
+                json!([]),
+                json!({ "question": question, "final_ggb_commands": [] }),
+            )
+        }
+        _ => unreachable!("tool name was checked"),
+    };
+
+    Ok(json!({
+        "success": success,
+        "content": content,
+        "sources": sources,
+        "metadata": metadata
+    }))
+}
+
+fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn plugin_tool_names() -> Vec<&'static str> {
+    vec![
+        "brainstorm",
+        "rag",
+        "web_search",
+        "code_execution",
+        "reason",
+        "paper_search",
+        "geogebra_analysis",
+    ]
+}
+
+fn plugin_tool_definitions() -> Value {
+    json!([
+        {
+            "name": "brainstorm",
+            "description": "Broadly explore multiple possibilities for a topic and give a short rationale for each.",
+            "parameters": [
+                tool_parameter("topic", "string", "The topic, goal, or problem to brainstorm about.", true, Value::Null, Value::Null),
+                tool_parameter("context", "string", "Optional supporting context, constraints, or background.", false, Value::Null, Value::Null)
+            ]
+        },
+        {
+            "name": "rag",
+            "description": "Search a knowledge base using Retrieval-Augmented Generation. Returns relevant passages and an LLM-synthesised answer.",
+            "parameters": [
+                tool_parameter("query", "string", "Search query.", true, Value::Null, Value::Null),
+                tool_parameter("kb_name", "string", "Knowledge base to search.", false, Value::Null, Value::Null)
+            ]
+        },
+        {
+            "name": "web_search",
+            "description": "Search the web and return summarised results with citations.",
+            "parameters": [
+                tool_parameter("query", "string", "Search query.", true, Value::Null, Value::Null)
+            ]
+        },
+        {
+            "name": "code_execution",
+            "description": "Turn a natural-language computation request into Python, run it in a restricted Python worker, and return the result.",
+            "parameters": [
+                tool_parameter("intent", "string", "Natural-language description of the computation or verification task.", true, Value::Null, Value::Null),
+                tool_parameter("code", "string", "Optional raw Python code to execute directly.", false, Value::Null, Value::Null),
+                tool_parameter("timeout", "integer", "Max execution time in seconds.", false, json!(30), Value::Null)
+            ]
+        },
+        {
+            "name": "reason",
+            "description": "Perform deep reasoning on a complex sub-problem using a dedicated LLM call. Use when the current context is insufficient for a confident answer.",
+            "parameters": [
+                tool_parameter("query", "string", "The sub-problem to reason about.", true, Value::Null, Value::Null),
+                tool_parameter("context", "string", "Supporting context for reasoning.", false, Value::Null, Value::Null)
+            ]
+        },
+        {
+            "name": "paper_search",
+            "description": "Search arXiv preprints by keyword and return concise metadata.",
+            "parameters": [
+                tool_parameter("query", "string", "Search query.", true, Value::Null, Value::Null),
+                tool_parameter("max_results", "integer", "Maximum papers to return.", false, json!(3), Value::Null),
+                tool_parameter("years_limit", "integer", "Only include preprints from the last N years.", false, json!(3), Value::Null),
+                tool_parameter("sort_by", "string", "Sort by relevance or submission date.", false, json!("relevance"), json!(["relevance", "date"]))
+            ]
+        },
+        {
+            "name": "geogebra_analysis",
+            "description": "Analyze a math problem image, detect geometric elements, and generate validated GeoGebra commands for visualization. Requires an attached image.",
+            "parameters": [
+                tool_parameter("question", "string", "The math problem text to analyze.", true, Value::Null, Value::Null),
+                tool_parameter("image_base64", "string", "Base64-encoded image (data URI or raw). Injected from attachments when called via function-calling.", false, json!(""), Value::Null),
+                tool_parameter("language", "string", "Output language: 'zh' or 'en'.", false, json!("zh"), json!(["zh", "en"]))
+            ]
+        }
+    ])
+}
+
+fn tool_parameter(
+    name: &str,
+    parameter_type: &str,
+    description: &str,
+    required: bool,
+    default_value: Value,
+    enum_values: Value,
+) -> Value {
+    json!({
+        "name": name,
+        "type": parameter_type,
+        "description": description,
+        "required": required,
+        "default": default_value,
+        "enum": enum_values
+    })
+}
+
+fn plugin_capability_names() -> Vec<&'static str> {
+    vec![
+        "chat",
+        "deep_solve",
+        "deep_question",
+        "deep_research",
+        "math_animator",
+        "visualize",
+    ]
+}
+
+fn plugin_capability_manifests() -> Value {
+    json!([
+        {
+            "name": "chat",
+            "description": "Agentic chat with autonomous tool selection across enabled tools.",
+            "stages": ["thinking", "acting", "observing", "responding"],
+            "tools_used": ["brainstorm", "rag", "web_search", "code_execution", "reason", "paper_search"],
+            "cli_aliases": ["chat"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {},
+                "title": "ChatRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": {}
+        },
+        {
+            "name": "deep_solve",
+            "description": "Multi-agent problem solving (Plan -> ReAct -> Write).",
+            "stages": ["planning", "reasoning", "writing"],
+            "tools_used": ["rag", "web_search", "code_execution", "reason"],
+            "cli_aliases": ["solve"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {
+                    "detailed_answer": { "default": true, "title": "Detailed Answer", "type": "boolean" }
+                },
+                "title": "DeepSolveRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": {}
+        },
+        {
+            "name": "deep_question",
+            "description": "Fast question generation (Template batches -> Generate).",
+            "stages": ["ideation", "generation"],
+            "tools_used": ["rag", "web_search", "code_execution"],
+            "cli_aliases": ["question"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {
+                    "mode": { "default": "custom", "enum": ["custom", "mimic"], "title": "Mode", "type": "string" },
+                    "topic": { "default": "", "title": "Topic", "type": "string" },
+                    "num_questions": { "default": 1, "maximum": 50, "minimum": 1, "title": "Num Questions", "type": "integer" },
+                    "difficulty": { "default": "", "title": "Difficulty", "type": "string" },
+                    "question_type": { "default": "", "title": "Question Type", "type": "string" },
+                    "preference": { "default": "", "title": "Preference", "type": "string" },
+                    "paper_path": { "default": "", "title": "Paper Path", "type": "string" },
+                    "max_questions": { "default": 10, "maximum": 100, "minimum": 1, "title": "Max Questions", "type": "integer" }
+                },
+                "title": "DeepQuestionRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": {}
+        },
+        {
+            "name": "deep_research",
+            "description": "Multi-agent deep research with report generation.",
+            "stages": ["rephrasing", "decomposing", "researching", "reporting"],
+            "tools_used": ["rag", "web_search", "paper_search", "code_execution"],
+            "cli_aliases": ["research"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {
+                    "mode": { "enum": ["notes", "report", "comparison", "learning_path"], "title": "Mode", "type": "string" },
+                    "depth": { "enum": ["quick", "standard", "deep", "manual"], "title": "Depth", "type": "string" },
+                    "sources": {
+                        "items": { "enum": ["kb", "web", "papers"], "type": "string" },
+                        "title": "Sources",
+                        "type": "array"
+                    }
+                },
+                "required": ["mode", "depth", "sources"],
+                "title": "DeepResearchRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": {}
+        },
+        {
+            "name": "math_animator",
+            "description": "Generate math animations and visual explanations.",
+            "stages": ["concept_analysis", "concept_design", "code_generation", "code_retry", "summary", "render_output"],
+            "tools_used": [],
+            "cli_aliases": ["animate"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {
+                    "output_mode": { "default": "video", "enum": ["video", "image"], "title": "Output Mode", "type": "string" },
+                    "quality": { "default": "medium", "enum": ["low", "medium", "high"], "title": "Quality", "type": "string" },
+                    "style_hint": { "default": "", "maxLength": 500, "title": "Style Hint", "type": "string" }
+                },
+                "title": "MathAnimatorRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": { "output_mode": "video", "quality": "medium", "style_hint": "" }
+        },
+        {
+            "name": "visualize",
+            "description": "Create visual explanations and diagrams.",
+            "stages": ["analyzing", "generating", "reviewing"],
+            "tools_used": [],
+            "cli_aliases": ["visualize"],
+            "request_schema": {
+                "additionalProperties": false,
+                "properties": {
+                    "render_mode": { "default": "auto", "enum": ["auto", "svg", "chartjs", "mermaid", "html"], "title": "Render Mode", "type": "string" }
+                },
+                "title": "VisualizeRequestConfig",
+                "type": "object"
+            },
+            "config_defaults": {}
+        }
+    ])
+}
+
+fn sse(event: &str, payload: Value) -> String {
+    format!("event: {event}\ndata: {}\n\n", payload)
+}
+
+fn sse_response(body: String) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        body,
+    )
 }
 
 async fn list_skills(State(state): State<AppState>) -> impl IntoResponse {

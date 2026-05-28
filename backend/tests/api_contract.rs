@@ -1621,6 +1621,246 @@ async fn skills_tag_vocab_stays_unchanged_when_cascade_rewrite_fails() {
 }
 
 #[tokio::test]
+async fn plugins_list_matches_playground_contract() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/plugins/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    let tools = payload["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| {
+        tool["name"] == "rag"
+            && tool["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|param| param["name"] == "kb_name" && param["required"] == false)
+    }));
+    assert!(tools.iter().any(|tool| tool["name"] == "code_execution"));
+
+    let capabilities = payload["capabilities"]
+        .as_array()
+        .expect("capabilities array");
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "chat"
+            && capability["stages"] == json!(["thinking", "acting", "observing", "responding"])
+            && capability["tools_used"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("rag"))
+            && capability["request_schema"]["title"] == "ChatRequestConfig"
+    }));
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability["name"] == "deep_research")
+    );
+    assert_eq!(payload["plugins"], json!([]));
+}
+
+#[tokio::test]
+async fn plugins_tool_execute_and_stream_match_python_shapes() {
+    let direct_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/brainstorm/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"topic": "course planning", "context": "short"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(direct_response.status(), http::StatusCode::OK);
+    let direct = json_response(direct_response).await;
+    assert_eq!(direct["success"], true);
+    assert!(
+        direct["content"]
+            .as_str()
+            .unwrap()
+            .contains("course planning")
+    );
+    assert!(direct["sources"].is_array());
+    assert!(direct["metadata"].is_object());
+
+    let stream_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "blue theorem", "kb_name": "socartes-rust-rag"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        stream_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(stream_response).await;
+    assert!(stream.contains("event: process_log"));
+    assert!(stream.contains("event: result"));
+    assert!(stream.contains("\"success\":true"));
+    assert!(stream.contains("\"elapsed_ms\""));
+}
+
+#[tokio::test]
+async fn plugins_capability_stream_matches_playground_contract() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/chat/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Explain RAG briefly",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "language": "en",
+                        "config": {},
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    assert!(stream.contains("event: process_log"));
+    assert!(stream.contains("event: stream"));
+    assert!(stream.contains("\"type\":\"content\""));
+    assert!(stream.contains("event: result"));
+    assert!(stream.contains("\"success\":true"));
+    assert!(stream.contains("\"data\""));
+    assert!(stream.contains("\"elapsed_ms\""));
+}
+
+#[tokio::test]
+async fn page_agent_chat_completion_returns_agent_output_tool_call() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/page-agent/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.5",
+                        "messages": [
+                            {"role": "system", "content": "You are the Socartes page agent."},
+                            {"role": "user", "content": "What can you do on this page?"}
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "AgentOutput",
+                                    "parameters": {
+                                        "type": "object",
+                                        "required": ["type"],
+                                        "properties": {
+                                            "type": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        ],
+                        "tool_choice": {"type": "function", "function": {"name": "AgentOutput"}},
+                        "temperature": 0.7,
+                        "extra_frontend_field": "allowed"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert!(
+        payload["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("chatcmpl-page-agent-")
+    );
+    assert_eq!(payload["object"], "chat.completion");
+    assert_eq!(payload["model"], "gpt-5.5");
+    assert!(payload["created"].is_number());
+    assert_eq!(payload["choices"][0]["index"], 0);
+    assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
+
+    let message = &payload["choices"][0]["message"];
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["content"], "");
+
+    let tool_call = &message["tool_calls"][0];
+    assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
+    assert_eq!(tool_call["type"], "function");
+    assert_eq!(tool_call["function"]["name"], "AgentOutput");
+
+    let arguments = tool_call["function"]["arguments"]
+        .as_str()
+        .expect("AgentOutput arguments must be a JSON string");
+    let parsed_arguments: Value =
+        serde_json::from_str(arguments).expect("AgentOutput arguments JSON");
+    assert_eq!(parsed_arguments["type"], "done");
+    assert!(
+        parsed_arguments["message"]
+            .as_str()
+            .unwrap()
+            .contains("Page agent")
+    );
+    assert_eq!(payload["usage"]["total_tokens"], 0);
+}
+
+#[tokio::test]
+async fn page_agent_chat_completion_requires_messages_array() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/page-agent/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"model": "gpt-5.5"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+    let payload = json_response(response).await;
+    assert!(payload["detail"].as_str().unwrap().contains("messages"));
+}
+
+#[tokio::test]
 async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
