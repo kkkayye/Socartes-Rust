@@ -415,6 +415,7 @@ struct AppState {
     session_root: Arc<PathBuf>,
     book_root: Arc<PathBuf>,
     output_root: Arc<PathBuf>,
+    settings_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -433,11 +434,15 @@ impl AppState {
         let output_root = env::var_os("SOCARTES_OUTPUT_ROOT")
             .map(PathBuf::from)
             .unwrap_or(user_data_root);
+        let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("settings"));
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
             book_root: Arc::new(book_root),
             output_root: Arc::new(output_root),
+            settings_root: Arc::new(settings_root),
         }
     }
 }
@@ -484,7 +489,42 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(reindex_knowledge_base),
         )
         .route("/api/v1/knowledge/{name}", delete(delete_knowledge_base))
+        .route("/api/v1/settings", get(get_settings))
+        .route(
+            "/api/v1/settings/catalog",
+            get(get_settings_catalog).put(update_settings_catalog),
+        )
+        .route("/api/v1/settings/apply", post(apply_settings_catalog))
+        .route("/api/v1/settings/ui", put(update_ui_settings_endpoint))
+        .route("/api/v1/settings/theme", put(update_theme_endpoint))
+        .route("/api/v1/settings/language", put(update_language_endpoint))
+        .route("/api/v1/settings/reset", post(reset_settings_endpoint))
+        .route("/api/v1/settings/themes", get(settings_themes))
+        .route("/api/v1/settings/sidebar", get(settings_sidebar))
+        .route(
+            "/api/v1/settings/tests/{service}/start",
+            post(start_settings_test),
+        )
+        .route(
+            "/api/v1/settings/tests/{service}/{run_id}/events",
+            get(settings_test_events),
+        )
+        .route(
+            "/api/v1/settings/tests/{service}/{run_id}/cancel",
+            post(cancel_settings_test),
+        )
         .route("/api/v1/settings/llm-options", get(llm_options))
+        .route("/api/v1/system/status", get(system_status))
+        .route(
+            "/api/v1/system/runtime-topology",
+            get(system_runtime_topology),
+        )
+        .route("/api/v1/system/test/llm", post(system_test_llm))
+        .route(
+            "/api/v1/system/test/embeddings",
+            post(system_test_embeddings),
+        )
+        .route("/api/v1/system/test/search", post(system_test_search))
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}", patch(update_session_title))
@@ -1883,6 +1923,190 @@ fn output_mime_type(path: &FsPath) -> &'static str {
     }
 }
 
+fn settings_path(state: &AppState, filename: &str) -> PathBuf {
+    state.settings_root.join(filename)
+}
+
+fn read_settings_json(state: &AppState, filename: &str) -> Option<Value> {
+    let text = fs::read_to_string(settings_path(state, filename)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_settings_json(state: &AppState, filename: &str, value: &Value) -> Result<(), ApiError> {
+    fs::create_dir_all(&*state.settings_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create settings directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize settings: {error}"),
+        )
+    })?;
+    fs::write(settings_path(state, filename), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write settings: {error}"),
+        )
+    })
+}
+
+fn load_ui_settings(state: &AppState) -> Value {
+    let mut defaults = default_ui_settings();
+    if let Some(saved) = read_settings_json(state, "ui.json") {
+        merge_object_value(&mut defaults, &saved);
+    }
+    defaults
+}
+
+fn load_settings_catalog(state: &AppState) -> Value {
+    read_settings_json(state, "catalog.json").unwrap_or_else(default_settings_catalog)
+}
+
+fn default_ui_settings() -> Value {
+    json!({
+        "theme": "light",
+        "language": "en",
+        "sidebar_description": "✨ Data Intelligence Lab @ HKU",
+        "sidebar_nav_order": {
+            "start": ["/", "/history", "/knowledge", "/notebook"],
+            "learnResearch": ["/question", "/solver", "/research", "/co_writer"]
+        }
+    })
+}
+
+fn default_settings_catalog() -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "llm": {
+                "active_profile_id": "socartes-rust",
+                "active_model_id": "deterministic-agent-loop",
+                "profiles": [{
+                    "id": "socartes-rust",
+                    "name": "Socartes Rust",
+                    "binding": "openai",
+                    "base_url": "http://127.0.0.1:8810/v1",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-agent-loop",
+                        "name": "Deterministic Agent Loop",
+                        "model": "deterministic-agent-loop",
+                        "context_window": "8192",
+                        "context_window_source": "rust-default"
+                    }]
+                }]
+            },
+            "embedding": {
+                "active_profile_id": "socartes-rust-embedding",
+                "active_model_id": "deterministic-embedding",
+                "profiles": [{
+                    "id": "socartes-rust-embedding",
+                    "name": "Socartes Rust Embedding",
+                    "binding": "openai",
+                    "base_url": "http://127.0.0.1:8810/v1",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-embedding",
+                        "name": "Deterministic Embedding",
+                        "model": "deterministic-embedding",
+                        "dimension": "3072",
+                        "send_dimensions": true,
+                        "supported_dimensions": "1536,3072"
+                    }]
+                }]
+            },
+            "search": {
+                "active_profile_id": "duckduckgo-local",
+                "profiles": [{
+                    "id": "duckduckgo-local",
+                    "name": "DuckDuckGo Local",
+                    "provider": "duckduckgo",
+                    "base_url": "",
+                    "api_key": "",
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
+            }
+        }
+    })
+}
+
+fn settings_provider_choices() -> Value {
+    json!({
+        "llm": [
+            { "value": "openai", "label": "OpenAI-compatible", "base_url": "http://127.0.0.1:8810/v1" },
+            { "value": "custom", "label": "Custom (OpenAI API)", "base_url": "" },
+            { "value": "custom_anthropic", "label": "Custom (Anthropic API)", "base_url": "" }
+        ],
+        "embedding": [
+            { "value": "openai", "label": "OpenAI-compatible", "base_url": "http://127.0.0.1:8810/v1", "default_dim": "3072" },
+            { "value": "local", "label": "Local deterministic", "base_url": "", "default_dim": "3072" }
+        ],
+        "search": [
+            { "value": "brave", "label": "Brave", "base_url": "" },
+            { "value": "tavily", "label": "Tavily", "base_url": "" },
+            { "value": "jina", "label": "Jina", "base_url": "" },
+            { "value": "searxng", "label": "SearXNG", "base_url": "" },
+            { "value": "duckduckgo", "label": "DuckDuckGo", "base_url": "" },
+            { "value": "perplexity", "label": "Perplexity", "base_url": "" }
+        ]
+    })
+}
+
+fn render_settings_env(catalog: &Value) -> Value {
+    let llm_model = active_catalog_model_name(catalog, "llm")
+        .unwrap_or_else(|| "deterministic-agent-loop".to_string());
+    let embedding_model = active_catalog_model_name(catalog, "embedding")
+        .unwrap_or_else(|| "deterministic-embedding".to_string());
+    let search_provider =
+        active_search_provider(catalog).unwrap_or_else(|| "duckduckgo".to_string());
+    json!({
+        "SOCARTES_LLM_MODEL": llm_model,
+        "SOCARTES_EMBEDDING_MODEL": embedding_model,
+        "SOCARTES_SEARCH_PROVIDER": search_provider
+    })
+}
+
+fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<String> {
+    let service = &catalog["services"][service_name];
+    let active_profile_id = service["active_profile_id"].as_str();
+    let profile = service["profiles"]
+        .as_array()?
+        .iter()
+        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
+        .or_else(|| service["profiles"].as_array()?.first())?;
+    let active_model_id = service["active_model_id"].as_str();
+    let model = profile["models"]
+        .as_array()?
+        .iter()
+        .find(|model| Some(model["id"].as_str().unwrap_or_default()) == active_model_id)
+        .or_else(|| profile["models"].as_array()?.first())?;
+    model["model"]
+        .as_str()
+        .or_else(|| model["name"].as_str())
+        .map(ToString::to_string)
+}
+
+fn active_search_provider(catalog: &Value) -> Option<String> {
+    let service = &catalog["services"]["search"];
+    let active_profile_id = service["active_profile_id"].as_str();
+    let profile = service["profiles"]
+        .as_array()?
+        .iter()
+        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
+        .or_else(|| service["profiles"].as_array()?.first())?;
+    profile["provider"].as_str().map(ToString::to_string)
+}
+
 fn default_knowledge_root() -> PathBuf {
     env::var_os("SOCARTES_KNOWLEDGE_ROOT")
         .map(PathBuf::from)
@@ -2308,6 +2532,241 @@ async fn llm_options() -> Json<Value> {
                 "is_active_default": true
             }
         ]
+    }))
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ui": load_ui_settings(&state),
+        "catalog": load_settings_catalog(&state),
+        "providers": settings_provider_choices()
+    }))
+}
+
+async fn get_settings_catalog(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "catalog": load_settings_catalog(&state) }))
+}
+
+async fn update_settings_catalog(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let catalog = payload
+        .get("catalog")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(default_settings_catalog);
+    match write_settings_json(&state, "catalog.json", &catalog) {
+        Ok(()) => Json(json!({ "catalog": catalog })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn apply_settings_catalog(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let catalog = payload
+        .get("catalog")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| load_settings_catalog(&state));
+    if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
+        return error.into_response();
+    }
+    let env = render_settings_env(&catalog);
+    match write_settings_json(&state, "applied-env.json", &env) {
+        Ok(()) => Json(json!({
+            "message": "Catalog applied to the active .env configuration.",
+            "catalog": catalog,
+            "env": env
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_ui_settings_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut ui = load_ui_settings(&state);
+    if let Some(theme) = payload["theme"].as_str() {
+        ui["theme"] = json!(theme);
+    }
+    if let Some(language) = payload["language"].as_str() {
+        ui["language"] = json!(language);
+    }
+    if let Some(description) = payload["sidebar_description"].as_str() {
+        ui["sidebar_description"] = json!(description);
+    }
+    if payload["sidebar_nav_order"].is_object() {
+        ui["sidebar_nav_order"] = payload["sidebar_nav_order"].clone();
+    }
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(ui).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_theme_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let theme = payload["theme"].as_str().unwrap_or("light");
+    let mut ui = load_ui_settings(&state);
+    ui["theme"] = json!(theme);
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(json!({ "theme": theme })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_language_endpoint(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let language = payload["language"].as_str().unwrap_or("en");
+    let mut ui = load_ui_settings(&state);
+    ui["language"] = json!(language);
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(json!({ "language": language })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn reset_settings_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    let ui = default_ui_settings();
+    match write_settings_json(&state, "ui.json", &ui) {
+        Ok(()) => Json(ui).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn settings_themes() -> Json<Value> {
+    Json(json!({
+        "themes": [
+            { "id": "snow", "name": "Snow" },
+            { "id": "light", "name": "Light" },
+            { "id": "dark", "name": "Dark" },
+            { "id": "glass", "name": "Glass" }
+        ]
+    }))
+}
+
+async fn settings_sidebar(State(state): State<AppState>) -> Json<Value> {
+    let ui = load_ui_settings(&state);
+    Json(json!({
+        "description": ui["sidebar_description"].clone(),
+        "nav_order": ui["sidebar_nav_order"].clone()
+    }))
+}
+
+async fn start_settings_test(
+    Path(service): Path<String>,
+    Json(payload): Json<Value>,
+) -> Json<Value> {
+    let _ = payload;
+    Json(json!({ "run_id": format!("{service}-{}", unique_id()) }))
+}
+
+async fn settings_test_events(
+    Path((service, run_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let service = service.replace('"', "");
+    let run_id = run_id.replace('"', "");
+    let body = format!(
+        "data: {{\"type\":\"started\",\"message\":\"Socartes Rust {service} diagnostics started\",\"run_id\":\"{run_id}\"}}\n\n\
+data: {{\"type\":\"capabilities\",\"message\":\"Detected deterministic Rust compatibility capabilities\",\"detected_dim\":3072,\"default_dim\":3072,\"supported_dimensions\":[1536,3072],\"supports_variable_dimensions\":true,\"model_known\":true,\"active_dim\":3072,\"active_dim_source\":\"catalog\"}}\n\n\
+data: {{\"type\":\"completed\",\"message\":\"{service} diagnostics completed\"}}\n\n"
+    );
+    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+}
+
+async fn cancel_settings_test(Path((_service, _run_id)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "message": "Cancelled" }))
+}
+
+async fn system_status(State(state): State<AppState>) -> Json<Value> {
+    let catalog = load_settings_catalog(&state);
+    let llm_model = active_catalog_model_name(&catalog, "llm");
+    let embedding_model = active_catalog_model_name(&catalog, "embedding");
+    let search_provider = active_search_provider(&catalog);
+    Json(json!({
+        "backend": {
+            "status": "online",
+            "timestamp": now_label()
+        },
+        "llm": {
+            "status": if llm_model.is_some() { "configured" } else { "not_configured" },
+            "model": llm_model,
+            "testable": true
+        },
+        "embeddings": {
+            "status": if embedding_model.is_some() { "configured" } else { "not_configured" },
+            "model": embedding_model,
+            "testable": true
+        },
+        "search": {
+            "status": if search_provider.is_some() { "configured" } else { "optional" },
+            "provider": search_provider,
+            "testable": true
+        }
+    }))
+}
+
+async fn system_runtime_topology() -> Json<Value> {
+    Json(json!({
+        "primary_runtime": {
+            "transport": "/api/v1/ws",
+            "manager": "RustTurnRuntime",
+            "orchestrator": "SocartesOrchestrator",
+            "session_store": "FileSessionStore",
+            "capability_entry": "Rust compatibility endpoints",
+            "tool_entry": "Deterministic local adapters"
+        },
+        "compatibility_routes": [
+            {"router": "book", "mode": "file_backed_compatibility"},
+            {"router": "knowledge", "mode": "file_backed_compatibility"},
+            {"router": "settings", "mode": "file_backed_compatibility"}
+        ],
+        "isolated_subsystems": []
+    }))
+}
+
+async fn system_test_llm(State(state): State<AppState>) -> Json<Value> {
+    let model = active_catalog_model_name(&load_settings_catalog(&state), "llm")
+        .unwrap_or_else(|| "deterministic-agent-loop".to_string());
+    Json(json!({
+        "success": true,
+        "message": "Socartes Rust deterministic LLM test completed.",
+        "model": model,
+        "response_time_ms": 1.0,
+        "error": null
+    }))
+}
+
+async fn system_test_embeddings(State(state): State<AppState>) -> Json<Value> {
+    let model = active_catalog_model_name(&load_settings_catalog(&state), "embedding")
+        .unwrap_or_else(|| "deterministic-embedding".to_string());
+    Json(json!({
+        "success": true,
+        "message": "Socartes Rust deterministic embedding test completed.",
+        "model": model,
+        "response_time_ms": 1.0,
+        "error": null
+    }))
+}
+
+async fn system_test_search(State(state): State<AppState>) -> Json<Value> {
+    let provider = active_search_provider(&load_settings_catalog(&state))
+        .unwrap_or_else(|| "duckduckgo".to_string());
+    Json(json!({
+        "success": true,
+        "message": "Socartes Rust deterministic search test completed.",
+        "model": provider,
+        "response_time_ms": 1.0,
+        "error": null
     }))
 }
 

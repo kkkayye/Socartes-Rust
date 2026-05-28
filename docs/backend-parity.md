@@ -78,9 +78,8 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`54`
-- Rust 已覆盖的前端/Python/自身三方共同 HTTP 路径：`35`
-- 前端仍缺 Rust 覆盖的路径：`45`
+- Rust 后端路由：`72`
+- 前端仍缺 Rust 覆盖的路径：`39`
 
 本轮已补齐并验证的主要区域：
 
@@ -88,17 +87,19 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
+- `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
+- `/api/v1/system*` status/runtime-topology/test LLM/test embeddings/test search 兼容入口
 
 已运行的验证：
 
-- `cargo test`：`18` 个测试通过
+- `cargo test`：`19` 个测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
+- `cargo check --release`：通过
 - Chromium 本地打开 `http://127.0.0.1:3011/book?book=<id>`：页面 `200`，reader 正文渲染，控制台 `0` 个 error
+- Chromium 本地打开 `http://127.0.0.1:3011/settings`：页面 `200`，settings/status/catalog 渲染，控制台 `0` 个 error
 
 下一批 P0 仍未完成：
 
-- `/api/v1/settings`、`/api/v1/settings/ui`、`/api/v1/settings/catalog`、`/api/v1/settings/apply`、settings test SSE
-- `/api/v1/system/status`
 - `/api/v1/tutorbot/*` 和 `/api/v1/tutorbot/{id}/ws`
 - `/api/v1/plugins/list` 与 tool/capability stream
 - `/api/v1/co_writer/*`

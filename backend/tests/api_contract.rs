@@ -1084,6 +1084,157 @@ async fn book_creation_and_editing_workflow_matches_frontend_contract() {
 }
 
 #[tokio::test]
+async fn settings_and_system_status_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+    let settings_payload = json_response(settings_response).await;
+    assert_eq!(settings_payload["ui"]["theme"], "light");
+    assert!(settings_payload["catalog"]["services"]["llm"]["profiles"].is_array());
+    assert_eq!(
+        settings_payload["providers"]["embedding"][0]["default_dim"],
+        "3072"
+    );
+
+    let ui_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/ui")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"theme": "dark", "language": "ko"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ui_response.status(), http::StatusCode::OK);
+    let ui_payload = json_response(ui_response).await;
+    assert_eq!(ui_payload["theme"], "dark");
+    assert_eq!(ui_payload["language"], "ko");
+
+    let mut catalog = settings_payload["catalog"].clone();
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("socartes-test-model");
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    let catalog_payload = json_response(catalog_response).await;
+    assert_eq!(
+        catalog_payload["catalog"]["services"]["llm"]["profiles"][0]["models"][0]["model"],
+        "socartes-test-model"
+    );
+
+    let apply_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": catalog_payload["catalog"].clone()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(apply_response.status(), http::StatusCode::OK);
+    let apply_payload = json_response(apply_response).await;
+    assert!(
+        apply_payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("Catalog applied")
+    );
+    assert_eq!(
+        apply_payload["env"]["SOCARTES_LLM_MODEL"],
+        "socartes-test-model"
+    );
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/system/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), http::StatusCode::OK);
+    let status_payload = json_response(status_response).await;
+    assert_eq!(status_payload["backend"]["status"], "online");
+    assert_eq!(status_payload["llm"]["model"], "socartes-test-model");
+    assert_eq!(status_payload["embeddings"]["status"], "configured");
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/embedding/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": catalog_payload["catalog"].clone()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/embedding/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        events_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let events_body = text_response(events_response).await;
+    assert!(events_body.contains("\"type\":\"capabilities\""));
+    assert!(events_body.contains("\"type\":\"completed\""));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn story_rag_endpoint_returns_grounded_source_id() {
     let response = app()
         .oneshot(
