@@ -656,6 +656,7 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         )
         .route("/api/v1/system/test/search", post(system_test_search))
         .route("/api/v1/vision/analyze", post(vision_analyze))
+        .route("/api/v1/vision/solve", get(vision_solve_ws))
         .route("/api/v1/dashboard/recent", get(dashboard_recent))
         .route("/api/v1/dashboard/{entry_id}", get(dashboard_entry))
         .route("/api/v1/agent-config/agents", get(agent_config_agents))
@@ -6355,62 +6356,239 @@ async fn system_test_search(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
-    let question = payload["question"].as_str().unwrap_or("").trim();
-    if question.is_empty() {
+    if !payload["question"].is_string() {
         return api_error(StatusCode::UNPROCESSABLE_ENTITY, "question is required").into_response();
     }
     let session_id = payload["session_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
-        .unwrap_or_else(|| format!("vision-{}", unique_id()));
+        .unwrap_or_else(|| format!("vision_{}", unique_id()));
     let image_base64 = payload["image_base64"].as_str().map(str::trim);
     let image_url = payload["image_url"].as_str().map(str::trim);
-    if image_base64.is_none_or(str::is_empty) && image_url.is_none_or(str::is_empty) {
-        return Json(json!({
+    match resolve_vision_image_summary(image_base64, image_url) {
+        Ok(Some(image_summary)) => Json(json!({
+            "session_id": session_id,
+            "has_image": true,
+            "final_ggb_commands": [],
+            "ggb_script": Value::Null,
+            "analysis_summary": image_summary
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({
             "session_id": session_id,
             "has_image": false,
             "final_ggb_commands": [],
             "ggb_script": Value::Null,
-            "analysis_summary": {
-                "image_is_reference": false,
-                "elements_count": 0,
-                "commands_count": 0
-            }
+            "analysis_summary": {}
         }))
-        .into_response();
+        .into_response(),
+        Err(detail) => api_error(StatusCode::BAD_REQUEST, &detail).into_response(),
     }
-    if let Some(image_base64) = image_base64.filter(|value| !value.is_empty())
-        && !is_valid_image_data_uri(image_base64)
-    {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "image_base64 must be a data:image/...;base64,... URI",
-        )
-        .into_response();
-    }
-    if let Some(image_url) = image_url.filter(|value| !value.is_empty())
-        && !(image_url.starts_with("http://") || image_url.starts_with("https://"))
-    {
-        return api_error(StatusCode::BAD_REQUEST, "image_url must be an HTTP(S) URL")
-            .into_response();
-    }
-    api_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "Vision image analysis is not implemented in the Rust backend yet",
-    )
-    .into_response()
 }
 
-fn is_valid_image_data_uri(value: &str) -> bool {
-    let Some((prefix, data)) = value.split_once(',') else {
+async fn vision_solve_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_vision_solve_socket)
+}
+
+async fn handle_vision_solve_socket(mut socket: WebSocket) {
+    let Some(Ok(Message::Text(text))) = socket.recv().await else {
+        let _ = vision_ws_send(
+            &mut socket,
+            json!({"type": "error", "content": "Invalid JSON"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        let _ = vision_ws_send(
+            &mut socket,
+            json!({"type": "error", "content": "Invalid JSON"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let question = payload["question"].as_str().unwrap_or("");
+    if question.is_empty() {
+        let _ = vision_ws_send(
+            &mut socket,
+            json!({"type": "error", "content": "Question is required"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("vision_{}", unique_id()));
+    let _ = vision_ws_send(
+        &mut socket,
+        json!({"type": "session", "session_id": session_id}),
+    )
+    .await;
+    let image_base64 = payload["image_base64"].as_str().map(str::trim);
+    let image_url = payload["image_url"].as_str().map(str::trim);
+    let image_summary = match resolve_vision_image_summary(image_base64, image_url) {
+        Ok(Some(summary)) => summary,
+        Ok(None) => {
+            let _ = vision_ws_send(&mut socket, json!({"type": "no_image", "data": {}})).await;
+            let _ = vision_ws_send(&mut socket, json!({"type": "done"})).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        Err(detail) => {
+            let _ = vision_ws_send(&mut socket, json!({"type": "error", "content": detail})).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    let events = [
+        json!({"type": "analysis_start", "data": {"session_id": session_id}}),
+        json!({"type": "bbox_complete", "data": {"stage": "bbox", "elements_count": 0, "elements": []}}),
+        json!({"type": "analysis_complete", "data": {"stage": "analysis", "constraints_count": 0, "relations_count": 0, "image_is_reference": false, "constraints": []}}),
+        json!({"type": "ggbscript_complete", "data": {"stage": "ggbscript", "commands_count": 0, "commands": []}}),
+        json!({"type": "reflection_complete", "data": {"stage": "reflection", "issues_count": 0, "commands_count": 0, "final_commands": []}}),
+        json!({"type": "analysis_message_complete", "data": {"ggb_block": Value::Null, "analysis_summary": image_summary}}),
+        json!({"type": "answer_start", "data": {"has_image_analysis": true}}),
+        json!({"type": "done", "data": {}}),
+    ];
+    for event in events {
+        if vision_ws_send(&mut socket, event).await.is_err() {
+            return;
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn vision_ws_send(socket: &mut WebSocket, event: Value) -> Result<(), axum::Error> {
+    socket.send(Message::Text(event.to_string().into())).await
+}
+
+fn resolve_vision_image_summary(
+    image_base64: Option<&str>,
+    image_url: Option<&str>,
+) -> Result<Option<Value>, String> {
+    if let Some(image_base64) = image_base64.filter(|value| !value.is_empty()) {
+        let Some((mime_type, byte_count)) = parse_vision_image_data_uri(image_base64) else {
+            return Err(
+                "Invalid base64 image format, should be data:image/...;base64,...".to_string(),
+            );
+        };
+        return Ok(Some(json!({
+            "image_is_reference": false,
+            "elements_count": 0,
+            "commands_count": 0,
+            "analysis_mode": "metadata_only",
+            "input_source": "image_base64",
+            "mime_type": mime_type,
+            "byte_count": byte_count
+        })));
+    }
+    if let Some(image_url) = image_url.filter(|value| !value.is_empty()) {
+        if !is_valid_vision_image_url(image_url) {
+            return Err(format!("Invalid image URL: {image_url}"));
+        }
+        return Ok(Some(json!({
+            "image_is_reference": false,
+            "elements_count": 0,
+            "commands_count": 0,
+            "analysis_mode": "metadata_only",
+            "input_source": "image_url",
+            "mime_type": guess_image_mime_from_url(image_url),
+            "byte_count": Value::Null
+        })));
+    }
+    Ok(None)
+}
+
+fn parse_vision_image_data_uri(value: &str) -> Option<(&str, usize)> {
+    let (prefix, data) = value.split_once(',')?;
+    let mime_type = prefix
+        .strip_prefix("data:")?
+        .strip_suffix(";base64")?
+        .trim()
+        .to_ascii_lowercase();
+    if !is_supported_vision_image_mime(&mime_type) {
+        return None;
+    }
+    let byte_count = decoded_base64_len(data)?;
+    if byte_count > 10 * 1024 * 1024 {
+        return None;
+    }
+    Some((canonical_vision_image_mime(&mime_type), byte_count))
+}
+
+fn decoded_base64_len(data: &str) -> Option<usize> {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let bytes = data.as_bytes();
+    let mut padding = 0usize;
+    if bytes.ends_with(b"==") {
+        padding = 2;
+    } else if bytes.ends_with(b"=") {
+        padding = 1;
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        let is_padding = *byte == b'=';
+        let valid = byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/');
+        if is_padding {
+            if idx < bytes.len().saturating_sub(padding) {
+                return None;
+            }
+        } else if !valid {
+            return None;
+        }
+    }
+    Some((data.len() / 4) * 3 - padding)
+}
+
+fn is_supported_vision_image_mime(value: &str) -> bool {
+    matches!(
+        value,
+        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
+    )
+}
+
+fn canonical_vision_image_mime(value: &str) -> &'static str {
+    match value {
+        "image/jpg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+fn is_valid_vision_image_url(value: &str) -> bool {
+    if value.contains(char::is_whitespace) {
         return false;
     };
-    if !prefix.starts_with("data:image/") || !prefix.ends_with(";base64") || data.is_empty() {
+    let Some(rest) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
         return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty() && host != "." && host != ".."
+}
+
+fn guess_image_mime_from_url(value: &str) -> &'static str {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains(".png") {
+        "image/png"
+    } else if lower.contains(".gif") {
+        "image/gif"
+    } else if lower.contains(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
     }
-    data.bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 async fn list_tutorbots(State(state): State<AppState>) -> Json<Value> {

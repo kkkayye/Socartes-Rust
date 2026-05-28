@@ -7,9 +7,12 @@ use std::{
 
 use axum::body::Body;
 use axum::http;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use socartes_backend::{app, app_with_knowledge_root};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tower::ServiceExt;
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4462,7 +4465,7 @@ async fn vision_analyze_rest_route_matches_legacy_validation_contract() {
     assert_eq!(no_image["has_image"], false);
     assert_eq!(no_image["final_ggb_commands"], json!([]));
     assert_eq!(no_image["ggb_script"], Value::Null);
-    assert_eq!(no_image["analysis_summary"]["commands_count"], 0);
+    assert_eq!(no_image["analysis_summary"], json!({}));
 
     let invalid_base64_response = app()
         .oneshot(
@@ -4489,7 +4492,61 @@ async fn vision_analyze_rest_route_matches_legacy_validation_contract() {
         json_response(invalid_base64_response).await["detail"]
             .as_str()
             .unwrap()
-            .contains("data:image")
+            .contains("Invalid base64 image format")
+    );
+
+    let invalid_url_response = app()
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze this",
+                        "image_url": "ftp://example.com/image.png"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_url_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(invalid_url_response).await["detail"],
+        "Invalid image URL: ftp://example.com/image.png"
+    );
+
+    let base64_priority_response = app()
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze this",
+                        "image_base64": "not-a-data-uri",
+                        "image_url": "https://example.com/image.png"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        base64_priority_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert!(
+        json_response(base64_priority_response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid base64 image format")
     );
 
     let image_response = app()
@@ -4509,11 +4566,171 @@ async fn vision_analyze_rest_route_matches_legacy_validation_contract() {
         )
         .await
         .unwrap();
-    assert_eq!(image_response.status(), http::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(image_response.status(), http::StatusCode::OK);
+    let image_payload = json_response(image_response).await;
+    assert_eq!(image_payload["has_image"], true);
+    assert_eq!(image_payload["final_ggb_commands"], json!([]));
+    assert_eq!(image_payload["ggb_script"], Value::Null);
+    assert_eq!(image_payload["analysis_summary"]["mime_type"], "image/png");
     assert_eq!(
-        json_response(image_response).await["detail"],
-        "Vision image analysis is not implemented in the Rust backend yet"
+        image_payload["analysis_summary"]["analysis_mode"],
+        "metadata_only"
     );
+    assert_eq!(image_payload["analysis_summary"]["commands_count"], 0);
+
+    let default_session_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Describe this"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(default_session_response.status(), http::StatusCode::OK);
+    assert!(
+        json_response(default_session_response).await["session_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("vision_")
+    );
+}
+
+#[tokio::test]
+async fn vision_solve_websocket_route_is_registered_for_legacy_clients() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/vision/solve")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), http::StatusCode::NOT_FOUND);
+    assert_ne!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn vision_solve_websocket_streams_legacy_no_image_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app()).await.unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/vision/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Explain the diagram",
+                "session_id": "vision-test-session"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Some(message) = socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let event_type = event["type"].as_str().unwrap().to_string();
+                events.push(event);
+                if event_type == "done" {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        events[0],
+        json!({"type": "session", "session_id": "vision-test-session"})
+    );
+    assert_eq!(events[1], json!({"type": "no_image", "data": {}}));
+    assert_eq!(events[2], json!({"type": "done"}));
+}
+
+#[tokio::test]
+async fn vision_solve_websocket_streams_metadata_only_image_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app()).await.unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/vision/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Explain the diagram",
+                "session_id": "vision-test-image",
+                "image_base64": "data:image/png;base64,iVBORw0KGgo="
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut types = Vec::new();
+    let mut events = Vec::new();
+    while let Some(message) = socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let event_type = event["type"].as_str().unwrap().to_string();
+                types.push(event_type.clone());
+                events.push(event);
+                if event_type == "done" {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        types,
+        [
+            "session",
+            "analysis_start",
+            "bbox_complete",
+            "analysis_complete",
+            "ggbscript_complete",
+            "reflection_complete",
+            "analysis_message_complete",
+            "answer_start",
+            "done"
+        ]
+    );
+    let summary = &events[6]["data"]["analysis_summary"];
+    assert_eq!(summary["analysis_mode"], "metadata_only");
+    assert_eq!(summary["input_source"], "image_base64");
+    assert_eq!(summary["mime_type"], "image/png");
 }
 
 #[tokio::test]
