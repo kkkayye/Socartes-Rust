@@ -3,10 +3,11 @@ use std::collections::{BTreeMap, HashSet};
 use axum::{
     Json, Router,
     http::StatusCode,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -380,12 +381,27 @@ struct HealthResponse {
 
 #[derive(Debug, Clone, Serialize)]
 struct ErrorResponse {
-    detail: String,
+    detail: Vec<ValidationError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ValidationError {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    loc: Vec<&'static str>,
+    msg: &'static str,
+    input: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctx: Option<Value>,
 }
 
 pub fn app() -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(swagger_docs))
+        .route("/docs/oauth2-redirect", get(swagger_oauth2_redirect))
+        .route("/redoc", get(redoc_docs))
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/learn", post(learn))
         .route("/api/v1/story-rag/ask", post(ask_story_rag))
@@ -410,7 +426,13 @@ async fn learn(Json(request): Json<StudyRequest>) -> impl IntoResponse {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
-                detail: "goal must be at least 3 characters".to_string(),
+                detail: vec![ValidationError {
+                    error_type: "string_too_short",
+                    loc: vec!["body", "goal"],
+                    msg: "String should have at least 3 characters",
+                    input: json!(request.goal),
+                    ctx: Some(json!({ "min_length": 3 })),
+                }],
             }),
         )
             .into_response();
@@ -421,6 +443,180 @@ async fn learn(Json(request): Json<StudyRequest>) -> impl IntoResponse {
 
 async fn ask_story_rag(Json(request): Json<StoryQuestion>) -> Json<StoryAnswer> {
     Json(haunted_pajamas_index().ask(&request.question))
+}
+
+async fn openapi_json() -> Json<Value> {
+    Json(json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Socartes Backend",
+            "version": VERSION,
+            "description": "Rust implementation of the Socartes multi-agent learning backend."
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "responses": {
+                        "200": {
+                            "description": "Backend status",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/HealthResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/agents": {
+                "get": {
+                    "summary": "Agent catalog",
+                    "responses": {
+                        "200": {
+                            "description": "Agent responsibilities and contracts"
+                        }
+                    }
+                }
+            },
+            "/api/v1/learn": {
+                "post": {
+                    "summary": "Run the Socartes agent workflow",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/StudyRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Traceable study answer" },
+                        "422": { "description": "Invalid learning goal" }
+                    }
+                }
+            },
+            "/api/v1/story-rag/ask": {
+                "post": {
+                    "summary": "Ask the story-grounded RAG test index",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/StoryQuestion" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Grounded answer or refusal when evidence is missing"
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "HealthResponse": {
+                    "type": "object",
+                    "required": ["status", "service", "version"],
+                    "properties": {
+                        "status": { "type": "string" },
+                        "service": { "type": "string" },
+                        "version": { "type": "string" }
+                    }
+                },
+                "StudyRequest": {
+                    "type": "object",
+                    "required": ["goal"],
+                    "properties": {
+                        "goal": {
+                            "type": "string",
+                            "minLength": 3
+                        },
+                        "learner_context": {
+                            "type": "string",
+                            "default": ""
+                        }
+                    }
+                },
+                "StoryQuestion": {
+                    "type": "object",
+                    "required": ["question"],
+                    "properties": {
+                        "question": { "type": "string" }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+async fn swagger_docs() -> Html<&'static str> {
+    Html(
+        r##"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Socartes Backend - Swagger UI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui">Swagger UI</div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        url: "/openapi.json",
+        dom_id: "#swagger-ui",
+        oauth2RedirectUrl: window.location.origin + "/docs/oauth2-redirect"
+      });
+    </script>
+  </body>
+</html>"##,
+    )
+}
+
+async fn swagger_oauth2_redirect() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en-US">
+  <head>
+    <title>Swagger UI: OAuth2 Redirect</title>
+  </head>
+  <body>
+    <script>
+      'use strict';
+      function run() {
+        var oauth2 = window.opener && window.opener.swaggerUIRedirectOauth2;
+        var sentState = oauth2 && oauth2.state;
+        var redirectUrl = new URL(window.location.href);
+        var params = redirectUrl.search || redirectUrl.hash;
+        if (oauth2 && params && sentState) {
+          oauth2.callback({ auth: oauth2.auth, redirectUrl: window.location.href });
+        }
+        window.close();
+      }
+      run();
+    </script>
+  </body>
+</html>"#,
+    )
+}
+
+async fn redoc_docs() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Socartes Backend - ReDoc</title>
+  </head>
+  <body>
+    <redoc spec-url="/openapi.json">ReDoc</redoc>
+    <script src="https://cdn.jsdelivr.net/npm/redoc@2.5.0/bundles/redoc.standalone.js"></script>
+  </body>
+</html>"#,
+    )
 }
 
 fn retrieve(goal: &str) -> Vec<RetrievalChunk> {

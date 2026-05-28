@@ -15,6 +15,16 @@ async fn json_response(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json response")
 }
 
+async fn text_response(response: axum::response::Response) -> String {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    String::from_utf8(bytes.to_vec()).expect("utf8 response")
+}
+
 #[tokio::test]
 async fn health_endpoint_reports_backend_identity() {
     let response = app()
@@ -82,6 +92,10 @@ async fn learn_endpoint_rejects_short_goals_like_the_python_contract() {
         .unwrap();
 
     assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+    let payload = json_response(response).await;
+    assert_eq!(payload["detail"][0]["type"], "string_too_short");
+    assert_eq!(payload["detail"][0]["loc"], json!(["body", "goal"]));
+    assert_eq!(payload["detail"][0]["ctx"]["min_length"], 3);
 }
 
 #[tokio::test]
@@ -133,4 +147,57 @@ async fn story_rag_endpoint_returns_grounded_source_id() {
             .to_lowercase()
             .contains("tarantula")
     );
+}
+
+#[tokio::test]
+async fn openapi_json_matches_the_original_documentation_route() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["info"]["title"], "Socartes Backend");
+    assert_eq!(payload["info"]["version"], "0.1.0");
+    assert!(payload["paths"]["/health"].is_object());
+    assert!(payload["paths"]["/api/v1/agents"].is_object());
+    assert!(payload["paths"]["/api/v1/learn"].is_object());
+    assert!(payload["paths"]["/api/v1/story-rag/ask"].is_object());
+}
+
+#[tokio::test]
+async fn fastapi_documentation_routes_are_available() {
+    for (path, expected_text) in [
+        ("/docs", "Swagger UI"),
+        ("/docs/oauth2-redirect", "Swagger UI: OAuth2 Redirect"),
+        ("/redoc", "ReDoc"),
+    ] {
+        let response = app()
+            .oneshot(
+                http::Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        let body = text_response(response).await;
+        assert!(body.contains(expected_text));
+        if path != "/docs/oauth2-redirect" {
+            assert!(body.contains("/openapi.json"));
+        }
+    }
 }

@@ -21,6 +21,10 @@ This repository is intentionally separate from the original Socartes repository.
 | `GET` | `/api/v1/agents` | Returns the role boundary and implementation contract for each agent. |
 | `POST` | `/api/v1/learn` | Runs the Planner -> Retriever -> Tool Adapter -> Executor -> Critic -> Reflection loop. |
 | `POST` | `/api/v1/story-rag/ask` | Tests source-grounded RAG answers against an obscure public-domain novel. |
+| `GET` | `/openapi.json` | Returns the OpenAPI schema for the Rust backend. |
+| `GET` | `/docs` | Serves a Swagger UI-compatible documentation page. |
+| `GET` | `/docs/oauth2-redirect` | Serves the Swagger UI OAuth2 redirect helper page. |
+| `GET` | `/redoc` | Serves a ReDoc-compatible documentation page. |
 
 ## Run Locally
 
@@ -34,6 +38,8 @@ The service listens on `0.0.0.0:8000` by default. Set `PORT` to choose a differe
 ```bash
 PORT=8080 cargo run
 ```
+
+Open `http://127.0.0.1:8000/docs` for Swagger UI-compatible API documentation, or `http://127.0.0.1:8000/redoc` for ReDoc-compatible documentation.
 
 Example request:
 
@@ -83,6 +89,17 @@ Expected behavior:
 cd backend
 cargo fmt --check
 cargo test
+cargo check --release
+```
+
+Optional HTTP smoke checks while the server is running:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/openapi.json
+curl -fsS http://127.0.0.1:8000/docs
+curl -fsS http://127.0.0.1:8000/docs/oauth2-redirect
+curl -fsS http://127.0.0.1:8000/redoc
 ```
 
 ## License
