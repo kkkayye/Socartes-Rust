@@ -55,6 +55,10 @@ fn test_book_root(knowledge_root: &Path) -> std::path::PathBuf {
         .join("book")
 }
 
+fn test_memory_root(knowledge_root: &Path) -> std::path::PathBuf {
+    test_data_root(knowledge_root).join("memory")
+}
+
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("user")
 }
@@ -729,6 +733,335 @@ The lantern school rule says students must recite the blue theorem before openin
     assert!(assistant_content.contains("blue theorem"));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn memory_file_backed_api_matches_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let empty_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/memory")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(empty_response).await,
+        json!({
+            "summary": "",
+            "profile": "",
+            "summary_updated_at": null,
+            "profile_updated_at": null
+        })
+    );
+
+    let summary_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/memory")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "file": "summary",
+                        "content": "```markdown\n## Current Focus\nLearning Rust RAG.\n```"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary_response.status(), http::StatusCode::OK);
+    let summary_payload = json_response(summary_response).await;
+    assert_eq!(summary_payload["saved"], true);
+    assert_eq!(
+        summary_payload["summary"],
+        "## Current Focus\nLearning Rust RAG."
+    );
+    assert!(summary_payload["summary_updated_at"].as_str().is_some());
+    assert_eq!(
+        fs::read_to_string(test_memory_root(&root).join("SUMMARY.md")).unwrap(),
+        "## Current Focus\nLearning Rust RAG."
+    );
+
+    let profile_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/memory")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "file": "profile",
+                        "content": "## Preferences\nPrefers cited course answers."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile_response.status(), http::StatusCode::OK);
+    let profile_payload = json_response(profile_response).await;
+    assert_eq!(
+        profile_payload["profile"],
+        "## Preferences\nPrefers cited course answers."
+    );
+    assert!(profile_payload["profile_updated_at"].as_str().is_some());
+
+    let invalid_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/memory")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"file": "other", "content": "bad"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(invalid_response).await["detail"],
+        "Invalid file: other"
+    );
+
+    let invalid_content_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/memory")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"file": "profile", "content": {"bad": true}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        invalid_content_response.status(),
+        http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        fs::read_to_string(test_memory_root(&root).join("PROFILE.md")).unwrap(),
+        "## Preferences\nPrefers cited course answers."
+    );
+
+    let clear_profile_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/clear")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"file": "profile"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_profile_response.status(), http::StatusCode::OK);
+    let clear_profile_payload = json_response(clear_profile_response).await;
+    assert_eq!(clear_profile_payload["cleared"], true);
+    assert_eq!(
+        clear_profile_payload["summary"],
+        "## Current Focus\nLearning Rust RAG."
+    );
+    assert_eq!(clear_profile_payload["profile"], "");
+    assert!(!test_memory_root(&root).join("PROFILE.md").exists());
+
+    let missing_refresh_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"session_id": "missing-session", "language": "en"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_refresh_response.status(),
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_response(missing_refresh_response).await["detail"],
+        "Session not found"
+    );
+
+    let empty_refresh_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"language": "en"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_refresh_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(empty_refresh_response).await["changed"],
+        false
+    );
+
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "memory-session",
+                        "content": "Remember that Socartes memory should cite retrieved course files.",
+                        "language": "en"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+
+    let refresh_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"session_id": "memory-session", "language": "en"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh_response.status(), http::StatusCode::OK);
+    let refresh_payload = json_response(refresh_response).await;
+    assert_eq!(refresh_payload["changed"], true);
+    assert!(
+        refresh_payload["summary"]
+            .as_str()
+            .unwrap()
+            .contains("## Current Focus")
+    );
+    assert!(
+        refresh_payload["profile"]
+            .as_str()
+            .unwrap()
+            .contains("## Preferences")
+    );
+    assert!(
+        refresh_payload["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Learning Rust RAG")
+    );
+    assert!(
+        refresh_payload["profile"]
+            .as_str()
+            .unwrap()
+            .contains("Recent stable context came from session memory-session")
+    );
+
+    let thinking_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/memory")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "file": "summary",
+                        "content": "## Current Focus\nVisible study note\n<think>private reasoning"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(thinking_response.status(), http::StatusCode::OK);
+    let thinking_payload = json_response(thinking_response).await;
+    assert_eq!(
+        thinking_payload["summary"],
+        "## Current Focus\nVisible study note"
+    );
+
+    let clear_all_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/clear")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_all_response.status(), http::StatusCode::OK);
+    let clear_all_payload = json_response(clear_all_response).await;
+    assert_eq!(clear_all_payload["summary"], "");
+    assert_eq!(clear_all_payload["profile"], "");
+    assert!(!test_memory_root(&root).join("SUMMARY.md").exists());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn memory_refresh_reports_corrupt_session_as_server_error() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    fs::write(session_root.join("bad-session.json"), "{not json").unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/memory/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"session_id": "bad-session", "language": "en"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        json_response(response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to parse session")
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]

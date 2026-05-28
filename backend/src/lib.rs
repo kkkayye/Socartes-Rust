@@ -452,6 +452,7 @@ struct AppState {
     tutorbot_root: Arc<PathBuf>,
     notebook_root: Arc<PathBuf>,
     question_notebook_root: Arc<PathBuf>,
+    memory_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -482,6 +483,9 @@ impl AppState {
         let question_notebook_root = env::var_os("SOCARTES_QUESTION_NOTEBOOK_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| user_data_root.join("question_notebook"));
+        let memory_root = env::var_os("SOCARTES_MEMORY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("memory"));
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
@@ -491,6 +495,7 @@ impl AppState {
             tutorbot_root: Arc::new(tutorbot_root),
             notebook_root: Arc::new(notebook_root),
             question_notebook_root: Arc::new(question_notebook_root),
+            memory_root: Arc::new(memory_root),
         }
     }
 }
@@ -704,6 +709,9 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         )
         .route("/api/v1/chat/sessions", get(list_sessions))
         .route("/api/v1/chat/sessions/{session_id}", get(get_session))
+        .route("/api/v1/memory", get(get_memory).put(update_memory))
+        .route("/api/v1/memory/refresh", post(refresh_memory))
+        .route("/api/v1/memory/clear", post(clear_memory))
         .route("/api/v1/internal/test-chat-turn", post(run_test_chat_turn))
         .route("/api/v1/ws", get(chat_ws))
         .route("/api/v1/book/health", get(book_service_health))
@@ -5739,6 +5747,395 @@ async fn record_quiz_results(
         Ok(()) => Json(json!({ "recorded": true })).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+async fn get_memory(State(state): State<AppState>) -> impl IntoResponse {
+    match memory_snapshot(&state) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_memory(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let Some(file) = payload["file"].as_str() else {
+        return memory_file_validation_error(Value::Null).into_response();
+    };
+    let Some(kind) = parse_memory_file(file) else {
+        return api_error(StatusCode::BAD_REQUEST, &format!("Invalid file: {file}"))
+            .into_response();
+    };
+    let content = match payload.get("content") {
+        Some(Value::String(value)) => value.as_str(),
+        None | Some(Value::Null) => "",
+        Some(value) => {
+            return string_field_validation_error("content", value.clone()).into_response();
+        }
+    };
+    match write_memory_file(&state, kind, content).and_then(|()| {
+        let mut snapshot = memory_snapshot(&state)?;
+        snapshot["saved"] = json!(true);
+        Ok(snapshot)
+    }) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn refresh_memory(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let requested_session_id = payload["session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(session_id) = requested_session_id {
+        match read_session(&state, session_id) {
+            Ok(_) => {}
+            Err(error) if error.0 == StatusCode::NOT_FOUND => {
+                return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
+            }
+            Err(error) => return error.into_response(),
+        }
+    }
+
+    let language = payload["language"].as_str().unwrap_or("en");
+    match refresh_memory_from_session(&state, requested_session_id, language).and_then(|changed| {
+        let mut snapshot = memory_snapshot(&state)?;
+        snapshot["changed"] = json!(changed);
+        Ok(snapshot)
+    }) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn clear_memory(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let target = body
+        .as_ref()
+        .and_then(|Json(payload)| payload.get("file"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let result = if let Some(file) = target {
+        match parse_memory_file(file) {
+            Some(kind) => write_memory_file(&state, kind, ""),
+            None => Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid file: {file}"),
+            )),
+        }
+    } else {
+        clear_all_memory_files(&state)
+    };
+
+    match result.and_then(|()| {
+        let mut snapshot = memory_snapshot(&state)?;
+        snapshot["cleared"] = json!(true);
+        Ok(snapshot)
+    }) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MemoryFileKind {
+    Summary,
+    Profile,
+}
+
+impl MemoryFileKind {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Summary => "SUMMARY.md",
+            Self::Profile => "PROFILE.md",
+        }
+    }
+}
+
+fn parse_memory_file(value: &str) -> Option<MemoryFileKind> {
+    match value {
+        "summary" => Some(MemoryFileKind::Summary),
+        "profile" => Some(MemoryFileKind::Profile),
+        _ => None,
+    }
+}
+
+fn memory_file_validation_error(input: Value) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ErrorResponse {
+            detail: vec![ValidationError {
+                error_type: "missing",
+                loc: vec!["body", "file"],
+                msg: "Field required",
+                input,
+                ctx: None,
+            }],
+        }),
+    )
+}
+
+fn string_field_validation_error(
+    field: &'static str,
+    input: Value,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ErrorResponse {
+            detail: vec![ValidationError {
+                error_type: "string_type",
+                loc: vec!["body", field],
+                msg: "Input should be a valid string",
+                input,
+                ctx: None,
+            }],
+        }),
+    )
+}
+
+fn memory_file_path(state: &AppState, kind: MemoryFileKind) -> PathBuf {
+    state.memory_root.join(kind.filename())
+}
+
+fn read_memory_file(state: &AppState, kind: MemoryFileKind) -> Result<String, ApiError> {
+    let path = memory_file_path(state, kind);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read memory: {error}"),
+        )
+    })?;
+    let cleaned = clean_memory_content(&raw);
+    if cleaned != raw.trim() {
+        if cleaned.is_empty() {
+            let _ = fs::remove_file(path);
+        } else {
+            fs::write(path, &cleaned).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to write memory: {error}"),
+                )
+            })?;
+        }
+    }
+    Ok(cleaned)
+}
+
+fn write_memory_file(
+    state: &AppState,
+    kind: MemoryFileKind,
+    content: &str,
+) -> Result<(), ApiError> {
+    let normalized = clean_memory_content(content);
+    let path = memory_file_path(state, kind);
+    fs::create_dir_all(&*state.memory_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create memory store: {error}"),
+        )
+    })?;
+    if normalized.is_empty() {
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to delete memory: {error}"),
+                )
+            })?;
+        }
+        return Ok(());
+    }
+    fs::write(path, normalized).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write memory: {error}"),
+        )
+    })
+}
+
+fn clear_all_memory_files(state: &AppState) -> Result<(), ApiError> {
+    for kind in [MemoryFileKind::Summary, MemoryFileKind::Profile] {
+        write_memory_file(state, kind, "")?;
+    }
+    Ok(())
+}
+
+fn memory_snapshot(state: &AppState) -> Result<Value, ApiError> {
+    Ok(json!({
+        "summary": read_memory_file(state, MemoryFileKind::Summary)?,
+        "profile": read_memory_file(state, MemoryFileKind::Profile)?,
+        "summary_updated_at": memory_file_updated_at(state, MemoryFileKind::Summary),
+        "profile_updated_at": memory_file_updated_at(state, MemoryFileKind::Profile)
+    }))
+}
+
+fn memory_file_updated_at(state: &AppState, kind: MemoryFileKind) -> Value {
+    let path = memory_file_path(state, kind);
+    let Some(modified) = path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+    else {
+        return Value::Null;
+    };
+    let datetime: chrono::DateTime<Utc> = modified.into();
+    json!(datetime.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+fn clean_memory_content(content: &str) -> String {
+    let mut cleaned = strip_code_fence(content);
+    cleaned = strip_xml_block(&cleaned, "think");
+    cleaned = strip_xml_block(&cleaned, "thinking");
+    cleaned.trim().to_string()
+}
+
+fn strip_code_fence(content: &str) -> String {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    let Some(first_newline) = trimmed.find('\n') else {
+        return String::new();
+    };
+    let body = &trimmed[first_newline + 1..];
+    body.strip_suffix("```").unwrap_or(body).trim().to_string()
+}
+
+fn strip_xml_block(content: &str, tag: &str) -> String {
+    let mut output = content.to_string();
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    while let Some(start) = output.find(&open) {
+        let Some(end_offset) = output[start + open.len()..].find(&close) else {
+            output.replace_range(start..output.len(), "");
+            break;
+        };
+        let end = start + open.len() + end_offset + close.len();
+        output.replace_range(start..end, "");
+    }
+    output
+}
+
+fn refresh_memory_from_session(
+    state: &AppState,
+    requested_session_id: Option<&str>,
+    language: &str,
+) -> Result<bool, ApiError> {
+    let session_id = requested_session_id
+        .map(ToString::to_string)
+        .or_else(|| {
+            session_summaries(state)
+                .first()
+                .and_then(|session| session["session_id"].as_str().map(ToString::to_string))
+        })
+        .unwrap_or_default();
+    if session_id.is_empty() {
+        return Ok(false);
+    }
+
+    let session = read_session(state, &session_id)?;
+    let relevant_messages = session["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| {
+            matches!(message["role"].as_str(), Some("user" | "assistant"))
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| !content.trim().is_empty())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if relevant_messages.is_empty() {
+        return Ok(false);
+    }
+
+    let recent = relevant_messages
+        .iter()
+        .rev()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let last_user = recent
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or("Recent Socartes session");
+    let last_assistant = recent
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or("Socartes answered the learner.");
+    let capability = session["preferences"]["capability"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("chat");
+    let language = if language.trim().is_empty() {
+        session["preferences"]["language"].as_str().unwrap_or("en")
+    } else {
+        language.trim()
+    };
+    let existing_summary = read_memory_file(state, MemoryFileKind::Summary)?;
+    let existing_profile = read_memory_file(state, MemoryFileKind::Profile)?;
+    let generated_summary = format!(
+        "## Current Focus\n{}\n\n## Accomplishments\nReviewed the latest {} exchange in session {}.\n\n## Open Questions\nContinue from the most recent Socartes answer: {}",
+        memory_excerpt(last_user, 240),
+        capability,
+        session_id,
+        memory_excerpt(last_assistant, 240)
+    );
+    let generated_profile = format!(
+        "## Preferences\nLearner language: {}.\nRecent stable context came from session {}.\n\n## Learning Style\nPrefers responses grounded in selected Socartes context when available.",
+        language, session_id
+    );
+    let summary = merge_memory_refresh(&existing_summary, &generated_summary);
+    let profile = merge_memory_refresh(&existing_profile, &generated_profile);
+
+    let changed_summary = existing_summary != summary;
+    let changed_profile = existing_profile != profile;
+    if changed_summary {
+        write_memory_file(state, MemoryFileKind::Summary, &summary)?;
+    }
+    if changed_profile {
+        write_memory_file(state, MemoryFileKind::Profile, &profile)?;
+    }
+    Ok(changed_summary || changed_profile)
+}
+
+fn merge_memory_refresh(existing: &str, generated: &str) -> String {
+    let existing = existing.trim();
+    if existing.is_empty() {
+        return generated.to_string();
+    }
+    if existing.contains(generated) {
+        return existing.to_string();
+    }
+    format!("{existing}\n\n{generated}")
+}
+
+fn memory_excerpt(value: &str, max_chars: usize) -> String {
+    let mut compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > max_chars {
+        compact = compact.chars().take(max_chars.saturating_sub(3)).collect();
+        compact.push_str("...");
+    }
+    compact
 }
 
 async fn run_test_chat_turn(

@@ -78,8 +78,8 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`125`
-- 前端仍缺 Rust 覆盖的路径：`18`
+- Rust 后端路由：`129`
+- 前端仍缺 Rust 覆盖的路径：`15`
 
 本轮已补齐并验证的主要区域：
 
@@ -92,10 +92,11 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/tutorbot*` TutorBot 列表、创建/启动、停止/销毁、详情/PATCH、recent、souls CRUD、channels schema、profile 文件、history、WebSocket 最小聊天入口
 - `/api/v1/notebook/*` 普通 Notebook 列表、统计、创建、详情、更新、删除、记录增删改、带 summary 的 SSE 保存入口
 - `/api/v1/question-notebook/*` 题目 Notebook entries、lookup/upsert、分类 CRUD、entry/category 关联与筛选
+- `/api/v1/memory*` two-file public memory：`SUMMARY.md`/`PROFILE.md` 快照、单文件保存/清空、从会话刷新、缺失 session/非法 file 错误兼容
 
 已运行的验证：
 
-- `cargo test`：`24` 个测试通过
+- `cargo test`：`26` 个测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `cargo test course_knowledge`：`2` 个课程/知识库契约测试通过
@@ -110,7 +111,6 @@ python3 tools/api_parity_scan.py \
 
 - `/api/v1/plugins/list` 与 tool/capability stream
 - `/api/v1/co_writer/*`
-- `/api/v1/memory*`
 - `/api/v1/skills*`
 
 ## 已知限制
