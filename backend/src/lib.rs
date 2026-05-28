@@ -30,6 +30,8 @@ const BUILTIN_KNOWLEDGE_BASE: &str = "socartes-rust-rag";
 const DEFAULT_RAG_PROVIDER: &str = "llamaindex";
 const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] =
     &[".txt", ".md", ".markdown", ".pdf", ".json", ".csv"];
+const DEFAULT_SKILL_TAGS: &[&str] = &["style", "tool"];
+const SKILL_TAGS_FILE: &str = ".tags.json";
 const TUTORBOT_EDITABLE_FILES: &[&str] = &[
     "SOUL.md",
     "USER.md",
@@ -453,6 +455,7 @@ struct AppState {
     notebook_root: Arc<PathBuf>,
     question_notebook_root: Arc<PathBuf>,
     memory_root: Arc<PathBuf>,
+    skills_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -486,6 +489,9 @@ impl AppState {
         let memory_root = env::var_os("SOCARTES_MEMORY_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("memory"));
+        let skills_root = env::var_os("SOCARTES_SKILLS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_data_root.join("workspace").join("skills"));
         Self {
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
@@ -496,6 +502,7 @@ impl AppState {
             notebook_root: Arc::new(notebook_root),
             question_notebook_root: Arc::new(question_notebook_root),
             memory_root: Arc::new(memory_root),
+            skills_root: Arc::new(skills_root),
         }
     }
 }
@@ -712,6 +719,18 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         .route("/api/v1/memory", get(get_memory).put(update_memory))
         .route("/api/v1/memory/refresh", post(refresh_memory))
         .route("/api/v1/memory/clear", post(clear_memory))
+        .route("/api/v1/skills/list", get(list_skills))
+        .route("/api/v1/skills/create", post(create_skill))
+        .route("/api/v1/skills/tags/list", get(list_skill_tags))
+        .route("/api/v1/skills/tags/create", post(create_skill_tag))
+        .route(
+            "/api/v1/skills/tags/{tag}",
+            put(rename_skill_tag).delete(delete_skill_tag),
+        )
+        .route(
+            "/api/v1/skills/{name}",
+            get(get_skill).put(update_skill).delete(delete_skill),
+        )
         .route("/api/v1/internal/test-chat-turn", post(run_test_chat_turn))
         .route("/api/v1/ws", get(chat_ws))
         .route("/api/v1/book/health", get(book_service_health))
@@ -5843,6 +5862,874 @@ async fn clear_memory(
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+async fn list_skills(State(state): State<AppState>) -> impl IntoResponse {
+    match skill_summaries(&state) {
+        Ok(skills) => Json(json!({ "skills": skills })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_skill(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    match read_skill_detail(&state, &name) {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_skill(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match create_skill_value(&state, &payload) {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match update_skill_value(&state, &name, &payload) {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match delete_skill_value(&state, &name) {
+        Ok(name) => Json(json!({ "status": "deleted", "name": name })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_skill_tags(State(state): State<AppState>) -> impl IntoResponse {
+    match ensure_skill_tag_vocab(&state) {
+        Ok(tags) => Json(json!({ "tags": tags })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_skill_tag(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match create_skill_tag_value(&state, &payload) {
+        Ok(name) => Json(json!({ "name": name })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn rename_skill_tag(
+    State(state): State<AppState>,
+    Path(tag): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match rename_skill_tag_value(&state, &tag, &payload) {
+        Ok(name) => Json(json!({ "name": name })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_skill_tag(
+    State(state): State<AppState>,
+    Path(tag): Path<String>,
+) -> impl IntoResponse {
+    match delete_skill_tag_value(&state, &tag) {
+        Ok(name) => Json(json!({ "status": "deleted", "name": name })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SkillMetaValue {
+    Scalar(String),
+    List(Vec<String>),
+}
+
+fn create_skill_value(state: &AppState, payload: &Value) -> Result<Value, ApiError> {
+    let name = payload["name"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "name is required"))?;
+    let slug = validate_skill_name(name)?;
+    let dir = skill_dir(state, &slug);
+    if fs::symlink_metadata(&dir).is_ok() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            &format!("Skill already exists: {name}"),
+        ));
+    }
+
+    let description = payload["description"].as_str().unwrap_or("").trim();
+    let content = payload["content"].as_str().unwrap_or("");
+    let tags = validated_skill_tags(payload.get("tags"));
+    let body = normalize_skill_content(&slug, description, content, &tags);
+
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create skill directory: {error}"),
+        )
+    })?;
+    fs::write(skill_file_path(state, &slug), body).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write skill: {error}"),
+        )
+    })?;
+    merge_skill_tags_into_vocab(state, &tags)?;
+    Ok(skill_info_json(&slug, description, &tags))
+}
+
+fn update_skill_value(state: &AppState, name: &str, payload: &Value) -> Result<Value, ApiError> {
+    let mut slug = validate_skill_name(name)?;
+    let mut dir = skill_dir(state, &slug);
+    if !skill_dir_is_regular_dir(state, &slug) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Skill not found: {name}"),
+        ));
+    }
+
+    let mut text = if let Some(content) = payload.get("content") {
+        match content {
+            Value::String(value) => value.clone(),
+            Value::Null => fs::read_to_string(skill_file_path(state, &slug)).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to read skill: {error}"),
+                )
+            })?,
+            value => {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("content must be a string, got {value}"),
+                ));
+            }
+        }
+    } else {
+        fs::read_to_string(skill_file_path(state, &slug)).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read skill: {error}"),
+            )
+        })?
+    };
+
+    if let Some(value) = payload.get("description") {
+        match value {
+            Value::String(description) => {
+                text = rewrite_skill_frontmatter(&text, None, Some(description.trim()), None);
+            }
+            Value::Null => {}
+            value => {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("description must be a string, got {value}"),
+                ));
+            }
+        }
+    }
+
+    let mut clean_tags = None;
+    if payload.get("tags").is_some() {
+        let tags = validated_skill_tags(payload.get("tags"));
+        text = rewrite_skill_frontmatter(&text, None, None, Some(&tags));
+        clean_tags = Some(tags);
+    }
+
+    let final_description = skill_description_from_content(&text);
+    let final_tags = skill_tags_from_content(&text);
+
+    if let Some(rename_to) = payload["rename_to"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let new_slug = validate_skill_name(rename_to)?;
+        if new_slug != slug {
+            let new_dir = skill_dir(state, &new_slug);
+            if fs::symlink_metadata(&new_dir).is_ok() {
+                return Err(api_error(StatusCode::CONFLICT, &new_slug));
+            }
+            text = rewrite_skill_frontmatter(&text, Some(&new_slug), None, None);
+            fs::rename(&dir, &new_dir).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to rename skill: {error}"),
+                )
+            })?;
+            slug = new_slug;
+            dir = new_dir;
+        }
+    }
+
+    fs::write(dir.join("SKILL.md"), text).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write skill: {error}"),
+        )
+    })?;
+    if let Some(tags) = clean_tags {
+        merge_skill_tags_into_vocab(state, &tags)?;
+    }
+    Ok(skill_info_json(&slug, &final_description, &final_tags))
+}
+
+fn delete_skill_value(state: &AppState, name: &str) -> Result<String, ApiError> {
+    let slug = validate_skill_name(name)?;
+    let dir = skill_dir(state, &slug);
+    if !skill_dir_is_regular_dir(state, &slug) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Skill not found: {name}"),
+        ));
+    }
+    fs::remove_dir_all(dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to delete skill: {error}"),
+        )
+    })?;
+    Ok(slug)
+}
+
+fn skill_summaries(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    if !state.skills_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut summaries = Vec::new();
+    let mut entries = fs::read_dir(&*state.skills_root)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read skills: {error}"),
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| entry_is_regular_dir(entry.path()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for name in entries {
+        if let Ok(slug) = validate_skill_name(&name)
+            && let Ok(detail) = read_skill_detail_data(state, &slug)
+        {
+            summaries.push(skill_info_json(
+                &detail.name,
+                &detail.description,
+                &detail.tags,
+            ));
+        }
+    }
+    Ok(summaries)
+}
+
+fn read_skill_detail(state: &AppState, name: &str) -> Result<Value, ApiError> {
+    let detail = read_skill_detail_data(state, name)?;
+    Ok(json!({
+        "name": detail.name,
+        "description": detail.description,
+        "content": detail.content,
+        "tags": detail.tags
+    }))
+}
+
+struct SkillDetailData {
+    name: String,
+    description: String,
+    content: String,
+    tags: Vec<String>,
+}
+
+fn read_skill_detail_data(state: &AppState, name: &str) -> Result<SkillDetailData, ApiError> {
+    let slug = validate_skill_name(name)?;
+    let path = skill_file_path(state, &slug);
+    if !skill_dir_is_regular_dir(state, &slug) || !path_is_regular_file(&path) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Skill not found: {name}"),
+        ));
+    }
+    let content = fs::read_to_string(path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read skill: {error}"),
+        )
+    })?;
+    Ok(SkillDetailData {
+        name: slug,
+        description: skill_description_from_content(&content),
+        tags: skill_tags_from_content(&content),
+        content,
+    })
+}
+
+fn create_skill_tag_value(state: &AppState, payload: &Value) -> Result<String, ApiError> {
+    let tag = normalize_skill_tag(
+        payload["name"]
+            .as_str()
+            .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "name is required"))?,
+    )?;
+    let vocab = ensure_skill_tag_vocab(state)?;
+    if vocab.contains(&tag) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            &format!("Tag already exists: {tag}"),
+        ));
+    }
+    write_skill_tag_vocab(state, &[vocab, vec![tag.clone()]].concat())?;
+    Ok(tag)
+}
+
+fn rename_skill_tag_value(
+    state: &AppState,
+    old: &str,
+    payload: &Value,
+) -> Result<String, ApiError> {
+    let old_tag = normalize_skill_tag(old)?;
+    let new_tag =
+        normalize_skill_tag(payload["rename_to"].as_str().ok_or_else(|| {
+            api_error(StatusCode::UNPROCESSABLE_ENTITY, "rename_to is required")
+        })?)?;
+    let vocab = ensure_skill_tag_vocab(state)?;
+    if !vocab.contains(&old_tag) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Tag not found: {old_tag}"),
+        ));
+    }
+    if new_tag != old_tag && vocab.contains(&new_tag) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            &format!("Tag already exists: {new_tag}"),
+        ));
+    }
+    if new_tag == old_tag {
+        return Ok(old_tag);
+    }
+    let updated = vocab
+        .into_iter()
+        .map(|tag| if tag == old_tag { new_tag.clone() } else { tag })
+        .collect::<Vec<_>>();
+    replace_skill_tag_in_skills(state, &old_tag, Some(&new_tag))?;
+    write_skill_tag_vocab(state, &dedupe_strings(updated))?;
+    Ok(new_tag)
+}
+
+fn delete_skill_tag_value(state: &AppState, name: &str) -> Result<String, ApiError> {
+    let tag = normalize_skill_tag(name)?;
+    let vocab = ensure_skill_tag_vocab(state)?;
+    if !vocab.contains(&tag) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Tag not found: {tag}"),
+        ));
+    }
+    let updated = vocab
+        .into_iter()
+        .filter(|value| value != &tag)
+        .collect::<Vec<_>>();
+    replace_skill_tag_in_skills(state, &tag, None)?;
+    write_skill_tag_vocab(state, &updated)?;
+    Ok(tag)
+}
+
+fn skill_dir(state: &AppState, name: &str) -> PathBuf {
+    state.skills_root.join(name)
+}
+
+fn skill_file_path(state: &AppState, name: &str) -> PathBuf {
+    skill_dir(state, name).join("SKILL.md")
+}
+
+fn skill_dir_is_regular_dir(state: &AppState, name: &str) -> bool {
+    entry_is_regular_dir(skill_dir(state, name))
+}
+
+fn entry_is_regular_dir(path: PathBuf) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn path_is_regular_file(path: &FsPath) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn skill_tags_path(state: &AppState) -> PathBuf {
+    state.skills_root.join(SKILL_TAGS_FILE)
+}
+
+fn validate_skill_name(name: &str) -> Result<String, ApiError> {
+    let candidate = name.trim().to_ascii_lowercase();
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return Err(invalid_skill_name_error());
+    };
+    if candidate.chars().count() > 64 || !first.is_ascii_alphanumeric() {
+        return Err(invalid_skill_name_error());
+    }
+    if chars.any(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')) {
+        return Err(invalid_skill_name_error());
+    }
+    Ok(candidate)
+}
+
+fn invalid_skill_name_error() -> ApiError {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "Skill name must match ^[a-z0-9][a-z0-9-]{0,63}$",
+    )
+}
+
+fn normalize_skill_tag(raw: &str) -> Result<String, ApiError> {
+    let candidate = raw.trim().to_ascii_lowercase();
+    if candidate.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Tag name must not be empty.",
+        ));
+    }
+    let mut chars = candidate.chars();
+    let first = chars.next().unwrap_or_default();
+    if candidate.chars().count() > 32 || !first.is_ascii_alphanumeric() {
+        return Err(invalid_skill_tag_error());
+    }
+    if chars.any(|ch| {
+        !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' || ch == ' ')
+    }) {
+        return Err(invalid_skill_tag_error());
+    }
+    Ok(candidate)
+}
+
+fn invalid_skill_tag_error() -> ApiError {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "Tag must match ^[a-z0-9][a-z0-9- _]{0,31}$ (letters/digits/dash/space/underscore).",
+    )
+}
+
+fn validated_skill_tags(value: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(values)) = value else {
+        return Vec::new();
+    };
+    dedupe_strings(
+        values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .filter_map(|value| normalize_skill_tag(value).ok())
+            .collect(),
+    )
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn read_skill_tag_vocab(state: &AppState) -> Vec<String> {
+    let path = skill_tags_path(state);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value["tags"].as_array().cloned())
+        .map(|tags| {
+            dedupe_strings(
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|value| normalize_skill_tag(value).ok())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn write_skill_tag_vocab(state: &AppState, tags: &[String]) -> Result<(), ApiError> {
+    fs::create_dir_all(&*state.skills_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create skills directory: {error}"),
+        )
+    })?;
+    let payload = json!({ "tags": dedupe_strings(tags.to_vec()) });
+    let bytes = serde_json::to_vec_pretty(&payload).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize skill tags: {error}"),
+        )
+    })?;
+    fs::write(skill_tags_path(state), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write skill tags: {error}"),
+        )
+    })
+}
+
+fn ensure_skill_tag_vocab(state: &AppState) -> Result<Vec<String>, ApiError> {
+    let existed = skill_tags_path(state).exists();
+    let mut vocab = if existed {
+        read_skill_tag_vocab(state)
+    } else {
+        DEFAULT_SKILL_TAGS
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    };
+    vocab = dedupe_strings([vocab, collect_skill_tags(state)].concat());
+    if !existed || read_skill_tag_vocab(state) != vocab {
+        write_skill_tag_vocab(state, &vocab)?;
+    }
+    Ok(vocab)
+}
+
+fn merge_skill_tags_into_vocab(state: &AppState, tags: &[String]) -> Result<(), ApiError> {
+    let vocab = ensure_skill_tag_vocab(state)?;
+    let merged = dedupe_strings([vocab.clone(), tags.to_vec()].concat());
+    if merged != vocab {
+        write_skill_tag_vocab(state, &merged)?;
+    }
+    Ok(())
+}
+
+fn collect_skill_tags(state: &AppState) -> Vec<String> {
+    if !state.skills_root.exists() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    if let Ok(entries) = fs::read_dir(&*state.skills_root) {
+        let mut names = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry_is_regular_dir(entry.path()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if let Ok(detail) = read_skill_detail_data(state, &name) {
+                found.extend(detail.tags);
+            }
+        }
+    }
+    dedupe_strings(found)
+}
+
+fn replace_skill_tag_in_skills(
+    state: &AppState,
+    old_tag: &str,
+    new_tag: Option<&str>,
+) -> Result<(), ApiError> {
+    if !state.skills_root.exists() {
+        return Ok(());
+    }
+    let mut names = fs::read_dir(&*state.skills_root)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read skills: {error}"),
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| entry_is_regular_dir(entry.path()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        let Ok(detail) = read_skill_detail_data(state, &name) else {
+            continue;
+        };
+        if !detail.tags.iter().any(|tag| tag == old_tag) {
+            continue;
+        }
+        let mut tags = Vec::new();
+        for tag in detail.tags {
+            if tag == old_tag {
+                if let Some(new_tag) = new_tag {
+                    tags.push(new_tag.to_string());
+                }
+            } else {
+                tags.push(tag);
+            }
+        }
+        let text =
+            rewrite_skill_frontmatter(&detail.content, None, None, Some(&dedupe_strings(tags)));
+        fs::write(skill_file_path(state, &name), text).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write skill: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn normalize_skill_content(
+    name: &str,
+    description: &str,
+    content: &str,
+    tags: &[String],
+) -> String {
+    if split_skill_frontmatter(content).is_some() {
+        return rewrite_skill_frontmatter(content, Some(name), Some(description), Some(tags));
+    }
+    let mut meta = vec![
+        ("name".to_string(), SkillMetaValue::Scalar(name.to_string())),
+        (
+            "description".to_string(),
+            SkillMetaValue::Scalar(description.to_string()),
+        ),
+    ];
+    if !tags.is_empty() {
+        meta.push(("tags".to_string(), SkillMetaValue::List(tags.to_vec())));
+    }
+    render_skill_content(&meta, content.trim_start())
+}
+
+fn rewrite_skill_frontmatter(
+    text: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    tags: Option<&[String]>,
+) -> String {
+    let (mut meta, body) = split_skill_frontmatter(text)
+        .map(|(raw, body)| (parse_skill_meta(&raw), body))
+        .unwrap_or_else(|| (Vec::new(), text.replace("\r\n", "\n")));
+    if let Some(name) = name {
+        set_skill_meta_scalar(&mut meta, "name", name);
+    }
+    if let Some(description) = description {
+        set_skill_meta_scalar(&mut meta, "description", description);
+    }
+    if let Some(tags) = tags {
+        if tags.is_empty() {
+            remove_skill_meta(&mut meta, "tags");
+        } else {
+            set_skill_meta_list(&mut meta, "tags", tags.to_vec());
+        }
+    }
+    if meta.is_empty() {
+        text.to_string()
+    } else {
+        render_skill_content(&meta, body.trim_start())
+    }
+}
+
+fn split_skill_frontmatter(text: &str) -> Option<(String, String)> {
+    let normalized = text.replace("\r\n", "\n");
+    if !normalized.starts_with("---\n") {
+        return None;
+    }
+    let rest = &normalized[4..];
+    let end = rest.find("\n---")?;
+    let header = rest[..end].to_string();
+    let mut body_start = 4 + end + "\n---".len();
+    if normalized[body_start..].starts_with('\n') {
+        body_start += 1;
+    }
+    Some((header, normalized[body_start..].to_string()))
+}
+
+fn parse_skill_meta(raw: &str) -> Vec<(String, SkillMetaValue)> {
+    let mut meta = Vec::<(String, SkillMetaValue)>::new();
+    let mut current_list_key: Option<String> = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            if let Some(key) = current_list_key.as_deref()
+                && let Some((_, SkillMetaValue::List(values))) =
+                    meta.iter_mut().find(|(existing, _)| existing == key)
+            {
+                values.push(unquote_yaml_scalar(item.trim()));
+            }
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            current_list_key = None;
+            continue;
+        };
+        let key = key.trim().to_string();
+        let value = value.trim();
+        current_list_key = None;
+        if value.is_empty() {
+            set_skill_meta_list(&mut meta, &key, Vec::new());
+            current_list_key = Some(key);
+        } else {
+            set_skill_meta_scalar(&mut meta, &key, &unquote_yaml_scalar(value));
+        }
+    }
+    meta
+}
+
+fn render_skill_content(meta: &[(String, SkillMetaValue)], body: &str) -> String {
+    let mut header = String::new();
+    for (key, value) in meta {
+        match value {
+            SkillMetaValue::Scalar(value) => {
+                header.push_str(key);
+                header.push_str(": ");
+                header.push_str(&render_yaml_scalar(value));
+                header.push('\n');
+            }
+            SkillMetaValue::List(values) => {
+                if values.is_empty() {
+                    continue;
+                }
+                header.push_str(key);
+                header.push_str(":\n");
+                for value in values {
+                    header.push_str("- ");
+                    header.push_str(&render_yaml_scalar(value));
+                    header.push('\n');
+                }
+            }
+        }
+    }
+    format!("---\n{}---\n\n{}", header, body.trim_start())
+        .trim_end()
+        .to_string()
+        + "\n"
+}
+
+fn set_skill_meta_scalar(meta: &mut Vec<(String, SkillMetaValue)>, key: &str, value: &str) {
+    if let Some((_, existing)) = meta.iter_mut().find(|(existing, _)| existing == key) {
+        *existing = SkillMetaValue::Scalar(value.to_string());
+    } else {
+        meta.push((key.to_string(), SkillMetaValue::Scalar(value.to_string())));
+    }
+}
+
+fn set_skill_meta_list(meta: &mut Vec<(String, SkillMetaValue)>, key: &str, values: Vec<String>) {
+    if let Some((_, existing)) = meta.iter_mut().find(|(existing, _)| existing == key) {
+        *existing = SkillMetaValue::List(values);
+    } else {
+        meta.push((key.to_string(), SkillMetaValue::List(values)));
+    }
+}
+
+fn remove_skill_meta(meta: &mut Vec<(String, SkillMetaValue)>, key: &str) {
+    meta.retain(|(existing, _)| existing != key);
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    if value.starts_with('"') && value.ends_with('"') {
+        return serde_json::from_str::<String>(value).unwrap_or_else(|_| {
+            value
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(value)
+                .to_string()
+        });
+    }
+    if value.starts_with('\'') && value.ends_with('\'') {
+        return value
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+            .unwrap_or(value)
+            .replace("''", "'");
+    }
+    value.to_string()
+}
+
+fn render_yaml_scalar(value: &str) -> String {
+    if yaml_plain_scalar_is_safe(value) {
+        value.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+    }
+}
+
+fn yaml_plain_scalar_is_safe(value: &str) -> bool {
+    if value.is_empty()
+        || value.trim() != value
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains(": ")
+        || value.contains(" #")
+        || value.contains('"')
+        || value.contains('\'')
+    {
+        return false;
+    }
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    !matches!(
+        first,
+        '-' | '?'
+            | ':'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | ','
+            | '&'
+            | '*'
+            | '#'
+            | '!'
+            | '|'
+            | '>'
+            | '@'
+            | '`'
+    )
+}
+
+fn skill_description_from_content(content: &str) -> String {
+    split_skill_frontmatter(content)
+        .map(|(raw, _)| parse_skill_meta(&raw))
+        .and_then(|meta| {
+            meta.into_iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("description", SkillMetaValue::Scalar(value)) => {
+                        Some(value.trim().to_string())
+                    }
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn skill_tags_from_content(content: &str) -> Vec<String> {
+    split_skill_frontmatter(content)
+        .map(|(raw, _)| parse_skill_meta(&raw))
+        .and_then(|meta| {
+            meta.into_iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("tags", SkillMetaValue::List(values)) => Some(dedupe_strings(
+                        values
+                            .iter()
+                            .filter_map(|value| normalize_skill_tag(value).ok())
+                            .collect(),
+                    )),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn skill_info_json(name: &str, description: &str, tags: &[String]) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "tags": tags
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

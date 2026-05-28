@@ -78,8 +78,8 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描到的调用：`163`
 - Python 原后端路由：`167`
-- Rust 后端路由：`129`
-- 前端仍缺 Rust 覆盖的路径：`15`
+- Rust 后端路由：`138`
+- 前端仍缺 Rust 覆盖的路径：`9`
 
 本轮已补齐并验证的主要区域：
 
@@ -93,14 +93,17 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/notebook/*` 普通 Notebook 列表、统计、创建、详情、更新、删除、记录增删改、带 summary 的 SSE 保存入口
 - `/api/v1/question-notebook/*` 题目 Notebook entries、lookup/upsert、分类 CRUD、entry/category 关联与筛选
 - `/api/v1/memory*` two-file public memory：`SUMMARY.md`/`PROFILE.md` 快照、单文件保存/清空、从会话刷新、缺失 session/非法 file 错误兼容
+- `/api/v1/skills*` file-backed `SKILL.md` 管理：技能 list/detail/create/update/rename/delete、默认 tag 词表、tag create/rename/delete、tag 级联重写、frontmatter scalar 转义、symlink 目录拒绝、前端 JSON DELETE 合同
 
 已运行的验证：
 
-- `cargo test`：`26` 个测试通过
+- `cargo fmt --check`：通过
+- `cargo test`：`31` 个测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `cargo test course_knowledge`：`2` 个课程/知识库契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
+- `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test book_`：`4` 个 Book/Notebook 相关契约测试通过
 - Chromium 本地打开 `http://127.0.0.1:3011/book?book=<id>`：页面 `200`，reader 正文渲染，控制台 `0` 个 error
 - Chromium 本地打开 `http://127.0.0.1:3011/settings`：页面 `200`，settings/status/catalog 渲染，控制台 `0` 个 error
@@ -111,7 +114,7 @@ python3 tools/api_parity_scan.py \
 
 - `/api/v1/plugins/list` 与 tool/capability stream
 - `/api/v1/co_writer/*`
-- `/api/v1/skills*`
+- `/api/v1/page-agent/openai/v1/chat/completions`
 
 ## 已知限制
 

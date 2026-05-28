@@ -59,6 +59,13 @@ fn test_memory_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("memory")
 }
 
+fn test_skills_root(knowledge_root: &Path) -> std::path::PathBuf {
+    test_data_root(knowledge_root)
+        .join("user")
+        .join("workspace")
+        .join("skills")
+}
+
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("user")
 }
@@ -1061,6 +1068,555 @@ async fn memory_refresh_reports_corrupt_session_as_server_error() {
             .contains("Failed to parse session")
     );
 
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn skills_file_backed_crud_and_tags_match_frontend_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let initial_tags_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/tags/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial_tags_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(initial_tags_response).await,
+        json!({"tags": ["style", "tool"]})
+    );
+
+    let create_tag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/tags/create")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name": "Workflow"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_tag_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(create_tag_response).await["name"], "workflow");
+
+    let create_skill_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Course-Coach",
+                        "description": "Coach course answers with citations",
+                        "content": "Always cite uploaded course material.",
+                        "tags": ["Workflow", "tool", "workflow"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_skill_response.status(), http::StatusCode::OK);
+    let created = json_response(create_skill_response).await;
+    assert_eq!(created["name"], "course-coach");
+    assert_eq!(
+        created["description"],
+        "Coach course answers with citations"
+    );
+    assert_eq!(created["tags"], json!(["workflow", "tool"]));
+
+    let skill_file = test_skills_root(&root)
+        .join("course-coach")
+        .join("SKILL.md");
+    let saved = fs::read_to_string(skill_file).expect("saved skill");
+    assert!(saved.contains("name: course-coach"));
+    assert!(saved.contains("description: Coach course answers with citations"));
+    assert!(saved.contains("Always cite uploaded course material."));
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    assert_eq!(list["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(list["skills"][0]["name"], "course-coach");
+    assert!(list["skills"][0].get("content").is_none());
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/course-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["name"], "course-coach");
+    assert!(
+        detail["content"]
+            .as_str()
+            .unwrap()
+            .contains("Always cite uploaded course material.")
+    );
+
+    let rename_tag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/skills/tags/workflow")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"rename_to": "Study Flow"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_tag_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(rename_tag_response).await["name"],
+        "study flow"
+    );
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/skills/course-coach")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "rename_to": "citation-coach",
+                        "description": "Updated citation coach",
+                        "content": "---\nname: old\ntriggers:\n- cite\n---\n\nUse course evidence.",
+                        "tags": ["Study Flow"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+    let updated = json_response(update_response).await;
+    assert_eq!(updated["name"], "citation-coach");
+    assert_eq!(updated["description"], "Updated citation coach");
+    assert_eq!(updated["tags"], json!(["study flow"]));
+
+    let old_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/course-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_detail_response.status(), http::StatusCode::NOT_FOUND);
+
+    let new_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/citation-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(new_detail_response.status(), http::StatusCode::OK);
+    let new_detail = json_response(new_detail_response).await;
+    assert!(
+        new_detail["content"]
+            .as_str()
+            .unwrap()
+            .contains("name: citation-coach")
+    );
+    assert!(
+        new_detail["content"]
+            .as_str()
+            .unwrap()
+            .contains("Use course evidence.")
+    );
+
+    let delete_tag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/skills/tags/study%20flow")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_tag_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_tag_response).await,
+        json!({"status": "deleted", "name": "study flow"})
+    );
+
+    let untagged_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/citation-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(untagged_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(untagged_response).await["tags"], json!([]));
+
+    let delete_skill_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/skills/citation-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_skill_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_skill_response).await,
+        json!({"status": "deleted", "name": "citation-coach"})
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn skills_errors_match_python_status_codes() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let invalid_skill_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "../bad",
+                        "description": "",
+                        "content": ""
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        invalid_skill_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "dupe-skill",
+                        "description": "First",
+                        "content": "First body"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let duplicate_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "dupe-skill",
+                        "description": "Second",
+                        "content": "Second body"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_response.status(), http::StatusCode::CONFLICT);
+
+    let missing_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/missing-skill")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+
+    let invalid_tag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/tags/create")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name": "$bad"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_tag_response.status(), http::StatusCode::BAD_REQUEST);
+
+    let missing_tag_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/skills/tags/not-there")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_tag_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn skills_frontmatter_preserves_yaml_sensitive_scalars() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let description = "Coach: cite #1\nsecond line with \"quotes\"";
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "yaml-coach",
+                        "description": description,
+                        "content": "Use the evidence exactly.",
+                        "tags": ["style"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/yaml-coach")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["description"], description);
+
+    let saved = fs::read_to_string(test_skills_root(&root).join("yaml-coach").join("SKILL.md"))
+        .expect("saved skill");
+    assert!(saved.contains("description: \"Coach: cite #1\\nsecond line with \\\"quotes\\\"\""));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skills_api_rejects_symlink_directory_escape() {
+    use std::os::unix::fs as unix_fs;
+
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let skills_root = test_skills_root(&root);
+    let outside = root.with_file_name(format!(
+        "socartes-skills-outside-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&skills_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("SKILL.md"),
+        "---\nname: evil-link\ndescription: outside\n---\n\nDo not expose.",
+    )
+    .unwrap();
+    unix_fs::symlink(&outside, skills_root.join("evil-link")).unwrap();
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(list_response).await["skills"], json!([]));
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/evil-link")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), http::StatusCode::NOT_FOUND);
+
+    let update_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/skills/evil-link")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"description": "mutated outside"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::NOT_FOUND);
+    let outside_content = fs::read_to_string(outside.join("SKILL.md")).unwrap();
+    assert!(outside_content.contains("description: outside"));
+
+    let _ = std::fs::remove_file(skills_root.join("evil-link"));
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+    let _ = std::fs::remove_dir_all(outside);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skills_tag_vocab_stays_unchanged_when_cascade_rewrite_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    for name in ["alpha-skill", "zeta-skill"] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/skills/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": name,
+                            "description": "Tag cascade fixture",
+                            "content": "Body",
+                            "tags": ["workflow"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    let locked_skill = test_skills_root(&root).join("alpha-skill").join("SKILL.md");
+    let mut permissions = fs::metadata(&locked_skill).unwrap().permissions();
+    permissions.set_mode(0o444);
+    fs::set_permissions(&locked_skill, permissions).unwrap();
+
+    let rename_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/skills/tags/workflow")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"rename_to": "study flow"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rename_response.status(),
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let tags_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/tags/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tags = json_response(tags_response).await["tags"].clone();
+    assert!(tags.as_array().unwrap().contains(&json!("workflow")));
+    assert!(!tags.as_array().unwrap().contains(&json!("study flow")));
+    assert!(
+        fs::read_to_string(test_skills_root(&root).join("zeta-skill").join("SKILL.md"))
+            .unwrap()
+            .contains("- workflow")
+    );
+
+    let mut permissions = fs::metadata(&locked_skill).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&locked_skill, permissions).unwrap();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
