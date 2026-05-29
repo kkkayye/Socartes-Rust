@@ -90,7 +90,7 @@ python3 tools/api_parity_scan.py \
 - 课程上传增量索引：`/api/v1/knowledge/{name}/upload` 现在要求课程已有 active index；当课程配置或 metadata 标记 `needs_reindex`、或课程尚未 reindex 出 active index 时返回 `409`，避免在 stale/missing index 上假成功；完成 reindex 后上传会重写 active `chunks.json`、维护 `metadata.json.file_hashes`、追加 `update_history`，并跳过已存在课程内容的重复上传而不改 metadata
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
-- `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn`/`resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，也可在 turn 运行中接上 live events；`cancel_turn` 支持同连接、跨连接和已落盘 running turn 取消，并广播/补写 `error(status=cancelled)` + `done(status=cancelled)`；`regenerate` 复用上一条 user、删除尾部 assistant、写入 regenerate metadata 且不重复 user message；`subscribe_session` 可回放 session 最新 turn
+- `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`llm_selection` 会按 catalog 中同一 profile 下的 model id 精确校验，无效 selection 返回 `error(status=rejected)` 且不创建 turn；`subscribe_turn`/`resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，也可在 turn 运行中接上 live events；`cancel_turn` 支持同连接、跨连接和已落盘 running turn 取消，并广播/补写 `error(status=cancelled)` + `done(status=cancelled)`；`regenerate` 复用上一条 user、删除尾部 assistant、写入 regenerate metadata 且不重复 user message；无效 regenerate `llm_selection` 会在删改历史前 rejected，保留原 user/assistant 历史；`subscribe_session` 可回放 session 最新 turn
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
@@ -114,7 +114,7 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`53` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`55` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
@@ -128,7 +128,7 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
 - `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、REST image URL 下载/content-type 错误、真实 WS 握手和事件序列契约测试通过
-- `cargo test --test api_contract chat_ws_`：`8` 个 unified chat WebSocket 真实握手、turn event 持久化、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换契约测试通过
+- `cargo test --test api_contract chat_ws_`：`10` 个 unified chat WebSocket 真实握手、turn event 持久化、`llm_selection` 无效 selection rejected、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换和无效 selection 不破坏历史契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过

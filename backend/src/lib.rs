@@ -4882,6 +4882,79 @@ fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<Stri
         .map(ToString::to_string)
 }
 
+fn resolve_chat_llm_selection(state: &AppState, payload: &mut Value) {
+    let has_explicit_selection = payload
+        .get("llm_selection")
+        .is_some_and(|value| !value.is_null());
+    if has_explicit_selection {
+        return;
+    }
+    let Some(session_id) = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let Ok(session) = read_session(state, session_id) else {
+        return;
+    };
+    let selection = session["preferences"]["llm_selection"].clone();
+    if !selection.is_null() {
+        payload["llm_selection"] = selection;
+    }
+}
+
+fn validate_llm_selection(state: &AppState, payload: &Value) -> Result<(), String> {
+    validate_llm_selection_value(state, &payload["llm_selection"])
+}
+
+fn validate_llm_selection_value(state: &AppState, selection: &Value) -> Result<(), String> {
+    if selection.is_null() {
+        return Ok(());
+    }
+    let Some(selection) = selection.as_object() else {
+        return Err("Invalid LLM selection: expected an object.".to_string());
+    };
+
+    let profile_id = llm_selection_field(selection, "profile_id");
+    let model_id = llm_selection_field(selection, "model_id");
+    let profile_id = profile_id.trim();
+    let model_id = model_id.trim();
+    if profile_id.is_empty() && model_id.is_empty() {
+        return Ok(());
+    }
+    if profile_id.is_empty() || model_id.is_empty() {
+        return Err("Invalid LLM selection: profile_id and model_id are required.".to_string());
+    }
+
+    let catalog = load_settings_catalog(state);
+    let profiles = catalog["services"]["llm"]["profiles"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let selected_exists = profiles.iter().any(|profile| {
+        profile["id"].as_str() == Some(profile_id)
+            && profile["models"].as_array().is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|model| model["id"].as_str() == Some(model_id))
+            })
+    });
+    if selected_exists {
+        Ok(())
+    } else {
+        Err("Invalid LLM selection: selected profile/model was not found.".to_string())
+    }
+}
+
+fn llm_selection_field(selection: &Map<String, Value>, key: &str) -> String {
+    match selection.get(key) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(value) => value.to_string(),
+    }
+}
+
 fn active_search_provider(catalog: &Value) -> Option<String> {
     let service = &catalog["services"]["search"];
     let active_profile_id = service["active_profile_id"].as_str();
@@ -9649,26 +9722,7 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
                     run_chat_turn(&mut socket, &state, &regenerate_payload).await;
                 }
                 Err(reason) => {
-                    let _ = send_stream_event(
-                        &mut socket,
-                        stream_event(
-                            "error",
-                            "rust-backend",
-                            "",
-                            &reason,
-                            json!({
-                                "turn_terminal": true,
-                                "status": "rejected",
-                                "reason": reason
-                            }),
-                            StreamIds {
-                                session_id: payload["session_id"].as_str(),
-                                turn_id: Some(""),
-                            },
-                            0,
-                        ),
-                    )
-                    .await;
+                    let _ = send_rejected_turn_error(&mut socket, &payload, &reason, true).await;
                 }
             },
             "cancel_turn" => {
@@ -9716,6 +9770,38 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+async fn send_rejected_turn_error(
+    socket: &mut WebSocket,
+    payload: &Value,
+    reason: &str,
+    include_reason: bool,
+) -> Result<(), axum::Error> {
+    let session_id = payload["session_id"].as_str().unwrap_or("");
+    let mut metadata = json!({
+        "turn_terminal": true,
+        "status": "rejected"
+    });
+    if include_reason {
+        metadata["reason"] = json!(reason);
+    }
+    send_stream_event(
+        socket,
+        stream_event(
+            "error",
+            "unified_ws",
+            "",
+            reason,
+            metadata,
+            StreamIds {
+                session_id: Some(session_id),
+                turn_id: Some(""),
+            },
+            0,
+        ),
+    )
+    .await
 }
 
 async fn replay_turn_events(socket: &mut WebSocket, state: &AppState, payload: &Value) {
@@ -9883,6 +9969,20 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
         return Err("regenerate_busy".to_string());
     }
 
+    let overrides = payload["overrides"].as_object();
+    let override_llm_selection = overrides
+        .and_then(|object| object.get("llm_selection"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let preference_llm_selection = {
+        let value = session["preferences"]["llm_selection"].clone();
+        (!value.is_null()).then_some(value)
+    };
+    let llm_selection = override_llm_selection.or(preference_llm_selection);
+    if let Some(selection) = &llm_selection {
+        validate_llm_selection_value(state, selection)?;
+    }
+
     let Some(messages) = session["messages"].as_array_mut() else {
         return Err("nothing_to_regenerate".to_string());
     };
@@ -9917,7 +10017,6 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
     }
     write_session(state, session_id, &session).map_err(|_| "nothing_to_regenerate")?;
 
-    let overrides = payload["overrides"].as_object();
     let preferences = session["preferences"].as_object();
     let override_value =
         |key: &str| -> Option<Value> { overrides.and_then(|object| object.get(key)).cloned() };
@@ -9961,9 +10060,7 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
         "book_references": override_value("book_references").unwrap_or_else(|| json!([])),
         "config": config
     });
-    if let Some(llm_selection) =
-        override_value("llm_selection").or_else(|| preference_value("llm_selection"))
-    {
+    if let Some(llm_selection) = llm_selection {
         regenerate["llm_selection"] = llm_selection;
     }
     Ok(regenerate)
@@ -10066,7 +10163,15 @@ async fn drain_chat_control_messages(
 }
 
 async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
-    let turn = build_chat_turn(state, payload);
+    let mut payload = payload.clone();
+    resolve_chat_llm_selection(state, &mut payload);
+    if let Err(reason) = validate_llm_selection(state, &payload) {
+        let _ = ensure_chat_session_shell(state, payload["session_id"].as_str());
+        let _ = send_rejected_turn_error(socket, &payload, &reason, false).await;
+        return;
+    }
+
+    let turn = build_chat_turn(state, &payload);
     let live_turn = state
         .chat_runtime
         .register_turn(&turn.turn_id, &turn.session_id)
@@ -10083,7 +10188,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if live_turn.cancel_requested.load(Ordering::SeqCst) {
             break;
         }
-        if publish_chat_event(state, payload, &live_turn, event.clone())
+        if publish_chat_event(state, &payload, &live_turn, event.clone())
             .await
             .is_err()
         {
@@ -10093,7 +10198,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if event["type"] == "done" {
             let _ = persist_chat_turn(
                 state,
-                payload,
+                &payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &turn.trace,
@@ -10139,12 +10244,12 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
             ),
         ];
         for event in cancel_events {
-            let _ = publish_chat_event(state, payload, &live_turn, event.clone()).await;
+            let _ = publish_chat_event(state, &payload, &live_turn, event.clone()).await;
             delivered_events.push(event.clone());
             if event["type"] == "done" {
                 let _ = persist_cancelled_chat_turn(
                     state,
-                    payload,
+                    &payload,
                     &turn.session_id,
                     &turn.turn_id,
                     &delivered_events,
@@ -10158,7 +10263,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if !final_persisted {
             let _ = persist_cancelled_chat_turn(
                 state,
-                payload,
+                &payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &delivered_events,
@@ -10167,7 +10272,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
     } else if !final_persisted {
         let _ = persist_chat_turn(
             state,
-            payload,
+            &payload,
             &turn.session_id,
             &turn.turn_id,
             &turn.trace,
@@ -10299,6 +10404,38 @@ fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
 fn session_path(state: &AppState, session_id: &str) -> PathBuf {
     let component = safe_storage_component(session_id).unwrap_or_else(|| "invalid".to_string());
     state.session_root.join(format!("{component}.json"))
+}
+
+fn ensure_chat_session_shell(
+    state: &AppState,
+    requested_session_id: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(session_id) = requested_session_id.filter(|value| !value.trim().is_empty())
+        && read_session(state, session_id).is_ok()
+    {
+        return Ok(session_id.to_string());
+    }
+
+    let now = now_seconds();
+    let session_id = format!("rust-session-{}", unique_id());
+    let session = json!({
+        "id": session_id,
+        "session_id": session_id,
+        "title": "New conversation",
+        "created_at": now,
+        "updated_at": now,
+        "status": "idle",
+        "compressed_summary": "",
+        "summary_up_to_msg_id": 0,
+        "preferences": {},
+        "messages": [],
+        "active_turns": [],
+        "active_turn_id": Value::Null,
+        "turns": [],
+        "turn_events": {}
+    });
+    write_session(state, &session_id, &session)?;
+    Ok(session_id)
 }
 
 fn read_session(state: &AppState, session_id: &str) -> Result<Value, ApiError> {

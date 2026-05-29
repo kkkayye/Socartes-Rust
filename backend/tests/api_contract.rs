@@ -4231,6 +4231,94 @@ async fn chat_sessions_are_persisted_and_manageable() {
 }
 
 #[tokio::test]
+async fn chat_ws_start_turn_rejects_unknown_llm_selection_without_creating_turn() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "This turn should not run with an invalid model selection.",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "missing-profile",
+                    "model_id": "missing-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("rejection event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(text) = message else {
+        panic!("expected text websocket message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["source"], "unified_ws");
+    assert_eq!(event["session_id"], "");
+    assert_eq!(event["turn_id"], "");
+    assert_eq!(event["metadata"]["status"], "rejected");
+    assert_eq!(event["metadata"]["turn_terminal"], true);
+    assert!(
+        event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Invalid LLM selection"))
+    );
+
+    let list_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    let sessions = list["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    let shell_session_id = sessions[0]["id"].as_str().unwrap();
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{shell_session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["turns"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["active_turns"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["preferences"], json!({}));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_subscribe_turn_replays_persisted_events_after_seq() {
     let root = unique_test_knowledge_root();
     let server_root = root.clone();
@@ -5115,6 +5203,122 @@ async fn chat_ws_regenerate_reuses_last_user_without_duplicating_message() {
     assert_eq!(user_messages.len(), 1);
     assert_eq!(assistant_messages.len(), 1);
     assert_eq!(user_messages[0]["content"], original_question);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_regenerate_rejects_invalid_llm_selection_without_mutating_history() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let original_question = "Explain the preserved archive answer before invalid regenerate.";
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": original_question,
+                        "language": "en",
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "tools": ["rag"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let first_turn = json_response(turn_response).await;
+    let session_id = first_turn["session_id"].as_str().unwrap().to_string();
+
+    let before_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_response.status(), http::StatusCode::OK);
+    let before_detail = json_response(before_response).await;
+    let before_messages = before_detail["messages"].clone();
+    assert_eq!(before_messages.as_array().unwrap().len(), 2);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate",
+                "session_id": session_id,
+                "overrides": {
+                    "llm_selection": {
+                        "profile_id": "missing-profile",
+                        "model_id": "missing-model"
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("regenerate rejection event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(text) = message else {
+        panic!("expected text websocket message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["source"], "unified_ws");
+    assert_eq!(event["session_id"], session_id);
+    assert_eq!(event["turn_id"], "");
+    assert_eq!(event["metadata"]["status"], "rejected");
+    assert_eq!(event["metadata"]["turn_terminal"], true);
+    assert!(
+        event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Invalid LLM selection"))
+    );
+
+    server.abort();
+
+    let after_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_response.status(), http::StatusCode::OK);
+    let after_detail = json_response(after_response).await;
+    assert_eq!(after_detail["messages"], before_messages);
+    assert_eq!(after_detail["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(after_detail["turns"][0]["status"], "completed");
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
