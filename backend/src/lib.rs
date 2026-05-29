@@ -1,9 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::Write,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +24,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, broadcast};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -464,6 +468,54 @@ struct AppState {
     memory_root: Arc<PathBuf>,
     skills_root: Arc<PathBuf>,
     co_writer_docs_root: Arc<PathBuf>,
+    chat_runtime: Arc<ChatRuntimeState>,
+}
+
+#[derive(Debug)]
+struct ChatRuntimeState {
+    turns: Mutex<HashMap<String, LiveChatTurn>>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveChatTurn {
+    session_id: String,
+    cancel_requested: Arc<AtomicBool>,
+    events: Arc<Mutex<Vec<Value>>>,
+    sender: broadcast::Sender<Value>,
+}
+
+impl ChatRuntimeState {
+    async fn register_turn(&self, turn_id: &str, session_id: &str) -> LiveChatTurn {
+        let (sender, _) = broadcast::channel(64);
+        let turn = LiveChatTurn {
+            session_id: session_id.to_string(),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            sender,
+        };
+        self.turns
+            .lock()
+            .await
+            .insert(turn_id.to_string(), turn.clone());
+        turn
+    }
+
+    async fn get_turn(&self, turn_id: &str) -> Option<LiveChatTurn> {
+        self.turns.lock().await.get(turn_id).cloned()
+    }
+
+    async fn active_session_turn(&self, session_id: &str) -> Option<(String, LiveChatTurn)> {
+        self.turns
+            .lock()
+            .await
+            .iter()
+            .find(|(_, turn)| turn.session_id == session_id)
+            .map(|(turn_id, turn)| (turn_id.clone(), turn.clone()))
+    }
+
+    async fn remove_turn(&self, turn_id: &str) {
+        self.turns.lock().await.remove(turn_id);
+    }
 }
 
 impl AppState {
@@ -530,6 +582,9 @@ impl AppState {
             memory_root: Arc::new(memory_root),
             skills_root: Arc::new(skills_root),
             co_writer_docs_root: Arc::new(co_writer_docs_root),
+            chat_runtime: Arc::new(ChatRuntimeState {
+                turns: Mutex::new(HashMap::new()),
+            }),
         }
     }
 }
@@ -9152,31 +9207,35 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
             "start_turn" | "message" => {
                 run_chat_turn(&mut socket, &state, &payload).await;
             }
-            "regenerate" => {
-                let fallback = json!({
-                    "type": "start_turn",
-                    "content": "Regenerate the previous Socartes answer.",
-                    "session_id": payload["session_id"].as_str()
-                });
-                run_chat_turn(&mut socket, &state, &fallback).await;
-            }
+            "regenerate" => match regenerate_chat_payload(&state, &payload).await {
+                Ok(regenerate_payload) => {
+                    run_chat_turn(&mut socket, &state, &regenerate_payload).await;
+                }
+                Err(reason) => {
+                    let _ = send_stream_event(
+                        &mut socket,
+                        stream_event(
+                            "error",
+                            "rust-backend",
+                            "",
+                            &reason,
+                            json!({
+                                "turn_terminal": true,
+                                "status": "rejected",
+                                "reason": reason
+                            }),
+                            StreamIds {
+                                session_id: payload["session_id"].as_str(),
+                                turn_id: Some(""),
+                            },
+                            0,
+                        ),
+                    )
+                    .await;
+                }
+            },
             "cancel_turn" => {
-                let _ = send_stream_event(
-                    &mut socket,
-                    stream_event(
-                        "done",
-                        "rust-backend",
-                        "",
-                        "",
-                        json!({ "status": "cancelled" }),
-                        StreamIds {
-                            session_id: payload["session_id"].as_str(),
-                            turn_id: payload["turn_id"].as_str(),
-                        },
-                        1,
-                    ),
-                )
-                .await;
+                cancel_chat_turn(&mut socket, &state, &payload).await;
             }
             "subscribe_turn" => {
                 replay_turn_events(&mut socket, &state, &payload).await;
@@ -9231,6 +9290,10 @@ async fn replay_turn_events(socket: &mut WebSocket, state: &AppState, payload: &
         return;
     };
     let after_seq = replay_after_seq(payload);
+    if let Some(live_turn) = state.chat_runtime.get_turn(turn_id).await {
+        replay_live_turn_events(socket, state, turn_id, live_turn, after_seq).await;
+        return;
+    }
     match read_turn_events(state, turn_id, after_seq) {
         Ok(events) => {
             for event in events {
@@ -9254,6 +9317,10 @@ async fn replay_session_events(socket: &mut WebSocket, state: &AppState, payload
         return;
     };
     let after_seq = replay_after_seq(payload);
+    if let Some((turn_id, live_turn)) = state.chat_runtime.active_session_turn(session_id).await {
+        replay_live_turn_events(socket, state, &turn_id, live_turn, after_seq).await;
+        return;
+    }
     match latest_session_turn_events(state, session_id, after_seq) {
         Ok(events) => {
             for event in events {
@@ -9266,6 +9333,203 @@ async fn replay_session_events(socket: &mut WebSocket, state: &AppState, payload
             let _ = send_api_error_as_stream(socket, error).await;
         }
     }
+}
+
+async fn replay_live_turn_events(
+    socket: &mut WebSocket,
+    state: &AppState,
+    turn_id: &str,
+    live_turn: LiveChatTurn,
+    after_seq: u64,
+) {
+    let mut last_seq = after_seq;
+    if let Ok(events) = read_turn_events(state, turn_id, after_seq) {
+        for event in events {
+            last_seq = last_seq.max(event["seq"].as_u64().unwrap_or_default());
+            if send_stream_event(socket, event).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let mut receiver = live_turn.sender.subscribe();
+    let catchup = live_turn.events.lock().await.clone();
+    for event in catchup {
+        let seq = event["seq"].as_u64().unwrap_or_default();
+        if seq <= last_seq {
+            continue;
+        }
+        last_seq = seq;
+        let done = event["type"] == "done";
+        if send_stream_event(socket, event).await.is_err() || done {
+            return;
+        }
+    }
+
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let seq = event["seq"].as_u64().unwrap_or_default();
+                if seq <= last_seq {
+                    continue;
+                }
+                last_seq = seq;
+                let done = event["type"] == "done";
+                if send_stream_event(socket, event).await.is_err() || done {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                if let Ok(events) = read_turn_events(state, turn_id, last_seq) {
+                    for event in events {
+                        let seq = event["seq"].as_u64().unwrap_or_default();
+                        if seq <= last_seq {
+                            continue;
+                        }
+                        last_seq = seq;
+                        let done = event["type"] == "done";
+                        if send_stream_event(socket, event).await.is_err() || done {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn cancel_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
+    let Some(turn_id) = payload["turn_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        let _ = send_protocol_error(socket, "Missing turn_id.").await;
+        return;
+    };
+    if let Some(turn) = state.chat_runtime.get_turn(turn_id).await {
+        turn.cancel_requested.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    match mark_stored_turn_cancelled(state, turn_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = send_protocol_error(socket, &format!("Turn not found: {turn_id}")).await;
+        }
+        Err(error) => {
+            let _ = send_api_error_as_stream(socket, error).await;
+        }
+    }
+}
+
+async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Value, String> {
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "nothing_to_regenerate".to_string())?;
+    if state
+        .chat_runtime
+        .active_session_turn(session_id)
+        .await
+        .is_some()
+    {
+        return Err("regenerate_busy".to_string());
+    }
+
+    let mut session = read_session(state, session_id).map_err(|_| "nothing_to_regenerate")?;
+    if session["active_turn_id"].as_str().is_some()
+        || session["active_turns"]
+            .as_array()
+            .is_some_and(|turns| !turns.is_empty())
+    {
+        return Err("regenerate_busy".to_string());
+    }
+
+    let Some(messages) = session["messages"].as_array_mut() else {
+        return Err("nothing_to_regenerate".to_string());
+    };
+    let Some(last_user_index) = messages
+        .iter()
+        .rposition(|message| message["role"] == "user")
+    else {
+        return Err("nothing_to_regenerate".to_string());
+    };
+    let last_user = messages[last_user_index].clone();
+    let last_user_id = last_user["id"].as_u64().unwrap_or_default();
+    let previous_turn_id = messages.last().and_then(|message| {
+        if message["role"] != "assistant" {
+            return None;
+        }
+        message["metadata"]["turn_id"]
+            .as_str()
+            .map(ToString::to_string)
+            .or_else(|| {
+                message["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|event| event["turn_id"].as_str().map(ToString::to_string))
+            })
+    });
+    if messages
+        .last()
+        .is_some_and(|message| message["role"] == "assistant")
+    {
+        messages.pop();
+    }
+    write_session(state, session_id, &session).map_err(|_| "nothing_to_regenerate")?;
+
+    let overrides = payload["overrides"].as_object();
+    let preferences = session["preferences"].as_object();
+    let override_value =
+        |key: &str| -> Option<Value> { overrides.and_then(|object| object.get(key)).cloned() };
+    let preference_value =
+        |key: &str| -> Option<Value> { preferences.and_then(|object| object.get(key)).cloned() };
+    let mut config = override_value("config").unwrap_or_else(|| json!({}));
+    if !config.is_object() {
+        config = json!({});
+    }
+    config["_persist_user_message"] = json!(false);
+    config["_regenerate"] = json!(true);
+    config["_regenerated_from_message_id"] = json!(last_user_id);
+    if let Some(previous_turn_id) = previous_turn_id {
+        config["_superseded_turn_id"] = json!(previous_turn_id);
+    }
+
+    let mut regenerate = json!({
+        "type": "start_turn",
+        "session_id": session_id,
+        "content": last_user["content"].as_str().unwrap_or_default(),
+        "capability": override_value("capability")
+            .or_else(|| last_user.get("capability").cloned())
+            .or_else(|| preference_value("capability"))
+            .unwrap_or_else(|| json!("chat")),
+        "tools": override_value("tools")
+            .or_else(|| preference_value("tools"))
+            .unwrap_or_else(|| json!([])),
+        "knowledge_bases": override_value("knowledge_bases")
+            .or_else(|| preference_value("knowledge_bases"))
+            .unwrap_or_else(|| json!([])),
+        "language": override_value("language")
+            .or_else(|| preference_value("language"))
+            .unwrap_or_else(|| json!("en")),
+        "attachments": last_user.get("attachments").cloned().unwrap_or_else(|| json!([])),
+        "notebook_references": override_value("notebook_references")
+            .or_else(|| preference_value("notebook_references"))
+            .unwrap_or_else(|| json!([])),
+        "history_references": override_value("history_references")
+            .or_else(|| preference_value("history_references"))
+            .unwrap_or_else(|| json!([])),
+        "book_references": override_value("book_references").unwrap_or_else(|| json!([])),
+        "config": config
+    });
+    if let Some(llm_selection) =
+        override_value("llm_selection").or_else(|| preference_value("llm_selection"))
+    {
+        regenerate["llm_selection"] = llm_selection;
+    }
+    Ok(regenerate)
 }
 
 async fn send_api_error_as_stream(
@@ -9301,16 +9565,202 @@ fn replay_after_seq(payload: &Value) -> u64 {
         .unwrap_or_default()
 }
 
-async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
-    let (_, _, events) = execute_chat_turn(state, payload);
-    for event in events {
-        if send_stream_event(socket, event).await.is_err() {
-            break;
+#[derive(Default)]
+struct ChatSocketControl {
+    socket_closed: bool,
+}
+
+async fn drain_chat_control_messages(
+    socket: &mut WebSocket,
+    state: &AppState,
+    current_turn_id: &str,
+    live_turn: &LiveChatTurn,
+) -> ChatSocketControl {
+    let mut control = ChatSocketControl::default();
+    loop {
+        let message =
+            match tokio::time::timeout(std::time::Duration::from_millis(1), socket.recv()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) => {
+                    control.socket_closed = true;
+                    return control;
+                }
+                Err(_) => return control,
+            };
+        let Message::Text(text) = message else {
+            if matches!(message, Message::Close(_)) {
+                control.socket_closed = true;
+                return control;
+            }
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+            let _ = send_protocol_error(socket, "Invalid WebSocket JSON message.").await;
+            continue;
+        };
+        match payload["type"].as_str().unwrap_or_default() {
+            "cancel_turn" => {
+                let requested_turn_id = payload["turn_id"].as_str().unwrap_or_default();
+                if requested_turn_id.is_empty() || requested_turn_id == current_turn_id {
+                    live_turn.cancel_requested.store(true, Ordering::SeqCst);
+                    return control;
+                }
+                cancel_chat_turn(socket, state, &payload).await;
+            }
+            "ping" => {
+                let _ = send_stream_event(
+                    socket,
+                    stream_event(
+                        "pong",
+                        "rust-backend",
+                        "protocol",
+                        "",
+                        json!({}),
+                        StreamIds::empty(),
+                        1,
+                    ),
+                )
+                .await;
+            }
+            "unsubscribe" => {}
+            _ => {}
         }
     }
 }
 
+async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
+    let turn = build_chat_turn(state, payload);
+    let live_turn = state
+        .chat_runtime
+        .register_turn(&turn.turn_id, &turn.session_id)
+        .await;
+    let delay_ms = payload["config"]["debug_stream_delay_ms"]
+        .as_u64()
+        .unwrap_or_default();
+    let mut delivered_events = Vec::new();
+    let mut socket_open = true;
+    let mut final_persisted = false;
+    for event in turn.events {
+        let control = drain_chat_control_messages(socket, state, &turn.turn_id, &live_turn).await;
+        socket_open &= !control.socket_closed;
+        if live_turn.cancel_requested.load(Ordering::SeqCst) {
+            break;
+        }
+        if publish_chat_event(state, payload, &live_turn, event.clone())
+            .await
+            .is_err()
+        {
+            break;
+        }
+        delivered_events.push(event.clone());
+        if event["type"] == "done" {
+            let _ = persist_chat_turn(
+                state,
+                payload,
+                &turn.session_id,
+                &turn.turn_id,
+                &turn.trace,
+                &delivered_events,
+            );
+            final_persisted = true;
+        }
+        if socket_open && send_stream_event(socket, event).await.is_err() {
+            socket_open = false;
+        }
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let control = drain_chat_control_messages(socket, state, &turn.turn_id, &live_turn).await;
+        socket_open &= !control.socket_closed;
+    }
+    if live_turn.cancel_requested.load(Ordering::SeqCst) {
+        let next_seq = delivered_events
+            .iter()
+            .filter_map(|event| event["seq"].as_u64())
+            .max()
+            .unwrap_or_default()
+            + 1;
+        let ids = StreamIds::new(&turn.session_id, &turn.turn_id);
+        let cancel_events = vec![
+            stream_event(
+                "error",
+                "rust-backend",
+                "",
+                "Turn cancelled",
+                json!({ "turn_terminal": true, "status": "cancelled" }),
+                ids,
+                next_seq,
+            ),
+            stream_event(
+                "done",
+                "rust-backend",
+                "",
+                "",
+                json!({ "status": "cancelled" }),
+                ids,
+                next_seq + 1,
+            ),
+        ];
+        for event in cancel_events {
+            let _ = publish_chat_event(state, payload, &live_turn, event.clone()).await;
+            delivered_events.push(event.clone());
+            if event["type"] == "done" {
+                let _ = persist_cancelled_chat_turn(
+                    state,
+                    payload,
+                    &turn.session_id,
+                    &turn.turn_id,
+                    &delivered_events,
+                );
+                final_persisted = true;
+            }
+            if socket_open && send_stream_event(socket, event).await.is_err() {
+                socket_open = false;
+            }
+        }
+        if !final_persisted {
+            let _ = persist_cancelled_chat_turn(
+                state,
+                payload,
+                &turn.session_id,
+                &turn.turn_id,
+                &delivered_events,
+            );
+        }
+    } else if !final_persisted {
+        let _ = persist_chat_turn(
+            state,
+            payload,
+            &turn.session_id,
+            &turn.turn_id,
+            &turn.trace,
+            &delivered_events,
+        );
+    }
+    state.chat_runtime.remove_turn(&turn.turn_id).await;
+}
+
 fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<Value>) {
+    let turn = build_chat_turn(state, payload);
+    let _ = persist_chat_turn(
+        state,
+        payload,
+        &turn.session_id,
+        &turn.turn_id,
+        &turn.trace,
+        &turn.events,
+    );
+    (turn.session_id, turn.turn_id, turn.events)
+}
+
+struct BuiltChatTurn {
+    session_id: String,
+    turn_id: String,
+    trace: StudyTrace,
+    events: Vec<Value>,
+}
+
+fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
     let content = payload["content"]
         .as_str()
         .unwrap_or("Explain the Socartes Rust agent loop.");
@@ -9332,17 +9782,19 @@ fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<
         retrieved_context,
     );
     let ids = StreamIds::new(&session_id, &turn_id);
+    let mut session_metadata = json!({ "session_id": session_id, "turn_id": turn_id });
+    if payload["config"]["_regenerate"].as_bool().unwrap_or(false) {
+        session_metadata["regenerate"] = json!(true);
+    }
+    if let Some(message_id) = payload["config"]["_regenerated_from_message_id"].as_u64() {
+        session_metadata["regenerated_from_message_id"] = json!(message_id);
+    }
+    if let Some(superseded_turn_id) = payload["config"]["_superseded_turn_id"].as_str() {
+        session_metadata["superseded_turn_id"] = json!(superseded_turn_id);
+    }
 
     let events = vec![
-        stream_event(
-            "session",
-            "rust-backend",
-            "",
-            "",
-            json!({ "session_id": session_id, "turn_id": turn_id }),
-            ids,
-            1,
-        ),
+        stream_event("session", "rust-backend", "", "", session_metadata, ids, 1),
         stream_event(
             "stage_start",
             "planner",
@@ -9399,8 +9851,12 @@ fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<
         ),
     ];
 
-    let _ = persist_chat_turn(state, payload, &session_id, &turn_id, &trace, &events);
-    (session_id, turn_id, events)
+    BuiltChatTurn {
+        session_id,
+        turn_id,
+        trace,
+        events,
+    }
 }
 
 fn session_path(state: &AppState, session_id: &str) -> PathBuf {
@@ -9451,6 +9907,71 @@ fn read_turn_events(
         }
     }
     Err(api_error(StatusCode::NOT_FOUND, "Turn not found"))
+}
+
+fn mark_stored_turn_cancelled(state: &AppState, turn_id: &str) -> Result<bool, ApiError> {
+    for mut session in session_records(state) {
+        let session_id = session["session_id"]
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| session["id"].as_str().unwrap_or_default().to_string());
+        let Some(turn_index) = session["turns"]
+            .as_array()
+            .and_then(|turns| turns.iter().position(|turn| turn["id"] == turn_id))
+        else {
+            continue;
+        };
+        if session["turns"][turn_index]["status"] != "running" {
+            return Ok(false);
+        }
+        let now = now_seconds();
+        if !session["turn_events"].is_object() {
+            session["turn_events"] = Value::Object(Map::new());
+        }
+        let mut events = session["turn_events"][turn_id]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let next_seq = events
+            .iter()
+            .filter_map(|event| event["seq"].as_u64())
+            .max()
+            .unwrap_or_default()
+            + 1;
+        let ids = StreamIds::new(&session_id, turn_id);
+        events.push(stream_event(
+            "error",
+            "rust-backend",
+            "",
+            "Turn cancelled",
+            json!({ "turn_terminal": true, "status": "cancelled" }),
+            ids,
+            next_seq,
+        ));
+        events.push(stream_event(
+            "done",
+            "rust-backend",
+            "",
+            "",
+            json!({ "status": "cancelled" }),
+            ids,
+            next_seq + 1,
+        ));
+        let event_count = events.len();
+        if let Some(turn_events) = session["turn_events"].as_object_mut() {
+            turn_events.insert(turn_id.to_string(), Value::Array(events));
+        }
+        session["turns"][turn_index]["status"] = json!("cancelled");
+        session["turns"][turn_index]["error"] = json!("Turn cancelled");
+        session["turns"][turn_index]["completed_at"] = json!(now);
+        session["turns"][turn_index]["event_count"] = json!(event_count);
+        session["status"] = json!("cancelled");
+        session["active_turns"] = json!([]);
+        session["active_turn_id"] = Value::Null;
+        write_session(state, &session_id, &session)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn latest_session_turn_events(
@@ -9694,6 +10215,159 @@ fn legacy_session_kb_name(session: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+async fn publish_chat_event(
+    state: &AppState,
+    payload: &Value,
+    live_turn: &LiveChatTurn,
+    event: Value,
+) -> Result<(), ApiError> {
+    let turn_id = event["turn_id"].as_str().unwrap_or_default();
+    persist_partial_chat_event(state, payload, &live_turn.session_id, turn_id, &event)?;
+    live_turn.events.lock().await.push(event.clone());
+    let _ = live_turn.sender.send(event);
+    Ok(())
+}
+
+fn persist_partial_chat_event(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    event: &Value,
+) -> Result<(), ApiError> {
+    let now = now_seconds();
+    let mut session = read_session(state, session_id).unwrap_or_else(|_| {
+        json!({
+            "id": session_id,
+            "session_id": session_id,
+            "title": title_from_content(payload["content"].as_str().unwrap_or("Socartes chat")),
+            "created_at": now,
+            "updated_at": now,
+            "status": "running",
+            "preferences": {},
+            "messages": [],
+            "active_turns": []
+        })
+    });
+    session["updated_at"] = json!(now);
+    session["status"] = json!("running");
+    session["active_turn_id"] = json!(turn_id);
+    session["active_turns"] = json!([{
+        "id": turn_id,
+        "session_id": session_id,
+        "status": "running",
+        "started_at": now
+    }]);
+    session["preferences"] = chat_preferences_from_payload(payload);
+
+    if !session["turns"].is_array() {
+        session["turns"] = json!([]);
+    }
+    if let Some(turns) = session["turns"].as_array_mut()
+        && !turns.iter().any(|turn| turn["id"] == turn_id)
+    {
+        turns.push(json!({
+            "id": turn_id,
+            "session_id": session_id,
+            "status": "running",
+            "started_at": now,
+            "completed_at": Value::Null,
+            "event_count": 0
+        }));
+    }
+
+    if !session["turn_events"].is_object() {
+        session["turn_events"] = Value::Object(Map::new());
+    }
+    if let Some(turn_events) = session["turn_events"].as_object_mut() {
+        let events = turn_events
+            .entry(turn_id.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(items) = events.as_array_mut() {
+            let seq = event["seq"].as_u64().unwrap_or_default();
+            if !items
+                .iter()
+                .any(|existing| existing["seq"].as_u64().unwrap_or_default() == seq)
+            {
+                items.push(event.clone());
+            }
+        }
+    }
+
+    write_session(state, session_id, &session)
+}
+
+fn persist_cancelled_chat_turn(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    events: &[Value],
+) -> Result<(), ApiError> {
+    let now = now_seconds();
+    let mut session = read_session(state, session_id).unwrap_or_else(|_| {
+        json!({
+            "id": session_id,
+            "session_id": session_id,
+            "title": title_from_content(payload["content"].as_str().unwrap_or("Socartes chat")),
+            "created_at": now,
+            "updated_at": now,
+            "status": "cancelled",
+            "preferences": {},
+            "messages": [],
+            "active_turns": []
+        })
+    });
+    session["updated_at"] = json!(now);
+    session["status"] = json!("cancelled");
+    session["active_turns"] = json!([]);
+    session["active_turn_id"] = Value::Null;
+    session["preferences"] = chat_preferences_from_payload(payload);
+    if should_persist_user_message(payload)
+        && session["messages"].as_array().is_none_or(Vec::is_empty)
+    {
+        session["messages"] = json!([{
+            "id": 1,
+            "session_id": session_id,
+            "role": "user",
+            "content": payload["content"].as_str().unwrap_or_default(),
+            "capability": payload["capability"].as_str().unwrap_or_default(),
+            "events": [],
+            "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
+            "metadata": { "turn_id": turn_id },
+            "created_at": now
+        }]);
+    }
+    let turn_record = json!({
+        "id": turn_id,
+        "session_id": session_id,
+        "status": "cancelled",
+        "started_at": now,
+        "completed_at": now,
+        "event_count": events.len()
+    });
+    upsert_turn_record(&mut session, turn_id, turn_record);
+    if !session["turn_events"].is_object() {
+        session["turn_events"] = Value::Object(Map::new());
+    }
+    if let Some(turn_events) = session["turn_events"].as_object_mut() {
+        turn_events.insert(turn_id.to_string(), Value::Array(events.to_vec()));
+    }
+    write_session(state, session_id, &session)
+}
+
+fn upsert_turn_record(session: &mut Value, turn_id: &str, turn_record: Value) {
+    if let Some(turns) = session["turns"].as_array_mut() {
+        if let Some(existing) = turns.iter_mut().find(|turn| turn["id"] == turn_id) {
+            *existing = turn_record;
+        } else {
+            turns.push(turn_record);
+        }
+    } else {
+        session["turns"] = json!([turn_record]);
+    }
+}
+
 fn session_summary(session: &Value) -> Value {
     let messages = session["messages"].as_array().cloned().unwrap_or_default();
     let last_message = messages
@@ -9759,8 +10433,13 @@ fn persist_chat_turn(
         "metadata": { "turn_id": turn_id },
         "created_at": now
     });
+    let assistant_id = if should_persist_user_message(payload) {
+        messages_len + 2
+    } else {
+        messages_len + 1
+    };
     let assistant_message = json!({
-        "id": messages_len + 2,
+        "id": assistant_id,
         "session_id": session_id,
         "role": "assistant",
         "content": trace.final_answer,
@@ -9776,22 +10455,22 @@ fn persist_chat_turn(
     });
 
     if let Some(messages) = session["messages"].as_array_mut() {
-        messages.push(user_message);
+        if should_persist_user_message(payload) {
+            messages.push(user_message);
+        }
         messages.push(assistant_message);
     } else {
-        session["messages"] = json!([user_message, assistant_message]);
+        session["messages"] = if should_persist_user_message(payload) {
+            json!([user_message, assistant_message])
+        } else {
+            json!([assistant_message])
+        };
     }
     session["updated_at"] = json!(now);
     session["status"] = json!("completed");
     session["active_turns"] = json!([]);
     session["active_turn_id"] = Value::Null;
-    session["preferences"] = json!({
-        "capability": payload["capability"].clone(),
-        "tools": as_string_array(&payload["tools"]),
-        "knowledge_bases": as_string_array(&payload["knowledge_bases"]),
-        "language": payload["language"].as_str().unwrap_or("en"),
-        "llm_selection": payload["llm_selection"].clone()
-    });
+    session["preferences"] = chat_preferences_from_payload(payload);
     let turn_record = json!({
         "id": turn_id,
         "session_id": session_id,
@@ -9800,11 +10479,7 @@ fn persist_chat_turn(
         "completed_at": now,
         "event_count": events.len()
     });
-    if let Some(turns) = session["turns"].as_array_mut() {
-        turns.push(turn_record);
-    } else {
-        session["turns"] = json!([turn_record]);
-    }
+    upsert_turn_record(&mut session, turn_id, turn_record);
     if !session["turn_events"].is_object() {
         session["turn_events"] = Value::Object(Map::new());
     }
@@ -9813,6 +10488,23 @@ fn persist_chat_turn(
     }
 
     write_session(state, session_id, &session)
+}
+
+fn should_persist_user_message(payload: &Value) -> bool {
+    !matches!(
+        payload["config"]["_persist_user_message"].as_bool(),
+        Some(false)
+    )
+}
+
+fn chat_preferences_from_payload(payload: &Value) -> Value {
+    json!({
+        "capability": payload["capability"].clone(),
+        "tools": as_string_array(&payload["tools"]),
+        "knowledge_bases": as_string_array(&payload["knowledge_bases"]),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "llm_selection": payload["llm_selection"].clone()
+    })
 }
 
 fn as_string_array(value: &Value) -> Vec<String> {

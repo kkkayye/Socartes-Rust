@@ -89,7 +89,7 @@ python3 tools/api_parity_scan.py \
 - 课程上传 reindex 防护：当课程配置或 metadata 标记 `needs_reindex` 时，`/api/v1/knowledge/{name}/upload` 返回 `409`，避免在 stale index 上继续增量写入；完成 reindex 后会清除 `needs_reindex`/`embedding_mismatch` 并允许继续上传课程文件
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
-- `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn` 和 `resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，`subscribe_session` 可回放 session 最新 turn
+- `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`subscribe_turn`/`resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，也可在 turn 运行中接上 live events；`cancel_turn` 支持同连接、跨连接和已落盘 running turn 取消，并广播/补写 `error(status=cancelled)` + `done(status=cancelled)`；`regenerate` 复用上一条 user、删除尾部 assistant、写入 regenerate metadata 且不重复 user message；`subscribe_session` 可回放 session 最新 turn
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
@@ -113,7 +113,7 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`45` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`51` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
@@ -126,7 +126,7 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
 - `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、真实 WS 握手和事件序列契约测试通过
-- `cargo test --test api_contract chat_ws_`：`2` 个 unified chat WebSocket 真实握手、turn event 持久化、`subscribe_turn`/`resume_from` 回放契约测试通过
+- `cargo test --test api_contract chat_ws_`：`8` 个 unified chat WebSocket 真实握手、turn event 持久化、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过
@@ -141,7 +141,7 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
 - `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
-- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界和本地 index-version 状态合同，但仍缺真实 LlamaIndex/embedding/vector search 语义；unified WS 已补已完成 turn 的 replay，仍缺运行中 turn live subscriber、真实 cancel task、真实 regenerate 语义；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
+- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界和本地 index-version 状态合同，但仍缺真实 LlamaIndex/embedding/vector search 语义；unified WS 已补 replay/live subscribe/cancel/regenerate 的协议级语义，但底层 turn 仍是 deterministic Rust agent loop，不是真实 Python ChatOrchestrator/LLM 后台任务；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
 

@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use socartes_backend::{app, app_with_knowledge_root};
 use tokio::net::TcpListener;
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tower::ServiceExt;
 
@@ -3987,6 +3988,701 @@ async fn chat_ws_resume_from_replays_tail_events_for_existing_turn() {
     );
     assert_eq!(replay_events[0]["type"], "stage_end");
     assert_eq!(replay_events[1]["type"], "done");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_subscribe_turn_continues_with_live_events_for_running_turn() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut starter_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    starter_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain live Socartes websocket subscriptions.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"],
+                "config": { "debug_stream_delay_ms": 25 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = timeout(Duration::from_secs(2), starter_socket.next())
+        .await
+        .expect("first websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(first_text) = first_message else {
+        panic!("expected text websocket message");
+    };
+    let session_event: Value = serde_json::from_str(&first_text).unwrap();
+    assert_eq!(session_event["type"], "session");
+    let session_id = session_event["session_id"].as_str().unwrap().to_string();
+    let turn_id = session_event["turn_id"].as_str().unwrap().to_string();
+
+    let (mut subscriber_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    subscriber_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 1
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut subscriber_events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), subscriber_socket.next())
+            .await
+            .expect("live subscription should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                subscriber_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        subscriber_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6, 7]
+    );
+    assert!(
+        subscriber_events
+            .iter()
+            .all(|event| event["session_id"] == session_id)
+    );
+    assert!(
+        subscriber_events
+            .iter()
+            .all(|event| event["turn_id"] == turn_id)
+    );
+    assert_eq!(
+        subscriber_events.last().unwrap()["metadata"]["status"],
+        "completed"
+    );
+
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let matching_turns = detail["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|turn| turn["id"] == turn_id)
+        .collect::<Vec<_>>();
+    assert_eq!(matching_turns.len(), 1);
+    assert_eq!(matching_turns[0]["status"], "completed");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_socket_disconnect_does_not_truncate_persisted_turn_events() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut starter_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    starter_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain disconnect-safe Socartes websocket persistence.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"],
+                "config": { "debug_stream_delay_ms": 10 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = timeout(Duration::from_secs(2), starter_socket.next())
+        .await
+        .expect("first websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(first_text) = first_message else {
+        panic!("expected text websocket message");
+    };
+    let session_event: Value = serde_json::from_str(&first_text).unwrap();
+    assert_eq!(session_event["type"], "session");
+    let turn_id = session_event["turn_id"].as_str().unwrap().to_string();
+    starter_socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let (mut replay_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    replay_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut replay_events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), replay_socket.next())
+            .await
+            .expect("replay should finish after starter disconnect")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                replay_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        replay_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(replay_events.last().unwrap()["type"], "done");
+    assert_eq!(
+        replay_events.last().unwrap()["metadata"]["status"],
+        "completed"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_cancel_turn_broadcasts_cancelled_terminal_event_to_subscribers() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut starter_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    starter_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain a cancellable Socartes websocket turn.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"],
+                "config": { "debug_stream_delay_ms": 25 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = timeout(Duration::from_secs(2), starter_socket.next())
+        .await
+        .expect("first websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(first_text) = first_message else {
+        panic!("expected text websocket message");
+    };
+    let session_event: Value = serde_json::from_str(&first_text).unwrap();
+    assert_eq!(session_event["type"], "session");
+    let session_id = session_event["session_id"].as_str().unwrap().to_string();
+    let turn_id = session_event["turn_id"].as_str().unwrap().to_string();
+
+    let (mut cancel_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    cancel_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "cancel_turn",
+                "session_id": session_id,
+                "turn_id": turn_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = vec![session_event];
+    loop {
+        let message = timeout(Duration::from_secs(2), starter_socket.next())
+            .await
+            .expect("cancelled turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Turn cancelled"))
+    }));
+    assert_eq!(events.last().unwrap()["type"], "done");
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "cancelled");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "done" && event["metadata"]["status"] == "completed")
+            .count(),
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_cancel_turn_on_same_socket_interrupts_running_turn() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain same-socket cancellation for Socartes.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"],
+                "config": { "debug_stream_delay_ms": 25 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("first websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(first_text) = first_message else {
+        panic!("expected text websocket message");
+    };
+    let session_event: Value = serde_json::from_str(&first_text).unwrap();
+    let turn_id = session_event["turn_id"].as_str().unwrap().to_string();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "cancel_turn",
+                "turn_id": turn_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = vec![session_event];
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("same-socket cancellation should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "error" && event["metadata"]["status"] == "cancelled"
+        })
+    );
+    assert_eq!(events.last().unwrap()["type"], "done");
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "cancelled");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_cancel_stored_running_turn_appends_terminal_replay_events() {
+    let root = unique_test_knowledge_root();
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    let session_id = "stored-running-session";
+    let turn_id = "stored-running-turn";
+    fs::write(
+        session_root.join(format!("{session_id}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "id": session_id,
+            "session_id": session_id,
+            "title": "Stored running turn",
+            "created_at": 10.0,
+            "updated_at": 20.0,
+            "status": "running",
+            "preferences": {},
+            "messages": [{
+                "id": 1,
+                "session_id": session_id,
+                "role": "user",
+                "content": "Cancel this stored turn",
+                "events": [],
+                "metadata": { "turn_id": turn_id },
+                "created_at": 10.0
+            }],
+            "active_turn_id": turn_id,
+            "active_turns": [{
+                "id": turn_id,
+                "session_id": session_id,
+                "status": "running",
+                "started_at": 20.0
+            }],
+            "turns": [{
+                "id": turn_id,
+                "session_id": session_id,
+                "status": "running",
+                "started_at": 20.0,
+                "completed_at": null,
+                "event_count": 2
+            }],
+            "turn_events": {
+                turn_id: [
+                    {
+                        "type": "session",
+                        "source": "turn_runtime",
+                        "stage": "",
+                        "content": "",
+                        "metadata": {"session_id": session_id, "turn_id": turn_id},
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "seq": 1,
+                        "timestamp": 20.0
+                    },
+                    {
+                        "type": "stage_start",
+                        "source": "planner",
+                        "stage": "planner",
+                        "content": "Stored running event",
+                        "metadata": {},
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "seq": 2,
+                        "timestamp": 21.0
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut cancel_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    cancel_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "cancel_turn",
+                "turn_id": turn_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let (mut replay_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    replay_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut replay_events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), replay_socket.next())
+            .await
+            .expect("stored cancellation should replay terminal events")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                replay_events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    assert_eq!(
+        replay_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(replay_events[2]["type"], "error");
+    assert_eq!(replay_events[2]["metadata"]["status"], "cancelled");
+    assert_eq!(replay_events[3]["type"], "done");
+    assert_eq!(replay_events[3]["metadata"]["status"], "cancelled");
+
+    let detail = serde_json::from_str::<Value>(
+        &fs::read_to_string(session_root.join(format!("{session_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(detail["turns"][0]["status"], "cancelled");
+    assert_eq!(detail["turns"][0]["event_count"], 4);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_regenerate_reuses_last_user_without_duplicating_message() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let original_question = "Explain the amber archive rule from the prior Socartes turn.";
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": original_question,
+                        "language": "en",
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "tools": ["rag"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let first_turn = json_response(turn_response).await;
+    let session_id = first_turn["session_id"].as_str().unwrap().to_string();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate",
+                "session_id": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("regenerate should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    server.abort();
+    let session_event = events
+        .iter()
+        .find(|event| event["type"] == "session")
+        .expect("session event");
+    assert_eq!(session_event["metadata"]["regenerate"], true);
+    assert!(
+        session_event["metadata"]["regenerated_from_message_id"]
+            .as_u64()
+            .is_some()
+    );
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert!(
+        content_event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(original_question))
+    );
+    assert!(
+        !content_event["content"]
+            .as_str()
+            .unwrap()
+            .contains("Regenerate the previous Socartes answer")
+    );
+
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let messages = detail["messages"].as_array().unwrap();
+    let user_messages = messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect::<Vec<_>>();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(assistant_messages.len(), 1);
+    assert_eq!(user_messages[0]["content"], original_question);
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
