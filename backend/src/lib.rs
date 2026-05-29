@@ -5013,6 +5013,9 @@ struct ChatRuntimeSelection {
 struct ChatProviderResponse {
     content: Option<String>,
     tool_calls: Vec<Value>,
+    usage: Option<Value>,
+    reasoning_content: Option<String>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5648,8 +5651,40 @@ fn parse_chat_completion_content(payload: &Value) -> Option<String> {
     }
 }
 
+fn parse_chat_textish_field(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => (!text.trim().is_empty()).then(|| text.clone()),
+        Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part["text"].as_str())
+                        .or_else(|| part["content"].as_str())
+                        .or_else(|| part["summary"].as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.trim().is_empty()).then_some(joined)
+        }
+        Value::Object(_) => value["text"]
+            .as_str()
+            .or_else(|| value["content"].as_str())
+            .or_else(|| value["summary"].as_str())
+            .map(ToString::to_string)
+            .filter(|text| !text.trim().is_empty()),
+        _ => None,
+    }
+}
+
+fn parse_chat_reasoning_content(message: &Value) -> Option<String> {
+    parse_chat_textish_field(&message["reasoning_content"])
+        .or_else(|| parse_chat_textish_field(&message["reasoning"]))
+}
+
 fn parse_chat_completion_response(payload: &Value) -> Option<ChatProviderResponse> {
-    let message = &payload["choices"].as_array()?.first()?["message"];
+    let choice = payload["choices"].as_array()?.first()?;
+    let message = &choice["message"];
     let content = parse_chat_completion_content(payload);
     let tool_calls = message["tool_calls"]
         .as_array()
@@ -5664,6 +5699,9 @@ fn parse_chat_completion_response(payload: &Value) -> Option<ChatProviderRespons
     Some(ChatProviderResponse {
         content,
         tool_calls,
+        usage: (!payload["usage"].is_null()).then(|| payload["usage"].clone()),
+        reasoning_content: parse_chat_reasoning_content(message),
+        finish_reason: choice["finish_reason"].as_str().map(ToString::to_string),
     })
 }
 
@@ -10788,6 +10826,21 @@ fn assistant_tool_call_message(response: &ChatProviderResponse, tool_calls: &[Va
     })
 }
 
+fn merge_chat_provider_response_metadata(metadata: &mut Value, response: &ChatProviderResponse) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    if let Some(usage) = response.usage.as_ref() {
+        object.insert("usage".to_string(), usage.clone());
+    }
+    if let Some(reasoning_content) = response.reasoning_content.as_ref() {
+        object.insert("reasoning_content".to_string(), json!(reasoning_content));
+    }
+    if let Some(finish_reason) = response.finish_reason.as_ref() {
+        object.insert("finish_reason".to_string(), json!(finish_reason));
+    }
+}
+
 fn plugin_capability_names() -> Vec<&'static str> {
     vec![
         "chat",
@@ -12782,6 +12835,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
                     "provider": selection.binding.as_str()
                 });
                 let final_answer = if response.tool_calls.is_empty() {
+                    merge_chat_provider_response_metadata(&mut metadata, &response);
                     response.content.clone().ok_or_else(|| {
                         "Chat completion response did not include assistant content".to_string()
                     })
@@ -12817,10 +12871,13 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
                         },
                     );
                     match call_chat_completion_provider(selection, body).await {
-                        Ok(final_response) => final_response.content.clone().ok_or_else(|| {
-                            "Chat completion response after tool execution did not include assistant content"
-                                .to_string()
-                        }),
+                        Ok(final_response) => {
+                            merge_chat_provider_response_metadata(&mut metadata, &final_response);
+                            final_response.content.clone().ok_or_else(|| {
+                                "Chat completion response after tool execution did not include assistant content"
+                                    .to_string()
+                            })
+                        }
                         Err(error) => Err(error),
                     }
                 };
@@ -13686,7 +13743,7 @@ fn persist_chat_turn(
             .cloned()
             .collect::<Vec<_>>(),
         "attachments": [],
-        "metadata": { "turn_id": turn_id },
+        "metadata": assistant_message_metadata(turn_id, events),
         "created_at": now
     });
 
@@ -13724,6 +13781,25 @@ fn persist_chat_turn(
     }
 
     write_session(state, session_id, &session)
+}
+
+fn assistant_message_metadata(turn_id: &str, events: &[Value]) -> Value {
+    let mut metadata = json!({ "turn_id": turn_id });
+    let Some(content_event_metadata) = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["metadata"].as_object())
+    else {
+        return metadata;
+    };
+    let Some(object) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    for (key, value) in content_event_metadata {
+        object.insert(key.clone(), value.clone());
+    }
+    object.insert("turn_id".to_string(), json!(turn_id));
+    metadata
 }
 
 fn final_turn_status(events: &[Value]) -> String {

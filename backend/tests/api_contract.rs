@@ -5347,6 +5347,134 @@ async fn chat_ws_start_turn_uses_selected_openai_compatible_llm() {
 }
 
 #[tokio::test]
+async fn chat_ws_start_turn_preserves_selected_llm_usage_and_reasoning_metadata() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-reasoning-test",
+        "object": "chat.completion",
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18
+        },
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Visible answer from the selected provider.",
+                "reasoning_content": "Hidden provider reasoning must stay metadata-only."
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "Use selected provider response metadata.",
+        "language": "en",
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_result = json_response(chat_response).await;
+    let session_id = chat_result["session_id"].as_str().unwrap();
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    drop(recorded);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(
+        assistant["content"],
+        "Visible answer from the selected provider."
+    );
+    assert!(
+        !assistant["content"]
+            .as_str()
+            .unwrap()
+            .contains("Hidden provider reasoning")
+    );
+    assert_eq!(assistant["metadata"]["usage"]["total_tokens"], 18);
+    assert_eq!(
+        assistant["metadata"]["reasoning_content"],
+        "Hidden provider reasoning must stay metadata-only."
+    );
+    assert_eq!(assistant["metadata"]["finish_reason"], "stop");
+
+    let content_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "Visible answer from the selected provider."
+    );
+    assert_eq!(content_event["metadata"]["usage"]["prompt_tokens"], 11);
+    assert_eq!(content_event["metadata"]["usage"]["completion_tokens"], 7);
+    assert_eq!(content_event["metadata"]["usage"]["total_tokens"], 18);
+    assert_eq!(
+        content_event["metadata"]["reasoning_content"],
+        "Hidden provider reasoning must stay metadata-only."
+    );
+    assert_eq!(content_event["metadata"]["finish_reason"], "stop");
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_start_turn_injects_text_attachment_into_selected_llm() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
