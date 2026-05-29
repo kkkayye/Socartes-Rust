@@ -5347,6 +5347,142 @@ async fn chat_ws_start_turn_uses_selected_openai_compatible_llm() {
 }
 
 #[tokio::test]
+async fn chat_ws_start_turn_injects_text_attachment_into_selected_llm() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-attachment-test",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The attached note says the secret rubric phrase is amber lattice."
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "Answer using the attached note.",
+        "language": "en",
+        "attachments": [{
+            "id": "note-1",
+            "type": "file",
+            "filename": "note.txt",
+            "mime_type": "text/plain",
+            "base64": "U2VjcmV0IHJ1YnJpYyBwaHJhc2U6IGFtYmVyIGxhdHRpY2Uu"
+        }],
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_result = json_response(chat_response).await;
+    let session_id = chat_result["session_id"].as_str().unwrap();
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    let user_message = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("user message sent to selected LLM");
+    let effective_content = user_message["content"].as_str().unwrap();
+    assert!(effective_content.contains("[Attached Documents]"));
+    assert!(effective_content.contains("note.txt"));
+    assert!(effective_content.contains("Secret rubric phrase: amber lattice."));
+    assert!(effective_content.contains("[User Question]"));
+    assert!(effective_content.contains("Answer using the attached note."));
+    drop(recorded);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("persisted user message");
+    assert_eq!(user["content"], "Answer using the attached note.");
+    let attachments = user["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["id"], "note-1");
+    assert_eq!(attachments[0]["filename"], "note.txt");
+    assert_eq!(attachments[0]["mime_type"], "text/plain");
+    assert_eq!(attachments[0]["base64"], "");
+    assert_eq!(
+        attachments[0]["url"],
+        format!("/api/attachments/{session_id}/note-1/note.txt")
+    );
+    assert!(
+        attachments[0]["extracted_text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Secret rubric phrase: amber lattice."))
+    );
+
+    let attachment_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/attachments/{session_id}/note-1/note.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attachment_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        text_response(attachment_response).await,
+        "Secret rubric phrase: amber lattice."
+    );
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_start_turn_executes_selected_llm_tool_calls_before_final_answer() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![

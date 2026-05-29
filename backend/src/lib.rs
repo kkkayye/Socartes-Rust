@@ -20,6 +20,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, patch, post, put},
 };
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -5354,6 +5355,207 @@ fn chat_history_messages(state: &AppState, session_id: &str, limit: usize) -> Ve
         history = history.split_off(history.len() - limit);
     }
     history
+}
+
+#[derive(Debug, Clone)]
+struct PreparedChatAttachment {
+    filename: String,
+    text: String,
+}
+
+fn prepare_chat_turn_payload(
+    state: &AppState,
+    session_id: &str,
+    payload: &Value,
+    content: &str,
+) -> (Value, String) {
+    let (attachments, documents) = prepare_chat_attachments(state, session_id, payload);
+    let mut persistence_payload = payload.clone();
+    persistence_payload["attachments"] = attachments;
+    let effective_content = chat_content_with_attached_documents(content, &documents);
+    (persistence_payload, effective_content)
+}
+
+fn prepare_chat_attachments(
+    state: &AppState,
+    session_id: &str,
+    payload: &Value,
+) -> (Value, Vec<PreparedChatAttachment>) {
+    let Some(items) = payload["attachments"].as_array() else {
+        return (json!([]), Vec::new());
+    };
+    let mut sanitized = Vec::new();
+    let mut documents = Vec::new();
+    for (index, attachment) in items.iter().enumerate() {
+        let Some(object) = attachment.as_object() else {
+            continue;
+        };
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(coerce_attachment_component)
+            .unwrap_or_else(|| format!("att-{}", index + 1));
+        let filename = object
+            .get("filename")
+            .or_else(|| object.get("name"))
+            .and_then(Value::as_str)
+            .and_then(coerce_attachment_filename)
+            .unwrap_or_else(|| format!("attachment-{}.txt", index + 1));
+        let mime_type = object
+            .get("mime_type")
+            .or_else(|| object.get("mimeType"))
+            .or_else(|| object.get("type"))
+            .and_then(Value::as_str)
+            .filter(|value| value.contains('/'))
+            .map(ToString::to_string)
+            .unwrap_or_else(|| output_mime_type(FsPath::new(&filename)).to_string());
+        let decoded = object
+            .get("base64")
+            .or_else(|| object.get("data"))
+            .and_then(Value::as_str)
+            .and_then(decode_attachment_base64);
+        if let Some(bytes) = decoded.as_deref() {
+            let _ = write_chat_attachment_file(state, session_id, &id, &filename, bytes);
+        }
+
+        let extracted_text = decoded
+            .as_deref()
+            .and_then(|bytes| extract_chat_attachment_text(&filename, &mime_type, bytes))
+            .or_else(|| {
+                object
+                    .get("extracted_text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default();
+
+        if !extracted_text.trim().is_empty() {
+            documents.push(PreparedChatAttachment {
+                filename: filename.clone(),
+                text: extracted_text.clone(),
+            });
+        }
+
+        let mut next = Value::Object(object.clone());
+        next["id"] = json!(id);
+        next["filename"] = json!(filename);
+        next["mime_type"] = json!(mime_type);
+        next["base64"] = json!("");
+        next["url"] = json!(format!(
+            "/api/attachments/{}/{}/{}",
+            percent_encode_path_segment(session_id),
+            percent_encode_path_segment(next["id"].as_str().unwrap_or("")),
+            percent_encode_path_segment(next["filename"].as_str().unwrap_or(""))
+        ));
+        if let Some(bytes) = decoded.as_deref() {
+            next["size_bytes"] = json!(bytes.len());
+        }
+        if !extracted_text.trim().is_empty() {
+            next["extracted_text"] = json!(extracted_text);
+        }
+        sanitized.push(next);
+    }
+    (Value::Array(sanitized), documents)
+}
+
+fn decode_attachment_base64(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let data = if let Some((prefix, data)) = trimmed.split_once(',') {
+        if prefix.to_ascii_lowercase().contains(";base64") {
+            data.trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    general_purpose::STANDARD.decode(data).ok()
+}
+
+fn write_chat_attachment_file(
+    state: &AppState,
+    session_id: &str,
+    attachment_id: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), std::io::Error> {
+    let dir = state.attachment_root.join(session_id);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(format!("{attachment_id}_{filename}")), bytes)
+}
+
+fn extract_chat_attachment_text(filename: &str, mime_type: &str, bytes: &[u8]) -> Option<String> {
+    let extension = FsPath::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let text_like_extension = matches!(
+        extension.as_str(),
+        "txt"
+            | "text"
+            | "md"
+            | "markdown"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "htm"
+            | "log"
+            | "py"
+            | "rs"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "css"
+            | "sql"
+            | "sh"
+            | "zsh"
+    );
+    if !text_like_extension && !mime_type.to_ascii_lowercase().starts_with("text/") {
+        return None;
+    }
+    let (text, _, had_errors) = encoding_rs::UTF_8.decode(bytes);
+    if had_errors {
+        return None;
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn chat_content_with_attached_documents(
+    content: &str,
+    documents: &[PreparedChatAttachment],
+) -> String {
+    if documents.is_empty() {
+        return content.to_string();
+    }
+    let mut effective = String::from("[Attached Documents]\n");
+    for document in documents.iter().take(8) {
+        effective.push_str("Filename: ");
+        effective.push_str(&document.filename);
+        effective.push('\n');
+        effective.push_str(&truncate_for_prompt(&document.text, 4000));
+        effective.push_str("\n\n");
+    }
+    effective.push_str("[User Question]\n");
+    effective.push_str(content);
+    effective
 }
 
 fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
@@ -12389,6 +12591,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         .chat_runtime
         .register_turn(&turn.turn_id, &turn.session_id)
         .await;
+    let persistence_payload = &turn.persistence_payload;
     let delay_ms = payload["config"]["debug_stream_delay_ms"]
         .as_u64()
         .unwrap_or_default();
@@ -12401,7 +12604,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if live_turn.cancel_requested.load(Ordering::SeqCst) {
             break;
         }
-        if publish_chat_event(state, &payload, &live_turn, event.clone())
+        if publish_chat_event(state, persistence_payload, &live_turn, event.clone())
             .await
             .is_err()
         {
@@ -12411,7 +12614,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if event["type"] == "done" {
             let _ = persist_chat_turn(
                 state,
-                &payload,
+                persistence_payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &turn.trace,
@@ -12457,12 +12660,12 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
             ),
         ];
         for event in cancel_events {
-            let _ = publish_chat_event(state, &payload, &live_turn, event.clone()).await;
+            let _ = publish_chat_event(state, persistence_payload, &live_turn, event.clone()).await;
             delivered_events.push(event.clone());
             if event["type"] == "done" {
                 let _ = persist_cancelled_chat_turn(
                     state,
-                    &payload,
+                    persistence_payload,
                     &turn.session_id,
                     &turn.turn_id,
                     &delivered_events,
@@ -12476,7 +12679,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         if !final_persisted {
             let _ = persist_cancelled_chat_turn(
                 state,
-                &payload,
+                persistence_payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &delivered_events,
@@ -12485,7 +12688,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
     } else if !final_persisted {
         let _ = persist_chat_turn(
             state,
-            &payload,
+            persistence_payload,
             &turn.session_id,
             &turn.turn_id,
             &turn.trace,
@@ -12499,7 +12702,7 @@ async fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String
     let turn = build_chat_turn(state, payload).await;
     let _ = persist_chat_turn(
         state,
-        payload,
+        &turn.persistence_payload,
         &turn.session_id,
         &turn.turn_id,
         &turn.trace,
@@ -12511,6 +12714,7 @@ async fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String
 struct BuiltChatTurn {
     session_id: String,
     turn_id: String,
+    persistence_payload: Value,
     trace: StudyTrace,
     events: Vec<Value>,
 }
@@ -12525,15 +12729,18 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
     let turn_id = format!("rust-turn-{}", unique_id());
+    let (persistence_payload, effective_content) =
+        prepare_chat_turn_payload(state, &session_id, payload, content);
     let learner_context = payload["language"]
         .as_str()
         .map(|language| format!("Frontend language: {language}"))
         .unwrap_or_default();
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
     let enabled_tools = requested_chat_tool_names(payload);
-    let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases).await;
+    let retrieved_context =
+        retrieve_chat_context(state, &effective_content, &knowledge_bases).await;
     let mut trace = SocartesOrchestrator::new().run_with_retrieved_context(
-        content,
+        &effective_content,
         &learner_context,
         retrieved_context,
     );
@@ -12558,7 +12765,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             selection,
             state,
             &session_id,
-            content,
+            &effective_content,
             &learner_context,
             &trace,
             ChatCompletionBodyOptions {
@@ -12585,7 +12792,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
                             state,
                             &enabled_tools,
                             &knowledge_bases,
-                            content,
+                            &effective_content,
                             &tool_calls,
                         )
                         .await;
@@ -12601,7 +12808,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
                         selection,
                         state,
                         &session_id,
-                        content,
+                        &effective_content,
                         &learner_context,
                         &trace,
                         ChatCompletionBodyOptions {
@@ -12770,6 +12977,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
     BuiltChatTurn {
         session_id,
         turn_id,
+        persistence_payload,
         trace,
         events,
     }
