@@ -259,6 +259,47 @@ async fn spawn_embedding_request_recorder(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn spawn_status_request_recorder(
+    status: http::StatusCode,
+    response: Value,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let response = response.clone();
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                axum::response::IntoResponse::into_response((status, axum::Json(response)))
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
 async fn spawn_semantic_embedding_mock() -> (
     String,
     Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -347,6 +388,68 @@ fn embedding_test_catalog(base_url: &str) -> Value {
                         ]
                     }
                 ]
+            }
+        }
+    })
+}
+
+fn llm_test_catalog(base_url: &str) -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "llm": {
+                "active_profile_id": "mock-llm",
+                "active_model_id": "mock-model",
+                "profiles": [{
+                    "id": "mock-llm",
+                    "name": "Mock LLM",
+                    "binding": "openai",
+                    "base_url": base_url,
+                    "api_key": "llm-key",
+                    "api_version": "",
+                    "extra_headers": {
+                        "x-socartes-test": "llm-chat"
+                    },
+                    "models": [{
+                        "id": "mock-model",
+                        "name": "Mock Chat Model",
+                        "model": "provider-chat-model",
+                        "context_window": "8192"
+                    }]
+                }]
+            },
+            "embedding": {
+                "active_profile_id": "socartes-rust-embedding",
+                "active_model_id": "deterministic-embedding",
+                "profiles": [{
+                    "id": "socartes-rust-embedding",
+                    "name": "Socartes Rust Embedding",
+                    "binding": "openai",
+                    "base_url": "local://socartes-rust",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-embedding",
+                        "name": "Deterministic Embedding",
+                        "model": "deterministic-embedding",
+                        "dimension": "64"
+                    }]
+                }]
+            },
+            "search": {
+                "active_profile_id": "duckduckgo-local",
+                "profiles": [{
+                    "id": "duckduckgo-local",
+                    "name": "DuckDuckGo Local",
+                    "provider": "duckduckgo",
+                    "base_url": "",
+                    "api_key": "",
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
             }
         }
     })
@@ -5006,6 +5109,277 @@ async fn chat_ws_start_turn_rejects_unknown_llm_selection_without_creating_turn(
     assert_eq!(detail["preferences"], json!({}));
 
     server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_uses_selected_openai_compatible_llm() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Provider grounded answer from the selected mock LLM."
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Use the selected provider for this chat turn.",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("LLM-backed turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "Provider grounded answer from the selected mock LLM."
+    );
+    assert_eq!(content_event["metadata"]["model"], "provider-chat-model");
+    assert_eq!(content_event["metadata"]["profile_id"], "mock-llm");
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(recorded[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    assert_eq!(recorded[0]["payload"]["stream"], false);
+    let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Use the selected provider"))
+    }));
+    drop(recorded);
+
+    let session_id = events[0]["session_id"].as_str().unwrap().to_string();
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(
+        assistant["content"],
+        "Provider grounded answer from the selected mock LLM."
+    );
+    assert_eq!(
+        detail["preferences"]["llm_selection"],
+        json!({
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        })
+    );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_reports_selected_llm_provider_failure() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_status_request_recorder(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": {"message": "provider down"}}),
+    )
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "This provider failure should not be marked completed.",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("failed LLM-backed turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let error_event = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("terminal provider error");
+    assert_eq!(error_event["metadata"]["turn_terminal"], true);
+    assert_eq!(error_event["metadata"]["status"], "failed");
+    assert!(
+        error_event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("HTTP 500"))
+    );
+    assert!(!events.iter().any(|event| event["type"] == "content"));
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "failed");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    drop(recorded);
+
+    let session_id = events[0]["session_id"].as_str().unwrap().to_string();
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["status"], "failed");
+    assert_eq!(detail["turns"][0]["status"], "failed");
+    assert_eq!(
+        detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user"]
+    );
+
+    server.abort();
+    llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 

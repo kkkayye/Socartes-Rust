@@ -4996,6 +4996,18 @@ fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<Stri
 }
 
 #[derive(Debug, Clone)]
+struct ChatRuntimeSelection {
+    profile_id: String,
+    model_id: String,
+    binding: String,
+    base_url: String,
+    api_key: String,
+    api_version: String,
+    extra_headers: BTreeMap<String, String>,
+    model: String,
+}
+
+#[derive(Debug, Clone)]
 struct EmbeddingRuntimeSelection {
     binding: String,
     base_url: String,
@@ -5006,6 +5018,105 @@ struct EmbeddingRuntimeSelection {
     dimension: Option<i64>,
     send_dimensions: bool,
     supported_dimensions: Vec<i64>,
+}
+
+fn active_chat_selection(
+    catalog: &Value,
+    selection_value: &Value,
+) -> Result<Option<ChatRuntimeSelection>, String> {
+    let service = &catalog["services"]["llm"];
+    let profiles = service["profiles"].as_array().ok_or_else(|| {
+        "No active LLM model is configured. Please set it in Settings > Catalog.".to_string()
+    })?;
+    let explicit_selection = selection_value.as_object();
+    let requested_profile_id = explicit_selection
+        .map(|selection| llm_selection_field(selection, "profile_id"))
+        .unwrap_or_default();
+    let requested_model_id = explicit_selection
+        .map(|selection| llm_selection_field(selection, "model_id"))
+        .unwrap_or_default();
+    let active_profile_id = {
+        let requested = requested_profile_id.trim();
+        if requested.is_empty() {
+            service["active_profile_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            requested.to_string()
+        }
+    };
+    let profile = profiles
+        .iter()
+        .find(|profile| profile["id"].as_str() == Some(active_profile_id.as_str()))
+        .or_else(|| profiles.first())
+        .ok_or_else(|| {
+            "No active LLM model is configured. Please set it in Settings > Catalog.".to_string()
+        })?;
+    let profile_id = profile["id"]
+        .as_str()
+        .unwrap_or(active_profile_id.as_str())
+        .trim()
+        .to_string();
+    let models = profile["models"].as_array().ok_or_else(|| {
+        "No active LLM model is configured. Please set it in Settings > Catalog.".to_string()
+    })?;
+    let active_model_id = {
+        let requested = requested_model_id.trim();
+        if requested.is_empty() {
+            service["active_model_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            requested.to_string()
+        }
+    };
+    let model = models
+        .iter()
+        .find(|model| model["id"].as_str() == Some(active_model_id.as_str()))
+        .or_else(|| models.first())
+        .ok_or_else(|| {
+            "No active LLM model is configured. Please set it in Settings > Catalog.".to_string()
+        })?;
+    let model_id = model["id"]
+        .as_str()
+        .unwrap_or(active_model_id.as_str())
+        .trim()
+        .to_string();
+    let model_name = model["model"]
+        .as_str()
+        .or_else(|| model["name"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "No active LLM model is configured. Please set it in Settings > Catalog.".to_string()
+        })?;
+    if model_name == "deterministic-agent-loop" {
+        return Ok(None);
+    }
+    Ok(Some(ChatRuntimeSelection {
+        profile_id,
+        model_id,
+        binding: profile["binding"]
+            .as_str()
+            .unwrap_or("openai")
+            .trim()
+            .to_string(),
+        base_url: profile["base_url"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        api_key: profile["api_key"].as_str().unwrap_or("").trim().to_string(),
+        api_version: profile["api_version"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        extra_headers: parse_string_map_field(&profile["extra_headers"]),
+        model: model_name.to_string(),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -5118,6 +5229,197 @@ fn parse_string_map_field(value: &Value) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn chat_completion_endpoint(selection: &ChatRuntimeSelection) -> Result<String, String> {
+    let trimmed = selection.base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(
+            "No effective LLM endpoint resolved. Please configure base_url for the active profile."
+                .to_string(),
+        );
+    }
+    if trimmed.starts_with("local://") {
+        return Err("Selected LLM profile points to a local deterministic endpoint.".to_string());
+    }
+    if trimmed.ends_with("/chat/completions") {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("{trimmed}/chat/completions"))
+    }
+}
+
+fn chat_completion_body(
+    selection: &ChatRuntimeSelection,
+    state: &AppState,
+    session_id: &str,
+    content: &str,
+    learner_context: &str,
+    trace: &StudyTrace,
+) -> Value {
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": chat_system_prompt(learner_context, trace)
+    })];
+    messages.extend(chat_history_messages(state, session_id, 12));
+    messages.push(json!({
+        "role": "user",
+        "content": content
+    }));
+    json!({
+        "model": selection.model.as_str(),
+        "messages": messages,
+        "stream": false
+    })
+}
+
+fn chat_system_prompt(learner_context: &str, trace: &StudyTrace) -> String {
+    let mut prompt = String::from(
+        "You are Socartes, an agentic learning assistant. Answer the learner directly, cite or name retrieved course evidence when it is relevant, and do not invent facts outside the supplied context.",
+    );
+    if !learner_context.trim().is_empty() {
+        prompt.push_str("\n\nLearner context:\n");
+        prompt.push_str(learner_context.trim());
+    }
+    if !trace.retrieved_context.is_empty() {
+        prompt.push_str("\n\nRetrieved context:\n");
+        for chunk in trace.retrieved_context.iter().take(8) {
+            prompt.push_str("- ");
+            prompt.push_str(&chunk.source_id);
+            prompt.push_str(": ");
+            prompt.push_str(&truncate_for_prompt(&chunk.content, 900));
+            prompt.push('\n');
+        }
+    }
+    if !trace.tool_results.is_empty() {
+        prompt.push_str("\nTool observations:\n");
+        for result in trace.tool_results.iter().take(6) {
+            prompt.push_str("- ");
+            prompt.push_str(&result.adapter);
+            prompt.push('.');
+            prompt.push_str(&result.action);
+            prompt.push_str(": ");
+            prompt.push_str(&truncate_for_prompt(&result.output, 360));
+            prompt.push('\n');
+        }
+    }
+    prompt
+}
+
+fn chat_history_messages(state: &AppState, session_id: &str, limit: usize) -> Vec<Value> {
+    let Ok(session) = read_session(state, session_id) else {
+        return Vec::new();
+    };
+    let Some(messages) = session["messages"].as_array() else {
+        return Vec::new();
+    };
+    let mut history = messages
+        .iter()
+        .filter_map(|message| {
+            let role = message["role"].as_str()?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content = message["content"].as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "role": role,
+                "content": truncate_for_prompt(content, 6000)
+            }))
+        })
+        .collect::<Vec<_>>();
+    if history.len() > limit {
+        history = history.split_off(history.len() - limit);
+    }
+    history
+}
+
+fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+async fn call_chat_completion_provider(
+    selection: &ChatRuntimeSelection,
+    body: Value,
+) -> Result<String, String> {
+    let endpoint = chat_completion_endpoint(selection)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let request = apply_openai_compatible_request_headers(
+        request,
+        &selection.api_key,
+        &selection.api_version,
+        &selection.extra_headers,
+    );
+    let response = request
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {} from {endpoint}: {text}", status.as_u16()));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Invalid JSON response: {error}"))?;
+    parse_chat_completion_content(&payload)
+        .ok_or_else(|| "Chat completion response did not include assistant content".to_string())
+}
+
+fn apply_openai_compatible_request_headers(
+    mut request: reqwest::RequestBuilder,
+    api_key: &str,
+    api_version: &str,
+    extra_headers: &BTreeMap<String, String>,
+) -> reqwest::RequestBuilder {
+    if !api_key.is_empty() {
+        if api_version.is_empty() {
+            request = request.bearer_auth(api_key);
+        } else {
+            request = request
+                .query(&[("api-version", api_version)])
+                .header("api-key", api_key);
+        }
+    } else if !api_version.is_empty() {
+        request = request.query(&[("api-version", api_version)]);
+    }
+    for (name, value) in extra_headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    request
+}
+
+fn parse_chat_completion_content(payload: &Value) -> Option<String> {
+    let content = &payload["choices"].as_array()?.first()?["message"]["content"];
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part["text"].as_str())
+                        .or_else(|| part["content"].as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11950,11 +12252,66 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         .unwrap_or_default();
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
     let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases).await;
-    let trace = SocartesOrchestrator::new().run_with_retrieved_context(
+    let mut trace = SocartesOrchestrator::new().run_with_retrieved_context(
         content,
         &learner_context,
         retrieved_context,
     );
+    let chat_selection =
+        match active_chat_selection(&load_settings_catalog(state), &payload["llm_selection"]) {
+            Ok(selection) => selection,
+            Err(error) => {
+                trace.review.status = "configuration_error".to_string();
+                trace.review.approved = false;
+                trace.review.issues.push(CriticIssue {
+                    issue_type: "llm_configuration".to_string(),
+                    claim: "The selected LLM profile could not be resolved.".to_string(),
+                    instruction: error,
+                });
+                None
+            }
+        };
+    let mut provider_metadata = None;
+    let mut provider_error = None;
+    if let Some(selection) = chat_selection.as_ref() {
+        let body = chat_completion_body(
+            selection,
+            state,
+            &session_id,
+            content,
+            &learner_context,
+            &trace,
+        );
+        match call_chat_completion_provider(selection, body).await {
+            Ok(answer) => {
+                trace.final_answer = answer.clone();
+                trace.draft.content = answer;
+                provider_metadata = Some(json!({
+                    "profile_id": selection.profile_id.as_str(),
+                    "model_id": selection.model_id.as_str(),
+                    "model": selection.model.as_str(),
+                    "provider": selection.binding.as_str()
+                }));
+            }
+            Err(error) => {
+                trace.review.status = "provider_error".to_string();
+                trace.review.approved = false;
+                trace.review.issues.push(CriticIssue {
+                    issue_type: "llm_provider".to_string(),
+                    claim: "The selected LLM provider did not return a usable response."
+                        .to_string(),
+                    instruction: error.clone(),
+                });
+                provider_metadata = Some(json!({
+                    "profile_id": selection.profile_id.as_str(),
+                    "model_id": selection.model_id.as_str(),
+                    "model": selection.model.as_str(),
+                    "provider": selection.binding.as_str()
+                }));
+                provider_error = Some(error);
+            }
+        }
+    }
     let ids = StreamIds::new(&session_id, &turn_id);
     let mut session_metadata = json!({ "session_id": session_id, "turn_id": turn_id });
     if payload["config"]["_regenerate"].as_bool().unwrap_or(false) {
@@ -11967,7 +12324,17 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         session_metadata["superseded_turn_id"] = json!(superseded_turn_id);
     }
 
-    let events = vec![
+    let mut content_metadata = json!({ "citations": trace.draft.citations });
+    if let Some(metadata) = provider_metadata.as_ref()
+        && let (Some(content), Some(provider)) =
+            (content_metadata.as_object_mut(), metadata.as_object())
+    {
+        for (key, value) in provider {
+            content.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut events = vec![
         stream_event("session", "rust-backend", "", "", session_metadata, ids, 1),
         stream_event(
             "stage_start",
@@ -11996,16 +12363,47 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             ids,
             4,
         ),
-        stream_event(
+    ];
+
+    if let Some(error) = provider_error {
+        let mut error_metadata = json!({ "turn_terminal": true, "status": "failed" });
+        if let Some(metadata) = provider_metadata.as_ref()
+            && let (Some(error_meta), Some(provider)) =
+                (error_metadata.as_object_mut(), metadata.as_object())
+        {
+            for (key, value) in provider {
+                error_meta.insert(key.clone(), value.clone());
+            }
+        }
+        events.push(stream_event(
+            "error",
+            "executor",
+            "executor",
+            &error,
+            error_metadata,
+            ids,
+            5,
+        ));
+        events.push(stream_event(
+            "done",
+            "rust-backend",
+            "",
+            "",
+            json!({ "status": "failed" }),
+            ids,
+            6,
+        ));
+    } else {
+        events.push(stream_event(
             "content",
             "executor",
             "executor",
             &trace.final_answer,
-            json!({ "citations": trace.draft.citations }),
+            content_metadata,
             ids,
             5,
-        ),
-        stream_event(
+        ));
+        events.push(stream_event(
             "stage_end",
             "critic",
             "critic",
@@ -12013,8 +12411,8 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             json!({ "review": trace.review }),
             ids,
             6,
-        ),
-        stream_event(
+        ));
+        events.push(stream_event(
             "done",
             "rust-backend",
             "",
@@ -12022,8 +12420,8 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             json!({ "status": "completed" }),
             ids,
             7,
-        ),
-    ];
+        ));
+    }
 
     BuiltChatTurn {
         session_id,
@@ -12562,6 +12960,75 @@ fn persist_cancelled_chat_turn(
     write_session(state, session_id, &session)
 }
 
+fn persist_failed_chat_turn(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    events: &[Value],
+    status: &str,
+) -> Result<(), ApiError> {
+    let now = now_seconds();
+    let mut session = read_session(state, session_id).unwrap_or_else(|_| {
+        json!({
+            "id": session_id,
+            "session_id": session_id,
+            "title": title_from_content(payload["content"].as_str().unwrap_or("Socartes chat")),
+            "created_at": now,
+            "updated_at": now,
+            "status": status,
+            "preferences": {},
+            "messages": [],
+            "active_turns": []
+        })
+    });
+    let messages_len = session["messages"]
+        .as_array()
+        .map(|messages| messages.len())
+        .unwrap_or_default();
+    if should_persist_user_message(payload) {
+        let user_message = json!({
+            "id": messages_len + 1,
+            "session_id": session_id,
+            "role": "user",
+            "content": payload["content"].as_str().unwrap_or_default(),
+            "capability": payload["capability"].as_str().unwrap_or_default(),
+            "events": [],
+            "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
+            "metadata": { "turn_id": turn_id },
+            "created_at": now
+        });
+        if let Some(messages) = session["messages"].as_array_mut() {
+            messages.push(user_message);
+        } else {
+            session["messages"] = json!([user_message]);
+        }
+    }
+    session["updated_at"] = json!(now);
+    session["status"] = json!(status);
+    session["active_turns"] = json!([]);
+    session["active_turn_id"] = Value::Null;
+    session["preferences"] = chat_preferences_from_payload(payload);
+    let error_message = terminal_error_message(events);
+    let turn_record = json!({
+        "id": turn_id,
+        "session_id": session_id,
+        "status": status,
+        "error": error_message,
+        "started_at": now,
+        "completed_at": now,
+        "event_count": events.len()
+    });
+    upsert_turn_record(&mut session, turn_id, turn_record);
+    if !session["turn_events"].is_object() {
+        session["turn_events"] = Value::Object(Map::new());
+    }
+    if let Some(turn_events) = session["turn_events"].as_object_mut() {
+        turn_events.insert(turn_id.to_string(), Value::Array(events.to_vec()));
+    }
+    write_session(state, session_id, &session)
+}
+
 fn upsert_turn_record(session: &mut Value, turn_id: &str, turn_record: Value) {
     if let Some(turns) = session["turns"].as_array_mut() {
         if let Some(existing) = turns.iter_mut().find(|turn| turn["id"] == turn_id) {
@@ -12603,6 +13070,17 @@ fn persist_chat_turn(
     trace: &StudyTrace,
     events: &[Value],
 ) -> Result<(), ApiError> {
+    let final_status = final_turn_status(events);
+    if final_status != "completed" {
+        return persist_failed_chat_turn(
+            state,
+            payload,
+            session_id,
+            turn_id,
+            events,
+            &final_status,
+        );
+    }
     let now = now_seconds();
     let mut session = read_session(state, session_id).unwrap_or_else(|_| {
         json!({
@@ -12694,6 +13172,27 @@ fn persist_chat_turn(
     }
 
     write_session(state, session_id, &session)
+}
+
+fn final_turn_status(events: &[Value]) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "done")
+        .and_then(|event| event["metadata"]["status"].as_str())
+        .unwrap_or("completed")
+        .to_string()
+}
+
+fn terminal_error_message(events: &[Value]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event["type"] == "error" && event["metadata"]["turn_terminal"].as_bool() == Some(true)
+        })
+        .and_then(|event| event["content"].as_str())
+        .map(ToString::to_string)
 }
 
 fn should_persist_user_message(payload: &Value) -> bool {
