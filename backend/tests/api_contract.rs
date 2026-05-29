@@ -6259,6 +6259,92 @@ async fn vision_analyze_rest_route_matches_legacy_validation_contract() {
     );
     assert_eq!(image_payload["analysis_summary"]["commands_count"], 0);
 
+    let image_bytes = b"\x89PNG\r\n\x1a\nmetadata-only-test-image".to_vec();
+    let image_server = axum::Router::new()
+        .route(
+            "/image.png",
+            axum::routing::get({
+                let image_bytes = image_bytes.clone();
+                move || async move {
+                    (
+                        [(http::header::CONTENT_TYPE, "image/png")],
+                        image_bytes.clone(),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/note.txt",
+            axum::routing::get(|| async {
+                ([(http::header::CONTENT_TYPE, "text/plain")], "not an image")
+            }),
+        );
+    let image_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let image_addr = image_listener.local_addr().unwrap();
+    let image_task = tokio::spawn(async move {
+        axum::serve(image_listener, image_server).await.unwrap();
+    });
+
+    let image_url_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze image URL",
+                        "image_url": format!("http://{image_addr}/image.png")
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_url_response.status(), http::StatusCode::OK);
+    let image_url_payload = json_response(image_url_response).await;
+    assert_eq!(image_url_payload["has_image"], true);
+    assert_eq!(
+        image_url_payload["analysis_summary"]["input_source"],
+        "image_url"
+    );
+    assert_eq!(
+        image_url_payload["analysis_summary"]["mime_type"],
+        "image/png"
+    );
+    assert_eq!(
+        image_url_payload["analysis_summary"]["byte_count"],
+        image_bytes.len()
+    );
+
+    let unsupported_url_response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Analyze text URL",
+                        "image_url": format!("http://{image_addr}/note.txt")
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unsupported_url_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        json_response(unsupported_url_response).await["detail"],
+        "Unsupported image format: text/plain"
+    );
+    image_task.abort();
+
     let default_session_response = app()
         .oneshot(
             http::Request::builder()

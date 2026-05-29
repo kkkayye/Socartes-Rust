@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -7018,7 +7018,7 @@ async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
         .unwrap_or_else(|| format!("vision_{}", unique_id()));
     let image_base64 = payload["image_base64"].as_str().map(str::trim);
     let image_url = payload["image_url"].as_str().map(str::trim);
-    match resolve_vision_image_summary(image_base64, image_url) {
+    match resolve_vision_image_summary(image_base64, image_url).await {
         Ok(Some(image_summary)) => Json(json!({
             "session_id": session_id,
             "has_image": true,
@@ -7084,7 +7084,7 @@ async fn handle_vision_solve_socket(mut socket: WebSocket) {
     .await;
     let image_base64 = payload["image_base64"].as_str().map(str::trim);
     let image_url = payload["image_url"].as_str().map(str::trim);
-    let image_summary = match resolve_vision_image_summary(image_base64, image_url) {
+    let image_summary = match resolve_vision_image_summary(image_base64, image_url).await {
         Ok(Some(summary)) => summary,
         Ok(None) => {
             let _ = vision_ws_send(&mut socket, json!({"type": "no_image", "data": {}})).await;
@@ -7120,7 +7120,7 @@ async fn vision_ws_send(socket: &mut WebSocket, event: Value) -> Result<(), axum
     socket.send(Message::Text(event.to_string().into())).await
 }
 
-fn resolve_vision_image_summary(
+async fn resolve_vision_image_summary(
     image_base64: Option<&str>,
     image_url: Option<&str>,
 ) -> Result<Option<Value>, String> {
@@ -7144,17 +7144,84 @@ fn resolve_vision_image_summary(
         if !is_valid_vision_image_url(image_url) {
             return Err(format!("Invalid image URL: {image_url}"));
         }
+        let (byte_count, mime_type) = fetch_vision_image_from_url(image_url).await?;
         return Ok(Some(json!({
             "image_is_reference": false,
             "elements_count": 0,
             "commands_count": 0,
             "analysis_mode": "metadata_only",
             "input_source": "image_url",
-            "mime_type": guess_image_mime_from_url(image_url),
-            "byte_count": Value::Null
+            "mime_type": mime_type,
+            "byte_count": byte_count
         })));
     }
     Ok(None)
+}
+
+async fn fetch_vision_image_from_url(image_url: &str) -> Result<(usize, &'static str), String> {
+    const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+    const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|error| format!("Failed to download image: {error}"))?;
+    let response = client.get(image_url).send().await.map_err(|error| {
+        if error.is_timeout() {
+            format!("Image download timeout ({REQUEST_TIMEOUT_SECS}s)")
+        } else {
+            format!("Failed to download image: {error}")
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Failed to download image: HTTP {}",
+            status.as_u16()
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let effective_type = if content_type.is_empty() || content_type == "application/octet-stream" {
+        guess_image_mime_from_url(image_url).to_string()
+    } else {
+        content_type
+    };
+    if !is_supported_vision_image_mime(&effective_type) {
+        return Err(format!("Unsupported image format: {effective_type}"));
+    }
+    let mime_type = canonical_vision_image_mime(&effective_type);
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_IMAGE_SIZE as u64)
+    {
+        return Err("Image too large: >10.0MB (max 10MB)".to_string());
+    }
+    let bytes = response.bytes().await.map_err(|error| {
+        if error.is_timeout() {
+            format!("Image download timeout ({REQUEST_TIMEOUT_SECS}s)")
+        } else {
+            format!("Failed to download image: {error}")
+        }
+    })?;
+    if bytes.len() > MAX_IMAGE_SIZE {
+        return Err(format!(
+            "Image too large: {:.1}MB (max 10MB)",
+            bytes.len() as f64 / 1024.0 / 1024.0
+        ));
+    }
+    Ok((bytes.len(), mime_type))
 }
 
 fn parse_vision_image_data_uri(value: &str) -> Option<(&str, usize)> {

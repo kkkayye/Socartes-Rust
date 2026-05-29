@@ -108,7 +108,7 @@ python3 tools/api_parity_scan.py \
 - `/api/attachments/{session_id}/{attachment_id}/{filename}` chat attachment preview/download 兼容入口，并兼容旧扫描器看到的四段 alias 形态
 - `/api/v1/settings/sidebar/description`、`/api/v1/settings/sidebar/nav-order`、`/api/v1/settings/tour/status|complete|reopen` 旧设置和 tour 入口
 - `/api/v1/dashboard/recent`、`/api/v1/dashboard/{entry_id}`、`/api/v1/agent-config/agents*`、`/api/v1/solve/sessions*` legacy dashboard/agent-config/solve session 兼容入口
-- `/api/v1/vision/analyze` legacy REST surface：参数校验、无图请求、base64/url 输入优先级和 valid image metadata-only 降级响应兼容
+- `/api/v1/vision/analyze` legacy REST surface：参数校验、无图请求、base64/url 输入优先级、valid data URI metadata-only 降级响应、`image_url` 真实下载、HTTP status/content-type/10MB 大小限制和 unsupported format 错误兼容
 - `/api/v1/vision/solve` legacy WebSocket surface：真实握手、无图 `session -> no_image -> done` 事件，以及 valid image metadata-only `analysis_start -> bbox_complete -> analysis_complete -> ggbscript_complete -> reflection_complete -> analysis_message_complete -> answer_start -> done` 事件兼容
 
 已运行的验证：
@@ -127,7 +127,7 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract co_writer`：`3` 个 Co-Writer 文档、编辑、历史/tool-calls/export 契约测试通过
 - `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
-- `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、真实 WS 握手和事件序列契约测试通过
+- `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、REST image URL 下载/content-type 错误、真实 WS 握手和事件序列契约测试通过
 - `cargo test --test api_contract chat_ws_`：`8` 个 unified chat WebSocket 真实握手、turn event 持久化、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换契约测试通过
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
@@ -142,7 +142,7 @@ python3 tools/api_parity_scan.py \
 当前剩余高风险差距：
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
-- `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
+- `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、REST image URL 下载、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
 - parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界和本地 index-version 状态合同，但仍缺真实 LlamaIndex/embedding/vector search 语义；unified WS 已补 replay/live subscribe/cancel/regenerate 的协议级语义，但底层 turn 仍是 deterministic Rust agent loop，不是真实 Python ChatOrchestrator/LLM 后台任务；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
