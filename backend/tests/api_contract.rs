@@ -1121,6 +1121,178 @@ The lantern school rule says students must recite the blue theorem before openin
 }
 
 #[tokio::test]
+async fn knowledge_reindex_persists_chunk_index_and_rag_uses_indexed_chunks() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESCHUNKINDEXBOUNDARY";
+    let filler = "general classroom logistics without the target answer. ".repeat(35);
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+chunk-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"long-notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+{filler}\n\n\
+The cedar lantern unlock phrase is cobalt spiral, and the archive keeper writes it only in this late paragraph.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/chunk-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("chunk-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().expect("chunks array");
+    assert!(chunks.iter().any(|chunk| {
+        chunk["source"].as_str() == Some("long-notes.md")
+            && chunk["chunk_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("long-notes.md#chunk-"))
+            && chunk["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("cobalt spiral"))
+    }));
+
+    let plugin_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "What unlock phrase does the cedar lantern use?",
+                            "kb_name": "chunk-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    let sources = plugin["sources"].as_array().expect("sources array");
+    let source = sources.first().expect("indexed source");
+    assert_eq!(source["provider"], "llamaindex");
+    assert_eq!(source["source"], "long-notes.md");
+    assert!(
+        source["chunk_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("long-notes.md#chunk-"))
+    );
+    assert!(
+        source["content"]
+            .as_str()
+            .unwrap()
+            .contains("cobalt spiral")
+    );
+    assert!(
+        !source["content"]
+            .as_str()
+            .unwrap()
+            .contains("general classroom logistics")
+    );
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "What unlock phrase does the cedar lantern use?",
+        "language": "en",
+        "tools": ["rag"],
+        "knowledge_bases": ["chunk-course"]
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let session_id = json_response(chat_response).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    let sources_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("sources event");
+    let chat_sources = sources_event["metadata"]["sources"].as_array().unwrap();
+    assert!(chat_sources.iter().any(|source| {
+        source["source"].as_str() == Some("long-notes.md")
+            && source["chunk_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("long-notes.md#chunk-"))
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("cobalt spiral"))
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn attachment_preview_route_serves_local_chat_files_like_python_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

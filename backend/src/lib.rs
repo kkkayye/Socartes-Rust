@@ -38,6 +38,8 @@ const RUST_EMBEDDING_MODEL: &str = "deterministic-agent-loop";
 const RUST_EMBEDDING_DIMENSION: i64 = 0;
 const RUST_EMBEDDING_BASE_URL: &str = "local://socartes-rust";
 const RUST_EMBEDDING_API_VERSION: &str = "";
+const KNOWLEDGE_CHUNK_SIZE_WORDS: usize = 160;
+const KNOWLEDGE_CHUNK_OVERLAP_WORDS: usize = 30;
 const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] =
     &[".txt", ".md", ".markdown", ".pdf", ".json", ".csv"];
 const DEFAULT_SKILL_TAGS: &[&str] = &["style", "tool"];
@@ -80,6 +82,16 @@ pub struct RetrievalChunk {
     pub title: String,
     pub content: String,
     pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6029,12 +6041,54 @@ fn write_active_knowledge_index_version(
     })?;
     version["storage_path"] = json!(version_dir.to_string_lossy());
     version["version_path"] = json!(version_dir.to_string_lossy());
-    fs::write(version_dir.join("docstore.json"), "{}").map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to write index version sentinel: {error}"),
-        )
-    })?;
+
+    let chunks = build_knowledge_index_chunks(state, name)?;
+    let chunk_index = json!({
+        "provider": DEFAULT_RAG_PROVIDER,
+        "signature": version["signature"].clone(),
+        "chunk_size_words": KNOWLEDGE_CHUNK_SIZE_WORDS,
+        "chunk_overlap_words": KNOWLEDGE_CHUNK_OVERLAP_WORDS,
+        "chunks": chunks
+    });
+    write_pretty_json(
+        &version_dir.join("chunks.json"),
+        &chunk_index,
+        "chunk index",
+    )?;
+    write_pretty_json(
+        &version_dir.join("docstore.json"),
+        &json!({ "docstore/data": chunk_index["chunks"].clone() }),
+        "index version docstore",
+    )?;
+    write_pretty_json(
+        &version_dir.join("index_store.json"),
+        &json!({ "index_store/data": { "root": "socartes-rust-lexical-index" } }),
+        "index version index store",
+    )?;
+    write_pretty_json(
+        &version_dir.join("default__vector_store.json"),
+        &json!({
+            "embedding_dict": {},
+            "metadata_dict": {},
+            "text_id_to_ref_doc_id": {}
+        }),
+        "index version vector store",
+    )?;
+    write_pretty_json(
+        &version_dir.join("graph_store.json"),
+        &json!({ "graph_dict": {} }),
+        "index version graph store",
+    )?;
+    write_pretty_json(
+        &version_dir.join("image__vector_store.json"),
+        &json!({
+            "embedding_dict": {},
+            "metadata_dict": {},
+            "text_id_to_ref_doc_id": {}
+        }),
+        "index version image vector store",
+    )?;
+
     let bytes = serde_json::to_vec_pretty(&version).map_err(|error| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6048,6 +6102,91 @@ fn write_active_knowledge_index_version(
         )
     })?;
     Ok(version)
+}
+
+fn write_pretty_json(path: &FsPath, value: &Value, label: &str) -> Result<(), ApiError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize {label}: {error}"),
+        )
+    })?;
+    fs::write(path, bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write {label}: {error}"),
+        )
+    })
+}
+
+fn build_knowledge_index_chunks(state: &AppState, name: &str) -> Result<Vec<Value>, ApiError> {
+    let mut chunks = Vec::new();
+    let files_dir = knowledge_files_dir(state, name);
+    let entries = fs::read_dir(&files_dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read knowledge files for indexing: {error}"),
+        )
+    })?;
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            let filename = entry.file_name().to_str().map(ToString::to_string)?;
+            is_supported_knowledge_file(&filename).then_some((filename, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (filename, path) in files {
+        let bytes = fs::read(&path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read knowledge file for indexing: {error}"),
+            )
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        for (index, content) in chunk_text_by_words(&text).into_iter().enumerate() {
+            let chunk_id = format!("{filename}#chunk-{:04}", index + 1);
+            chunks.push(json!({
+                "source_id": format!("{name}/{chunk_id}"),
+                "title": filename,
+                "content": content,
+                "source": filename,
+                "page": Value::Null,
+                "chunk_id": chunk_id,
+                "provider": DEFAULT_RAG_PROVIDER
+            }));
+        }
+    }
+
+    Ok(chunks)
+}
+
+fn chunk_text_by_words(text: &str) -> Vec<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= KNOWLEDGE_CHUNK_SIZE_WORDS {
+        return vec![normalized];
+    }
+
+    let step = KNOWLEDGE_CHUNK_SIZE_WORDS
+        .saturating_sub(KNOWLEDGE_CHUNK_OVERLAP_WORDS)
+        .max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < words.len() {
+        let end = (start + KNOWLEDGE_CHUNK_SIZE_WORDS).min(words.len());
+        chunks.push(words[start..end].join(" "));
+        if end == words.len() {
+            break;
+        }
+        start += step;
+    }
+    chunks
 }
 
 fn read_knowledge_metadata(state: &AppState, name: &str) -> Option<Value> {
@@ -7681,7 +7820,12 @@ fn plugin_tool_result(state: &AppState, tool_name: &str, params: Value) -> Resul
                             "source_id": chunk.source_id,
                             "title": chunk.title,
                             "content": chunk.content,
-                            "confidence": chunk.confidence
+                            "confidence": chunk.confidence,
+                            "provider": chunk.provider.as_deref().unwrap_or(DEFAULT_RAG_PROVIDER),
+                            "source": chunk.source,
+                            "page": chunk.page,
+                            "chunk_id": chunk.chunk_id,
+                            "score": chunk.score
                         })
                     })
                     .collect(),
@@ -10812,7 +10956,7 @@ fn retrieve_chat_context(
         }
     }
 
-    dedupe_chunks(chunks).into_iter().take(4).collect()
+    dedupe_chunks(chunks).into_iter().take(5).collect()
 }
 
 fn retrieve_uploaded_knowledge_base(
@@ -10822,6 +10966,10 @@ fn retrieve_uploaded_knowledge_base(
 ) -> Vec<RetrievalChunk> {
     if !knowledge_base_exists(state, name) {
         return Vec::new();
+    }
+
+    if let Some(chunks) = retrieve_indexed_knowledge_base(state, goal, name) {
+        return chunks;
     }
 
     let query_terms = tokenize(goal);
@@ -10863,6 +11011,11 @@ fn retrieve_uploaded_knowledge_base(
                 title: format!("{name} / {filename}"),
                 content: excerpt,
                 confidence: confidence_for_score(score).to_string(),
+                source: Some(filename),
+                page: None,
+                chunk_id: None,
+                score: Some(score as f64),
+                provider: Some(DEFAULT_RAG_PROVIDER.to_string()),
             },
         ));
     }
@@ -10874,6 +11027,85 @@ fn retrieve_uploaded_knowledge_base(
             .then_with(|| left.1.source_id.cmp(&right.1.source_id))
     });
     scored.into_iter().take(3).map(|(_, chunk)| chunk).collect()
+}
+
+fn retrieve_indexed_knowledge_base(
+    state: &AppState,
+    goal: &str,
+    name: &str,
+) -> Option<Vec<RetrievalChunk>> {
+    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
+    let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
+    let active = find_active_index_version(&versions)?;
+    let version_dir = active["version_path"]
+        .as_str()
+        .or_else(|| active["storage_path"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            knowledge_base_dir(state, name).join(active["version"].as_str().unwrap_or("version-1"))
+        });
+    let chunk_index_path = version_dir.join("chunks.json");
+    let Ok(text) = fs::read_to_string(chunk_index_path) else {
+        return Some(Vec::new());
+    };
+    let Ok(index) = serde_json::from_str::<Value>(&text) else {
+        return Some(Vec::new());
+    };
+    let query_terms = tokenize(goal);
+    if query_terms.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut scored = index["chunks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|chunk| {
+            let content = chunk["content"].as_str()?;
+            let title = chunk["title"].as_str().unwrap_or_default();
+            let source = chunk["source"].as_str().unwrap_or_default();
+            let score = query_terms
+                .intersection(&tokenize(&format!("{title} {source} {content}")))
+                .count();
+            if score == 0 {
+                return None;
+            }
+            let source_id = chunk["source_id"]
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("{name}/{source}"));
+            let chunk_id = chunk["chunk_id"].as_str().map(ToString::to_string);
+            let focused_content = query_focused_excerpt(content, &query_terms, 900);
+            Some((
+                score,
+                source_id.clone(),
+                RetrievalChunk {
+                    source_id,
+                    title: title.to_string(),
+                    content: focused_content,
+                    confidence: confidence_for_score(score).to_string(),
+                    source: (!source.is_empty()).then(|| source.to_string()),
+                    page: chunk["page"].as_str().map(ToString::to_string),
+                    chunk_id,
+                    score: Some(score as f64),
+                    provider: Some(
+                        chunk["provider"]
+                            .as_str()
+                            .unwrap_or(DEFAULT_RAG_PROVIDER)
+                            .to_string(),
+                    ),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    Some(
+        scored
+            .into_iter()
+            .take(5)
+            .map(|(_, _, chunk)| chunk)
+            .collect(),
+    )
 }
 
 fn dedupe_chunks(chunks: Vec<RetrievalChunk>) -> Vec<RetrievalChunk> {
@@ -10898,6 +11130,27 @@ fn compact_excerpt(text: &str, max_chars: usize) -> String {
     excerpt
 }
 
+fn query_focused_excerpt(text: &str, query_terms: &HashSet<String>, max_chars: usize) -> String {
+    let mut best_score = 0;
+    let mut best_segment = text;
+    for segment in text
+        .split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+    {
+        let score = query_terms.intersection(&tokenize(segment)).count();
+        if score > best_score {
+            best_score = score;
+            best_segment = segment;
+        }
+    }
+    if best_score == 0 {
+        compact_excerpt(text, max_chars)
+    } else {
+        compact_excerpt(best_segment, max_chars)
+    }
+}
+
 fn confidence_for_score(score: usize) -> &'static str {
     match score {
         0 => "low",
@@ -10913,18 +11166,33 @@ fn knowledge_base() -> Vec<RetrievalChunk> {
             title: "Learning systems index".to_string(),
             content: "RAG systems ground generated answers in retrieved external references so learners can inspect the source of a claim.".to_string(),
             confidence: "medium".to_string(),
+            source: Some("rag-index-18".to_string()),
+            page: None,
+            chunk_id: Some("rag-index-18#chunk-0001".to_string()),
+            score: None,
+            provider: Some("builtin".to_string()),
         },
         RetrievalChunk {
             source_id: "workflow-note-01".to_string(),
             title: "Agent workflow brief".to_string(),
             content: "Multi-agent learning systems separate planning, execution, and critique to make task ownership and revision steps visible.".to_string(),
             confidence: "high".to_string(),
+            source: Some("workflow-note-01".to_string()),
+            page: None,
+            chunk_id: Some("workflow-note-01#chunk-0001".to_string()),
+            score: None,
+            provider: Some("builtin".to_string()),
         },
         RetrievalChunk {
             source_id: "mcp-tool-07".to_string(),
             title: "Tool adapter note".to_string(),
             content: "MCP-style adapters expose external APIs, databases, and file systems through controlled contracts that can be audited.".to_string(),
             confidence: "high".to_string(),
+            source: Some("mcp-tool-07".to_string()),
+            page: None,
+            chunk_id: Some("mcp-tool-07#chunk-0001".to_string()),
+            score: None,
+            provider: Some("builtin".to_string()),
         },
     ]
 }
