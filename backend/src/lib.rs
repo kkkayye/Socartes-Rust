@@ -1389,10 +1389,20 @@ async fn upload_knowledge_files(
     Path(name): Path<String>,
     multipart: Multipart,
 ) -> impl IntoResponse {
+    if !knowledge_base_exists(&state, &name) {
+        return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
+    }
     if knowledge_needs_reindex_for_upload(&state, &name) {
         return api_error(
             StatusCode::CONFLICT,
             &format!("Knowledge base '{name}' needs reindex before uploading new files"),
+        )
+        .into_response();
+    }
+    if !knowledge_has_active_index(&state, &name) {
+        return api_error(
+            StatusCode::CONFLICT,
+            &format!("Knowledge base '{name}' does not have an active index; reindex before uploading new files"),
         )
         .into_response();
     }
@@ -1413,6 +1423,12 @@ fn knowledge_needs_reindex_for_upload(state: &AppState, name: &str) -> bool {
         || read_knowledge_metadata(state, name)
             .and_then(|metadata| metadata["needs_reindex"].as_bool())
             .unwrap_or(false)
+}
+
+fn knowledge_has_active_index(state: &AppState, name: &str) -> bool {
+    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
+    let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
+    find_active_index_version(&versions).is_some()
 }
 
 async fn set_default_knowledge_base(
@@ -6043,9 +6059,31 @@ fn write_active_knowledge_index_version(
     version["version_path"] = json!(version_dir.to_string_lossy());
 
     let chunks = build_knowledge_index_chunks(state, name)?;
+    write_knowledge_index_files(&version_dir, &version["signature"], chunks)?;
+
+    let bytes = serde_json::to_vec_pretty(&version).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize index version metadata: {error}"),
+        )
+    })?;
+    fs::write(version_dir.join("meta.json"), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write index version metadata: {error}"),
+        )
+    })?;
+    Ok(version)
+}
+
+fn write_knowledge_index_files(
+    version_dir: &FsPath,
+    signature: &Value,
+    chunks: Vec<Value>,
+) -> Result<(), ApiError> {
     let chunk_index = json!({
         "provider": DEFAULT_RAG_PROVIDER,
-        "signature": version["signature"].clone(),
+        "signature": signature.clone(),
         "chunk_size_words": KNOWLEDGE_CHUNK_SIZE_WORDS,
         "chunk_overlap_words": KNOWLEDGE_CHUNK_OVERLAP_WORDS,
         "chunks": chunks
@@ -6087,21 +6125,7 @@ fn write_active_knowledge_index_version(
             "text_id_to_ref_doc_id": {}
         }),
         "index version image vector store",
-    )?;
-
-    let bytes = serde_json::to_vec_pretty(&version).map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to serialize index version metadata: {error}"),
-        )
-    })?;
-    fs::write(version_dir.join("meta.json"), bytes).map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to write index version metadata: {error}"),
-        )
-    })?;
-    Ok(version)
+    )
 }
 
 fn write_pretty_json(path: &FsPath, value: &Value, label: &str) -> Result<(), ApiError> {
@@ -6187,6 +6211,150 @@ fn chunk_text_by_words(text: &str) -> Vec<String> {
         start += step;
     }
     chunks
+}
+
+fn rewrite_active_knowledge_index(state: &AppState, name: &str) -> Result<bool, ApiError> {
+    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
+    let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
+    let Some(active) = find_active_index_version(&versions) else {
+        return Ok(false);
+    };
+    let version_dir = active["version_path"]
+        .as_str()
+        .or_else(|| active["storage_path"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            knowledge_base_dir(state, name).join(active["version"].as_str().unwrap_or("version-1"))
+        });
+    let chunks = build_knowledge_index_chunks(state, name)?;
+    write_knowledge_index_files(&version_dir, &active["signature"], chunks)?;
+    Ok(true)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+#[derive(Debug)]
+struct SavedKnowledgeFile {
+    filename: String,
+    hash: String,
+}
+
+fn existing_file_hashes(metadata: &Value) -> Map<String, Value> {
+    metadata["file_hashes"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn existing_knowledge_content_hashes(
+    state: &AppState,
+    name: &str,
+) -> Result<HashSet<String>, ApiError> {
+    let files_dir = knowledge_files_dir(state, name);
+    let entries = fs::read_dir(&files_dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read existing knowledge files: {error}"),
+        )
+    })?;
+    let mut hashes = HashSet::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(filename) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+        if !is_supported_knowledge_file(&filename) {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read existing knowledge file for duplicate check: {error}"),
+            )
+        })?;
+        hashes.insert(sha256_hex(&bytes));
+    }
+    Ok(hashes)
+}
+
+fn write_knowledge_metadata_value(
+    state: &AppState,
+    name: &str,
+    metadata: &Value,
+) -> Result<(), ApiError> {
+    let dir = knowledge_base_dir(state, name);
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create knowledge base directory: {error}"),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(metadata).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize knowledge metadata: {error}"),
+        )
+    })?;
+    fs::write(knowledge_metadata_path(state, name), bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write knowledge metadata: {error}"),
+        )
+    })
+}
+
+fn write_upload_metadata(
+    state: &AppState,
+    name: &str,
+    processed_files: &[SavedKnowledgeFile],
+) -> Result<(), ApiError> {
+    if processed_files.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_label();
+    let mut metadata = read_knowledge_metadata(state, name)
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "created_at": now.clone() }));
+    if !metadata["created_at"].is_string() {
+        metadata["created_at"] = json!(now.clone());
+    }
+    metadata["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+    metadata["needs_reindex"] = json!(false);
+    metadata["embedding_mismatch"] = json!(false);
+    metadata["embedding_model"] = json!(RUST_EMBEDDING_MODEL);
+    metadata["embedding_dim"] = json!(RUST_EMBEDDING_DIMENSION);
+    metadata["embedding_signature"] = json!(active_knowledge_signature());
+    metadata["last_updated"] = json!(now.clone());
+    metadata["last_indexed_at"] = json!(now.clone());
+    metadata["last_indexed_count"] = json!(processed_files.len());
+    metadata["last_indexed_action"] = json!("upload");
+
+    let mut file_hashes = existing_file_hashes(&metadata);
+    for file in processed_files {
+        file_hashes.insert(file.filename.clone(), json!(file.hash));
+    }
+    metadata["file_hashes"] = Value::Object(file_hashes);
+
+    let mut history = metadata["update_history"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    history.push(json!({
+        "timestamp": now,
+        "action": "incremental_add",
+        "count": processed_files.len(),
+        "provider": DEFAULT_RAG_PROVIDER
+    }));
+    metadata["update_history"] = Value::Array(history);
+
+    write_knowledge_metadata_value(state, name, &metadata)
 }
 
 fn read_knowledge_metadata(state: &AppState, name: &str) -> Option<Value> {
@@ -6353,6 +6521,7 @@ async fn save_knowledge_base_from_multipart(
     mut multipart: Multipart,
     target_name: Option<String>,
 ) -> Result<(String, String), ApiError> {
+    let is_upload = target_name.is_some();
     let mut name = target_name;
     let mut provider = DEFAULT_RAG_PROVIDER.to_string();
     let mut files = Vec::<(String, Vec<u8>)>::new();
@@ -6417,6 +6586,26 @@ async fn save_knowledge_base_from_multipart(
         ));
     }
 
+    if is_upload {
+        if !knowledge_base_exists(state, &name) {
+            return Err(api_error(StatusCode::NOT_FOUND, "Knowledge base not found"));
+        }
+        if knowledge_needs_reindex_for_upload(state, &name) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                &format!("Knowledge base '{name}' needs reindex before uploading new files"),
+            ));
+        }
+        if !knowledge_has_active_index(state, &name) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "Knowledge base '{name}' does not have an active index; reindex before uploading new files"
+                ),
+            ));
+        }
+    }
+
     let files_dir = knowledge_files_dir(state, &name);
     fs::create_dir_all(&files_dir).map_err(|error| {
         api_error(
@@ -6424,16 +6613,53 @@ async fn save_knowledge_base_from_multipart(
             &format!("Failed to create knowledge file directory: {error}"),
         )
     })?;
-    for (filename, bytes) in files {
-        fs::write(files_dir.join(filename), bytes).map_err(|error| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to write uploaded file: {error}"),
-            )
-        })?;
+
+    if is_upload {
+        let metadata = read_knowledge_metadata(state, &name).unwrap_or_else(|| json!({}));
+        let mut known_hashes = existing_file_hashes(&metadata)
+            .values()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        known_hashes.extend(existing_knowledge_content_hashes(state, &name)?);
+        let mut saved_files = Vec::new();
+        for (filename, bytes) in files {
+            let hash = sha256_hex(&bytes);
+            if known_hashes.contains(&hash) {
+                continue;
+            }
+            fs::write(files_dir.join(&filename), bytes).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to write uploaded file: {error}"),
+                )
+            })?;
+            known_hashes.insert(hash.clone());
+            saved_files.push(SavedKnowledgeFile { filename, hash });
+        }
+        if !saved_files.is_empty() {
+            if !rewrite_active_knowledge_index(state, &name)? {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "Knowledge base '{name}' does not have an active index; reindex before uploading new files"
+                    ),
+                ));
+            }
+            write_upload_metadata(state, &name, &saved_files)?;
+        }
+    } else {
+        for (filename, bytes) in files {
+            fs::write(files_dir.join(filename), bytes).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to write uploaded file: {error}"),
+                )
+            })?;
+        }
+        write_knowledge_metadata(state, &name, &provider, None)?;
     }
 
-    write_knowledge_metadata(state, &name, &provider, None)?;
     Ok((name, format!("task-{}", unique_id())))
 }
 

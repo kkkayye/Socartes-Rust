@@ -801,6 +801,45 @@ Original stale course material.\r\n\
         .unwrap();
     assert_eq!(create_response.status(), http::StatusCode::OK);
 
+    let missing_index_boundary = "SOCARTESUPLOADMISSINGINDEX";
+    let missing_index_body = format!(
+        "--{missing_index_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"before-index.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+This upload should wait until the course has an active index.\r\n\
+--{missing_index_boundary}--\r\n"
+    );
+    let missing_index_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/stale-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={missing_index_boundary}"),
+                )
+                .body(Body::from(missing_index_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_index_response.status(), http::StatusCode::CONFLICT);
+    assert!(
+        json_response(missing_index_response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("active index")
+    );
+    assert!(
+        !root
+            .join("bases")
+            .join("stale-course")
+            .join("files")
+            .join("before-index.md")
+            .exists()
+    );
+
     let config_response = app
         .clone()
         .oneshot(
@@ -1288,6 +1327,227 @@ The cedar lantern unlock phrase is cobalt spiral, and the archive keeper writes 
                 .as_str()
                 .is_some_and(|content| content.contains("cobalt spiral"))
     }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_upload_updates_active_chunk_index_and_skips_duplicate_content() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESINCREMENTALCREATE";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+incremental-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"seed.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The seed lesson only mentions planner executor critic setup.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/incremental-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+
+    let upload_boundary = "SOCARTESINCREMENTALUPLOAD";
+    let upload_body = format!(
+        "--{upload_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"fresh.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The quartz compass answer is lavender delta, recorded only in this uploaded file.\r\n\
+--{upload_boundary}--\r\n"
+    );
+    let upload_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/incremental-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={upload_boundary}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), http::StatusCode::OK);
+
+    let plugin_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "What is the quartz compass answer?",
+                            "kb_name": "incremental-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    assert!(plugin["sources"].as_array().unwrap().iter().any(|source| {
+        source["source"].as_str() == Some("fresh.md")
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("lavender delta"))
+    }));
+
+    let metadata_path = root
+        .join("bases")
+        .join("incremental-course")
+        .join("metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
+            .expect("valid metadata");
+    assert_eq!(metadata["last_indexed_action"], "upload");
+    assert_eq!(metadata["last_indexed_count"], 1);
+    assert!(
+        metadata["file_hashes"]["fresh.md"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    let history_len = metadata["update_history"].as_array().unwrap().len();
+    assert_eq!(
+        metadata["update_history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["action"],
+        "incremental_add"
+    );
+
+    let duplicate_seed_boundary = "SOCARTESINCREMENTALSEEDDUPLICATE";
+    let duplicate_seed_body = format!(
+        "--{duplicate_seed_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"seed-copy.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The seed lesson only mentions planner executor critic setup.\r\n\
+--{duplicate_seed_boundary}--\r\n"
+    );
+    let duplicate_seed_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/incremental-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={duplicate_seed_boundary}"),
+                )
+                .body(Body::from(duplicate_seed_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_seed_response.status(), http::StatusCode::OK);
+
+    let metadata_after_seed_duplicate: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
+            .expect("valid metadata");
+    assert_eq!(metadata_after_seed_duplicate, metadata);
+
+    let duplicate_boundary = "SOCARTESINCREMENTALDUPLICATE";
+    let duplicate_body = format!(
+        "--{duplicate_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"fresh-copy.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The quartz compass answer is lavender delta, recorded only in this uploaded file.\r\n\
+--{duplicate_boundary}--\r\n"
+    );
+    let duplicate_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/incremental-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={duplicate_boundary}"),
+                )
+                .body(Body::from(duplicate_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_response.status(), http::StatusCode::OK);
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("incremental-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().unwrap();
+    assert!(chunks.iter().any(|chunk| {
+        chunk["source"].as_str() == Some("fresh.md")
+            && chunk["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("lavender delta"))
+    }));
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| chunk["source"].as_str() == Some("seed-copy.md"))
+    );
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| chunk["source"].as_str() == Some("fresh-copy.md"))
+    );
+
+    let metadata_after_duplicate: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
+            .expect("valid metadata");
+    assert_eq!(metadata_after_duplicate, metadata);
+    assert!(metadata_after_duplicate["file_hashes"]["fresh-copy.md"].is_null());
+    assert_eq!(
+        metadata_after_duplicate["update_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        history_len
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
