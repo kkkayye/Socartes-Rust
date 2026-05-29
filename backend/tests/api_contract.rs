@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Cursor, Write},
     path::Path,
     sync::{
         Arc,
@@ -18,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tower::ServiceExt;
+use zip::{ZipWriter, write::SimpleFileOptions};
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -90,6 +92,103 @@ fn test_co_writer_docs_root(knowledge_root: &Path) -> std::path::PathBuf {
 
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("user")
+}
+
+fn minimal_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, content) in entries {
+        writer.start_file(*name, options).expect("start zip entry");
+        writer
+            .write_all(content.as_bytes())
+            .expect("write zip entry");
+    }
+    writer.finish().expect("finish zip").into_inner()
+}
+
+fn minimal_docx_bytes(text: &str) -> Vec<u8> {
+    minimal_zip(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        ),
+        (
+            "word/document.xml",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
+            ),
+        ),
+    ])
+}
+
+fn minimal_xlsx_bytes(text: &str) -> Vec<u8> {
+    minimal_zip(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        ),
+        (
+            "xl/workbook.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Ledger" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/sharedStrings.xml",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>{text}</t></si></sst>"#
+            ),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c t="s"><v>0</v></c></row></sheetData></worksheet>"#,
+        ),
+    ])
+}
+
+fn minimal_pptx_bytes(text: &str) -> Vec<u8> {
+    minimal_zip(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            ),
+        ),
+    ])
+}
+
+fn push_multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
+fn push_multipart_file(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    field: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn finish_multipart(body: &mut Vec<u8>, boundary: &str) {
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 }
 
 async fn spawn_embedding_mock(
@@ -434,16 +533,44 @@ async fn course_knowledge_frontend_bootstrap_endpoints_are_available() {
 
     assert_eq!(policy_response.status(), http::StatusCode::OK);
     let policy_payload = json_response(policy_response).await;
-    assert!(
-        policy_payload["extensions"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(".txt"))
-    );
+    let extensions = policy_payload["extensions"].as_array().unwrap();
+    for extension in [
+        ".txt",
+        ".md",
+        ".json",
+        ".csv",
+        ".pdf",
+        ".docx",
+        ".xlsx",
+        ".pptx",
+        ".py",
+        ".yaml",
+        ".dockerfile",
+    ] {
+        assert!(
+            extensions.contains(&json!(extension)),
+            "missing supported extension {extension}"
+        );
+    }
+    for unsupported in [".doc", ".xls", ".ppt", ".rtf"] {
+        assert!(
+            !extensions.contains(&json!(unsupported)),
+            "legacy unsupported extension should not be advertised: {unsupported}"
+        );
+    }
     assert_eq!(
-        policy_payload["accept"],
-        ".txt,.md,.markdown,.pdf,.json,.csv"
+        policy_payload["accept"]
+            .as_str()
+            .unwrap()
+            .split(',')
+            .collect::<Vec<_>>(),
+        extensions
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>()
     );
+    assert_eq!(policy_payload["max_file_size_bytes"], 100 * 1024 * 1024);
+    assert_eq!(policy_payload["max_pdf_size_bytes"], 50 * 1024 * 1024);
 
     let files_response = app
         .oneshot(
@@ -1502,6 +1629,256 @@ The cedar lantern unlock phrase is cobalt spiral, and the archive keeper writes 
                 .as_str()
                 .is_some_and(|content| content.contains("cobalt spiral"))
     }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn office_documents_upload_reindex_and_rag_extract_text() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESOFFICEDOCSBOUNDARY";
+    let docx_phrase = "docx amber theorem";
+    let xlsx_phrase = "xlsx violet ledger";
+    let pptx_phrase = "pptx cobalt slide";
+    let mut body = Vec::new();
+    push_multipart_text(&mut body, boundary, "name", "office-course");
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "lesson.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        &minimal_docx_bytes(docx_phrase),
+    );
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        &minimal_xlsx_bytes(xlsx_phrase),
+    );
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "slides.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        &minimal_pptx_bytes(pptx_phrase),
+    );
+    finish_multipart(&mut body, boundary);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let files_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/office-course/files")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_response.status(), http::StatusCode::OK);
+    let files_payload = json_response(files_response).await;
+    let files = files_payload["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| {
+        file["name"] == "lesson.docx"
+            && file["mime_type"]
+                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    }));
+    assert!(files.iter().any(|file| {
+        file["name"] == "ledger.xlsx"
+            && file["mime_type"]
+                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }));
+    assert!(files.iter().any(|file| {
+        file["name"] == "slides.pptx"
+            && file["mime_type"]
+                == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    }));
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/office-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("office-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().expect("chunks array");
+    let indexed_text = chunks
+        .iter()
+        .filter_map(|chunk| chunk["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for phrase in [docx_phrase, xlsx_phrase, pptx_phrase] {
+        assert!(
+            indexed_text.contains(phrase),
+            "missing extracted phrase {phrase}"
+        );
+    }
+    assert!(indexed_text.contains("--- Sheet: Ledger ---"));
+    assert!(indexed_text.contains("--- Slide 1 ---"));
+    assert!(!indexed_text.contains("<w:t>"));
+    assert!(!indexed_text.contains("PK"));
+
+    for (query, source_name, phrase) in [
+        ("What does the docx lesson say?", "lesson.docx", docx_phrase),
+        ("Find the violet ledger phrase", "ledger.xlsx", xlsx_phrase),
+        (
+            "Which cobalt slide phrase appears?",
+            "slides.pptx",
+            pptx_phrase,
+        ),
+    ] {
+        let plugin_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugins/tools/rag/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "params": {
+                                "query": query,
+                                "kb_name": "office-course"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plugin_response.status(), http::StatusCode::OK);
+        let plugin = json_response(plugin_response).await;
+        let sources = plugin["sources"].as_array().expect("sources array");
+        assert!(sources.iter().any(|source| {
+            source["source"] == source_name
+                && source["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(phrase))
+        }));
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn corrupt_parser_documents_are_skipped_instead_of_indexing_binary_garbage() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESCORRUPTPARSERBOUNDARY";
+    let mut body = Vec::new();
+    push_multipart_text(&mut body, boundary, "name", "mixed-parser-course");
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "notes.md",
+        "text/markdown",
+        b"The surviving good note says parser fallback keeps emerald compass.",
+    );
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "broken.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        b"not a zip document and should not become a course chunk",
+    );
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "files",
+        "broken.pdf",
+        "application/pdf",
+        b"not a pdf document and should not become a course chunk",
+    );
+    finish_multipart(&mut body, boundary);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/mixed-parser-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("mixed-parser-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().expect("chunks array");
+    assert!(chunks.iter().any(|chunk| {
+        chunk["source"] == "notes.md"
+            && chunk["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("emerald compass"))
+    }));
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["source"] != "broken.docx" && chunk["source"] != "broken.pdf")
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

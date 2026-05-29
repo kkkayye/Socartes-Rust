@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    io::Write,
+    io::{Cursor, Read, Write},
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
@@ -40,8 +40,119 @@ const RUST_EMBEDDING_BASE_URL: &str = "local://socartes-rust";
 const RUST_EMBEDDING_API_VERSION: &str = "";
 const KNOWLEDGE_CHUNK_SIZE_WORDS: usize = 160;
 const KNOWLEDGE_CHUNK_OVERLAP_WORDS: usize = 30;
-const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] =
-    &[".txt", ".md", ".markdown", ".pdf", ".json", ".csv"];
+const MAX_KNOWLEDGE_FILE_SIZE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_KNOWLEDGE_PDF_SIZE_BYTES: usize = 50 * 1024 * 1024;
+const PARSER_KNOWLEDGE_EXTENSIONS: &[&str] = &[".pdf", ".docx", ".xlsx", ".pptx"];
+const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] = &[
+    ".asciidoc",
+    ".bash",
+    ".bib",
+    ".c",
+    ".cc",
+    ".cfg",
+    ".cjs",
+    ".clj",
+    ".cljc",
+    ".cljs",
+    ".cmake",
+    ".conf",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".csv",
+    ".cts",
+    ".cxx",
+    ".dart",
+    ".dockerfile",
+    ".docx",
+    ".env",
+    ".erl",
+    ".ex",
+    ".exs",
+    ".fish",
+    ".fs",
+    ".fsx",
+    ".go",
+    ".gql",
+    ".gradle",
+    ".graphql",
+    ".groovy",
+    ".h",
+    ".hcl",
+    ".hh",
+    ".hpp",
+    ".hs",
+    ".htm",
+    ".html",
+    ".hxx",
+    ".ini",
+    ".java",
+    ".jl",
+    ".js",
+    ".json",
+    ".json5",
+    ".jsonc",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".latex",
+    ".less",
+    ".lisp",
+    ".log",
+    ".lsp",
+    ".lua",
+    ".m",
+    ".markdown",
+    ".md",
+    ".mjs",
+    ".mk",
+    ".ml",
+    ".mli",
+    ".mm",
+    ".mts",
+    ".nginxconf",
+    ".nim",
+    ".pdf",
+    ".php",
+    ".pl",
+    ".pm",
+    ".pptx",
+    ".properties",
+    ".proto",
+    ".ps1",
+    ".py",
+    ".r",
+    ".rb",
+    ".rkt",
+    ".rs",
+    ".rst",
+    ".sass",
+    ".scala",
+    ".scm",
+    ".scss",
+    ".sh",
+    ".sol",
+    ".sql",
+    ".svelte",
+    ".svg",
+    ".swift",
+    ".tex",
+    ".text",
+    ".tf",
+    ".toml",
+    ".ts",
+    ".tsv",
+    ".tsx",
+    ".txt",
+    ".vim",
+    ".vue",
+    ".xlsx",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".zig",
+    ".zsh",
+];
 const DEFAULT_SKILL_TAGS: &[&str] = &["style", "tool"];
 const SKILL_TAGS_FILE: &str = ".tags.json";
 const TUTORBOT_EDITABLE_FILES: &[&str] = &[
@@ -1083,8 +1194,8 @@ async fn supported_file_types() -> Json<Value> {
     Json(json!({
         "extensions": SUPPORTED_KNOWLEDGE_EXTENSIONS,
         "accept": SUPPORTED_KNOWLEDGE_EXTENSIONS.join(","),
-        "max_file_size_bytes": 100 * 1024 * 1024,
-        "max_pdf_size_bytes": 50 * 1024 * 1024
+        "max_file_size_bytes": MAX_KNOWLEDGE_FILE_SIZE_BYTES,
+        "max_pdf_size_bytes": MAX_KNOWLEDGE_PDF_SIZE_BYTES
     }))
 }
 
@@ -7267,7 +7378,16 @@ fn build_knowledge_index_chunks(state: &AppState, name: &str) -> Result<Vec<Valu
                 &format!("Failed to read knowledge file for indexing: {error}"),
             )
         })?;
-        let text = String::from_utf8_lossy(&bytes);
+        let text = match extract_knowledge_file_text(&filename, &bytes) {
+            Ok(text) => text,
+            Err(_) if is_parser_knowledge_file(&filename) => continue,
+            Err(error) => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Failed to extract text from {filename}: {error}"),
+                ));
+            }
+        };
         for (index, content) in chunk_text_by_words(&text).into_iter().enumerate() {
             let chunk_id = format!("{filename}#chunk-{:04}", index + 1);
             chunks.push(json!({
@@ -7280,6 +7400,13 @@ fn build_knowledge_index_chunks(state: &AppState, name: &str) -> Result<Vec<Valu
                 "provider": DEFAULT_RAG_PROVIDER
             }));
         }
+    }
+
+    if chunks.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "No extractable knowledge content found",
+        ));
     }
 
     Ok(chunks)
@@ -7609,17 +7736,445 @@ fn mime_type_for(name: &str) -> &'static str {
         "json" => "application/json",
         "csv" => "text/csv",
         "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "htm" | "html" => "text/html",
+        "svg" => "image/svg+xml",
+        "yaml" | "yml" => "application/x-yaml",
+        "tsv" => "text/tab-separated-values",
         _ => "text/plain",
     }
 }
 
-fn is_supported_knowledge_file(filename: &str) -> bool {
-    let extension = FsPath::new(filename)
+fn knowledge_file_extension(filename: &str) -> String {
+    FsPath::new(filename)
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| format!(".{}", value.to_ascii_lowercase()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn is_supported_knowledge_file(filename: &str) -> bool {
+    let extension = knowledge_file_extension(filename);
     SUPPORTED_KNOWLEDGE_EXTENSIONS.contains(&extension.as_str())
+}
+
+fn is_parser_knowledge_file(filename: &str) -> bool {
+    let extension = knowledge_file_extension(filename);
+    PARSER_KNOWLEDGE_EXTENSIONS.contains(&extension.as_str())
+}
+
+fn extract_knowledge_file_text(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("empty document".to_string());
+    }
+    if bytes.len() > MAX_KNOWLEDGE_FILE_SIZE_BYTES {
+        return Err(format!(
+            "document exceeds {} byte limit",
+            MAX_KNOWLEDGE_FILE_SIZE_BYTES
+        ));
+    }
+
+    match knowledge_file_extension(filename).as_str() {
+        ".pdf" => extract_pdf_text(filename, bytes),
+        ".docx" => extract_docx_text(filename, bytes),
+        ".xlsx" => extract_xlsx_text(filename, bytes),
+        ".pptx" => extract_pptx_text(filename, bytes),
+        _ => Ok(decode_text_like(bytes)),
+    }
+}
+
+fn decode_text_like(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.trim_start_matches('\u{feff}').to_string();
+    }
+
+    for encoding in [encoding_rs::GBK, encoding_rs::WINDOWS_1252] {
+        let (decoded, _, had_errors) = encoding.decode(bytes);
+        if !had_errors {
+            return decoded.trim_start_matches('\u{feff}').to_string();
+        }
+    }
+
+    String::from_utf8_lossy(bytes)
+        .trim_start_matches('\u{feff}')
+        .to_string()
+}
+
+fn extract_pdf_text(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() > MAX_KNOWLEDGE_PDF_SIZE_BYTES {
+        return Err(format!(
+            "PDF exceeds {} byte limit",
+            MAX_KNOWLEDGE_PDF_SIZE_BYTES
+        ));
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Err("invalid PDF header".to_string());
+    }
+
+    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes)
+        .map_err(|error| format!("PDF text extraction failed: {error}"))?;
+    let text = pages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, page)| {
+            let page = page.trim();
+            (!page.is_empty()).then(|| format!("--- Page {} ---\n{page}", index + 1))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    finalize_extracted_text(filename, text)
+}
+
+fn open_ooxml_archive<'a>(
+    filename: &str,
+    bytes: &'a [u8],
+) -> Result<zip::ZipArchive<Cursor<&'a [u8]>>, String> {
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return Err("invalid Office Open XML header".to_string());
+    }
+    zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| format!("Failed to open {filename} as Office Open XML: {error}"))
+}
+
+fn zip_entry_names<R: Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<String> {
+    let mut names = Vec::new();
+    for index in 0..archive.len() {
+        if let Ok(file) = archive.by_index(index) {
+            names.push(file.name().to_string());
+        }
+    }
+    names
+}
+
+fn read_zip_entry_to_string<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
+    let mut file = archive.by_name(name).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+fn extract_docx_text(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let mut archive = open_ooxml_archive(filename, bytes)?;
+    let mut names = zip_entry_names(&mut archive)
+        .into_iter()
+        .filter(|name| is_docx_text_part(name))
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| {
+        docx_part_rank(left)
+            .cmp(&docx_part_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let text = names
+        .into_iter()
+        .filter_map(|name| read_zip_entry_to_string(&mut archive, &name))
+        .map(|xml| xml_text_nodes(&xml).join(" "))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    finalize_extracted_text(filename, text)
+}
+
+fn is_docx_text_part(name: &str) -> bool {
+    name == "word/document.xml"
+        || (name.starts_with("word/header") && name.ends_with(".xml"))
+        || (name.starts_with("word/footer") && name.ends_with(".xml"))
+        || name == "word/footnotes.xml"
+        || name == "word/endnotes.xml"
+        || name == "word/comments.xml"
+}
+
+fn docx_part_rank(name: &str) -> usize {
+    if name == "word/document.xml" { 0 } else { 1 }
+}
+
+fn extract_xlsx_text(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let mut archive = open_ooxml_archive(filename, bytes)?;
+    let shared_strings = read_zip_entry_to_string(&mut archive, "xl/sharedStrings.xml")
+        .map(|xml| xml_text_nodes(&xml))
+        .unwrap_or_default();
+    let sheet_names = read_zip_entry_to_string(&mut archive, "xl/workbook.xml")
+        .map(|xml| parse_xlsx_sheet_names(&xml))
+        .unwrap_or_default();
+    let mut worksheet_names = zip_entry_names(&mut archive)
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("xl/worksheets/sheet")
+                && name.ends_with(".xml")
+                && !name.contains("/_rels/")
+        })
+        .collect::<Vec<_>>();
+    worksheet_names.sort_by(|left, right| {
+        worksheet_number(left)
+            .cmp(&worksheet_number(right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut sections = Vec::new();
+    for (index, name) in worksheet_names.into_iter().enumerate() {
+        let Some(xml) = read_zip_entry_to_string(&mut archive, &name) else {
+            continue;
+        };
+        let rows = parse_xlsx_rows(&xml, &shared_strings);
+        if rows.is_empty() {
+            continue;
+        }
+        let sheet_name = sheet_names
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("Sheet {}", index + 1));
+        let body = rows
+            .into_iter()
+            .map(|row| row.join("\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("--- Sheet: {sheet_name} ---\n{body}"));
+    }
+
+    finalize_extracted_text(filename, sections.join("\n\n"))
+}
+
+fn worksheet_number(name: &str) -> usize {
+    name.rsplit_once("sheet")
+        .and_then(|(_, tail)| tail.strip_suffix(".xml"))
+        .and_then(|number| number.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn parse_xlsx_sheet_names(xml: &str) -> Vec<String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut names = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                let name = event.name();
+                if local_xml_name(name.as_ref()) == b"sheet"
+                    && let Some(value) = xml_attribute_value(&event, b"name")
+                {
+                    names.push(value);
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    names
+}
+
+fn parse_xlsx_rows(xml: &str, shared_strings: &[String]) -> Vec<Vec<String>> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut rows = Vec::new();
+    let mut current_row = Vec::new();
+    let mut current_cell_type = String::new();
+    let mut current_value = String::new();
+    let mut in_row = false;
+    let mut capturing_value = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event)) => {
+                let name = event.name();
+                match local_xml_name(name.as_ref()) {
+                    b"row" => {
+                        in_row = true;
+                        current_row.clear();
+                    }
+                    b"c" => {
+                        current_cell_type = xml_attribute_value(&event, b"t").unwrap_or_default();
+                    }
+                    b"v" => {
+                        capturing_value = true;
+                        current_value.clear();
+                    }
+                    b"t" if current_cell_type == "inlineStr" || current_cell_type == "str" => {
+                        capturing_value = true;
+                        current_value.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Text(event)) if capturing_value => {
+                append_xml_text(&mut current_value, decode_xml_text(&event));
+            }
+            Ok(quick_xml::events::Event::CData(event)) if capturing_value => {
+                append_xml_text(&mut current_value, decode_xml_cdata(&event));
+            }
+            Ok(quick_xml::events::Event::End(event)) => {
+                let name = event.name();
+                match local_xml_name(name.as_ref()) {
+                    b"v" | b"t" if capturing_value => {
+                        let value = if current_cell_type == "s" {
+                            current_value
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|index| shared_strings.get(index).cloned())
+                                .unwrap_or_default()
+                        } else {
+                            collapse_whitespace(&current_value)
+                        };
+                        if in_row && !value.is_empty() {
+                            current_row.push(value);
+                        }
+                        capturing_value = false;
+                        current_value.clear();
+                    }
+                    b"c" => {
+                        current_cell_type.clear();
+                    }
+                    b"row" => {
+                        if !current_row.is_empty() {
+                            rows.push(current_row.clone());
+                        }
+                        current_row.clear();
+                        in_row = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    rows
+}
+
+fn extract_pptx_text(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let mut archive = open_ooxml_archive(filename, bytes)?;
+    let mut slide_names = zip_entry_names(&mut archive)
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("ppt/slides/slide")
+                && name.ends_with(".xml")
+                && !name.contains("/_rels/")
+        })
+        .collect::<Vec<_>>();
+    slide_names.sort_by(|left, right| {
+        slide_number(left)
+            .cmp(&slide_number(right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let text = slide_names
+        .into_iter()
+        .filter_map(|name| {
+            let xml = read_zip_entry_to_string(&mut archive, &name)?;
+            let body = xml_text_nodes(&xml).join(" ");
+            (!body.trim().is_empty()).then(|| {
+                let number = slide_number(&name);
+                let number = if number == usize::MAX { 1 } else { number };
+                format!("--- Slide {number} ---\n{body}")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    finalize_extracted_text(filename, text)
+}
+
+fn slide_number(name: &str) -> usize {
+    name.rsplit_once("slide")
+        .and_then(|(_, tail)| tail.strip_suffix(".xml"))
+        .and_then(|number| number.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn xml_text_nodes(xml: &str) -> Vec<String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut texts = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Text(event)) => {
+                if let Some(text) = decode_xml_text(&event) {
+                    texts.push(text);
+                }
+            }
+            Ok(quick_xml::events::Event::CData(event)) => {
+                if let Some(text) = decode_xml_cdata(&event) {
+                    texts.push(text);
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    texts
+}
+
+fn append_xml_text(target: &mut String, value: Option<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push(' ');
+    }
+    target.push_str(&value);
+}
+
+fn decode_xml_text(event: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = event.xml10_content().ok()?;
+    let unescaped = quick_xml::escape::unescape(&decoded)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| decoded.into_owned());
+    let text = collapse_whitespace(&unescaped);
+    (!text.is_empty()).then_some(text)
+}
+
+fn decode_xml_cdata(event: &quick_xml::events::BytesCData<'_>) -> Option<String> {
+    let decoded = event.xml10_content().ok()?;
+    let text = collapse_whitespace(&decoded);
+    (!text.is_empty()).then_some(text)
+}
+
+fn xml_attribute_value(
+    event: &quick_xml::events::BytesStart<'_>,
+    expected_name: &[u8],
+) -> Option<String> {
+    event
+        .attributes()
+        .filter_map(Result::ok)
+        .find(|attribute| local_xml_name(attribute.key.as_ref()) == expected_name)
+        .map(|attribute| String::from_utf8_lossy(attribute.value.as_ref()).to_string())
+}
+
+fn local_xml_name(name: &[u8]) -> &[u8] {
+    name.iter()
+        .position(|byte| *byte == b':')
+        .map(|index| &name[index + 1..])
+        .unwrap_or(name)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn finalize_extracted_text(filename: &str, text: String) -> Result<String, String> {
+    let text = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        Err(format!("No extractable text found in {filename}"))
+    } else {
+        Ok(text)
+    }
 }
 
 async fn save_knowledge_base_from_multipart(
@@ -12501,7 +13056,9 @@ async fn retrieve_uploaded_knowledge_base(
         let Ok(bytes) = fs::read(entry.path()) else {
             continue;
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let Ok(text) = extract_knowledge_file_text(&filename, &bytes) else {
+            continue;
+        };
         let excerpt = compact_excerpt(&text, 900);
         if excerpt.is_empty() {
             continue;
