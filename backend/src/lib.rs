@@ -1430,7 +1430,7 @@ fn knowledge_needs_reindex_for_upload(state: &AppState, name: &str) -> bool {
 fn knowledge_has_active_index(state: &AppState, name: &str) -> bool {
     let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
     let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
-    find_active_index_version(&versions).is_some()
+    find_active_index_version(state, &versions).is_some()
 }
 
 async fn set_default_knowledge_base(
@@ -1464,10 +1464,10 @@ async fn reindex_knowledge_base(
     if !knowledge_base_exists(&state, &name) {
         return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
     }
-    let signature = active_knowledge_signature();
+    let signature = active_knowledge_signature(&state);
     let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
     let versions = knowledge_index_versions(&knowledge_base_dir(&state, &name), &metadata);
-    if find_active_index_version(&versions)
+    if find_active_index_version(&state, &versions)
         .filter(|version| version["layout"].as_str() == Some("flat"))
         .is_some()
     {
@@ -1485,7 +1485,7 @@ async fn reindex_knowledge_base(
         .into_response();
     }
     let task_id = format!("task-reindex-{}", unique_id());
-    let version = match write_active_knowledge_index_version(&state, &name, &versions) {
+    let version = match write_active_knowledge_index_version(&state, &name, &versions).await {
         Ok(version) => version,
         Err(error) => return error.into_response(),
     };
@@ -4897,6 +4897,17 @@ struct EmbeddingRuntimeSelection {
     supported_dimensions: Vec<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct KnowledgeEmbeddingConfig {
+    binding: String,
+    model: String,
+    dimension: i64,
+    base_url: String,
+    api_version: String,
+    signature: String,
+    selection: Option<EmbeddingRuntimeSelection>,
+}
+
 fn active_embedding_selection(catalog: &Value) -> Result<EmbeddingRuntimeSelection, String> {
     let service = &catalog["services"]["embedding"];
     let profiles = service["profiles"].as_array().ok_or_else(|| {
@@ -5281,6 +5292,198 @@ async fn probe_embedding_provider(
         EmbeddingProbeError::Connection(format!("Invalid JSON response: {error}"))
     })?;
     validate_embedding_probe_payload(selection, &payload, probe_texts.len())
+}
+
+async fn embed_knowledge_texts(
+    state: &AppState,
+    texts: &[String],
+) -> Result<Vec<Vec<f64>>, ApiError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = active_knowledge_embedding_config(state);
+    if let Some(selection) = config.selection {
+        embed_texts_with_selection(&selection, texts)
+            .await
+            .map_err(embedding_api_error)
+    } else {
+        Ok(deterministic_knowledge_embeddings(
+            texts,
+            knowledge_embedding_dimension(config.dimension),
+        ))
+    }
+}
+
+async fn embed_texts_with_selection(
+    selection: &EmbeddingRuntimeSelection,
+    texts: &[String],
+) -> Result<Vec<Vec<f64>>, EmbeddingProbeError> {
+    let endpoint = embedding_endpoint(selection).map_err(EmbeddingProbeError::Configuration)?;
+    if selection.model == "deterministic-embedding"
+        || endpoint == RUST_EMBEDDING_BASE_URL
+        || endpoint.starts_with("local://")
+    {
+        return Ok(deterministic_knowledge_embeddings(
+            texts,
+            knowledge_embedding_dimension(selection.dimension.unwrap_or_default()),
+        ));
+    }
+    let probe_texts = texts.iter().map(String::as_str).collect::<Vec<_>>();
+    let body = embedding_probe_body(selection, &probe_texts, selection.send_dimensions);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    let mut request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if !selection.api_key.is_empty() {
+        if selection.api_version.is_empty() {
+            request = request.bearer_auth(&selection.api_key);
+        } else {
+            request = request
+                .query(&[("api-version", selection.api_version.as_str())])
+                .header("api-key", selection.api_key.as_str());
+        }
+    } else if !selection.api_version.is_empty() {
+        request = request.query(&[("api-version", selection.api_version.as_str())]);
+    }
+    for (name, value) in &selection.extra_headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    if !status.is_success() {
+        return Err(EmbeddingProbeError::Connection(format!(
+            "HTTP {} from {endpoint}: {text}",
+            status.as_u16()
+        )));
+    }
+    let payload = serde_json::from_str::<Value>(&text).map_err(|error| {
+        EmbeddingProbeError::Connection(format!("Invalid JSON response: {error}"))
+    })?;
+    parse_embedding_payload(selection, &payload, texts.len())
+}
+
+fn parse_embedding_payload(
+    selection: &EmbeddingRuntimeSelection,
+    payload: &Value,
+    expected_count: usize,
+) -> Result<Vec<Vec<f64>>, EmbeddingProbeError> {
+    let vectors = extract_embedding_vectors(selection, payload)?;
+    if vectors.len() != expected_count {
+        return Err(invalid_embedding_response(format!(
+            "Embedding service returned an unexpected number of vectors (expected {expected_count}, got {}).",
+            vectors.len()
+        )));
+    }
+    let expected_dimension = selection
+        .dimension
+        .filter(|dimension| *dimension > 0)
+        .map(|dimension| dimension as usize);
+    let mut parsed = Vec::with_capacity(vectors.len());
+    let mut observed_dimension = None;
+    for values in vectors {
+        let vector = parse_embedding_vector(values)?;
+        if vector.is_empty() {
+            return Err(invalid_embedding_response(
+                "Embedding service returned an empty vector.",
+            ));
+        }
+        if let Some(expected) = expected_dimension
+            && vector.len() != expected
+        {
+            return Err(invalid_embedding_response(
+                "Embedding service returned a vector with an unexpected dimension.",
+            ));
+        }
+        match observed_dimension {
+            Some(expected) if expected != vector.len() => {
+                return Err(invalid_embedding_response(
+                    "Embedding service returned inconsistent vector dimensions.",
+                ));
+            }
+            Some(_) => {}
+            None => observed_dimension = Some(vector.len()),
+        }
+        parsed.push(vector);
+    }
+    Ok(parsed)
+}
+
+fn parse_embedding_vector(values: &[Value]) -> Result<Vec<f64>, EmbeddingProbeError> {
+    values
+        .iter()
+        .map(|value| {
+            let number = value.as_f64().ok_or_else(|| {
+                invalid_embedding_response("Embedding service returned a non-numeric vector value.")
+            })?;
+            if !number.is_finite() {
+                return Err(invalid_embedding_response(
+                    "Embedding service returned a non-finite vector value.",
+                ));
+            }
+            Ok(number)
+        })
+        .collect()
+}
+
+fn embedding_api_error(error: EmbeddingProbeError) -> ApiError {
+    let message = embedding_probe_error_message(error);
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        &format!("Embedding provider failed while indexing knowledge: {message}"),
+    )
+}
+
+fn knowledge_embedding_dimension(dimension: i64) -> usize {
+    if dimension > 0 {
+        dimension as usize
+    } else {
+        64
+    }
+}
+
+fn deterministic_knowledge_embeddings(texts: &[String], dimension: usize) -> Vec<Vec<f64>> {
+    texts
+        .iter()
+        .map(|text| deterministic_knowledge_embedding(text, dimension))
+        .collect()
+}
+
+fn deterministic_knowledge_embedding(text: &str, dimension: usize) -> Vec<f64> {
+    let dimension = dimension.max(1);
+    let mut vector = vec![0.0; dimension];
+    let mut terms = tokenize(text).into_iter().collect::<Vec<_>>();
+    if terms.is_empty() {
+        terms.push(text.trim().to_lowercase());
+    }
+    for term in terms {
+        let digest = Sha256::digest(term.as_bytes());
+        let mut index_bytes = [0_u8; 8];
+        index_bytes.copy_from_slice(&digest[..8]);
+        let index = (u64::from_be_bytes(index_bytes) as usize) % dimension;
+        vector[index] += 1.0;
+    }
+    normalize_vector(&mut vector);
+    vector
+}
+
+fn normalize_vector(vector: &mut [f64]) {
+    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for value in vector {
+            *value /= norm;
+        }
+    }
 }
 
 fn validate_embedding_probe_payload(
@@ -6685,7 +6888,7 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
         })
     });
     let index_versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
-    let active_signature = active_knowledge_signature();
+    let active_signature = active_knowledge_signature(state);
     let active_match = index_versions.iter().any(|version| {
         version["signature"].as_str() == Some(active_signature.as_str())
             && version["ready"].as_bool().unwrap_or(false)
@@ -6723,17 +6926,72 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
     })
 }
 
-fn active_knowledge_signature() -> String {
+fn knowledge_embedding_signature(
+    binding: &str,
+    model: &str,
+    dimension: i64,
+    base_url: &str,
+    api_version: &str,
+) -> String {
     let canonical = json!({
-        "api_version": RUST_EMBEDDING_API_VERSION,
-        "base_url": RUST_EMBEDDING_BASE_URL,
-        "binding": RUST_EMBEDDING_BINDING,
-        "dimension": RUST_EMBEDDING_DIMENSION,
-        "model": RUST_EMBEDDING_MODEL
+        "api_version": api_version,
+        "base_url": base_url,
+        "binding": binding,
+        "dimension": dimension,
+        "model": model
     });
     let serialized = serde_json::to_string(&canonical).unwrap_or_default();
     let digest = Sha256::digest(serialized.as_bytes());
     format!("{digest:x}").chars().take(16).collect()
+}
+
+fn fallback_knowledge_embedding_config() -> KnowledgeEmbeddingConfig {
+    let signature = knowledge_embedding_signature(
+        RUST_EMBEDDING_BINDING,
+        RUST_EMBEDDING_MODEL,
+        RUST_EMBEDDING_DIMENSION,
+        RUST_EMBEDDING_BASE_URL,
+        RUST_EMBEDDING_API_VERSION,
+    );
+    KnowledgeEmbeddingConfig {
+        binding: RUST_EMBEDDING_BINDING.to_string(),
+        model: RUST_EMBEDDING_MODEL.to_string(),
+        dimension: RUST_EMBEDDING_DIMENSION,
+        base_url: RUST_EMBEDDING_BASE_URL.to_string(),
+        api_version: RUST_EMBEDDING_API_VERSION.to_string(),
+        signature,
+        selection: None,
+    }
+}
+
+fn active_knowledge_embedding_config(state: &AppState) -> KnowledgeEmbeddingConfig {
+    let Some(catalog) = read_settings_json(state, "catalog.json") else {
+        return fallback_knowledge_embedding_config();
+    };
+    let Ok(selection) = active_embedding_selection(&catalog) else {
+        return fallback_knowledge_embedding_config();
+    };
+    let dimension = selection.dimension.unwrap_or_default();
+    let signature = knowledge_embedding_signature(
+        &selection.binding,
+        &selection.model,
+        dimension,
+        &selection.base_url,
+        &selection.api_version,
+    );
+    KnowledgeEmbeddingConfig {
+        binding: selection.binding.clone(),
+        model: selection.model.clone(),
+        dimension,
+        base_url: selection.base_url.clone(),
+        api_version: selection.api_version.clone(),
+        signature,
+        selection: Some(selection),
+    }
+}
+
+fn active_knowledge_signature(state: &AppState) -> String {
+    active_knowledge_embedding_config(state).signature
 }
 
 fn knowledge_index_versions(kb_dir: &FsPath, metadata: &Value) -> Vec<Value> {
@@ -6793,8 +7051,8 @@ fn version_number(version: &Value) -> usize {
         .unwrap_or_default()
 }
 
-fn find_active_index_version(versions: &[Value]) -> Option<&Value> {
-    let signature = active_knowledge_signature();
+fn find_active_index_version<'a>(state: &AppState, versions: &'a [Value]) -> Option<&'a Value> {
+    let signature = active_knowledge_signature(state);
     versions.iter().find(|version| {
         version["signature"].as_str() == Some(signature.as_str())
             && version["ready"].as_bool().unwrap_or(false)
@@ -6813,15 +7071,16 @@ fn next_knowledge_version_name(versions: &[Value]) -> String {
     format!("version-{next}")
 }
 
-fn build_active_index_version(versions: &[Value]) -> Value {
+fn build_active_index_version(state: &AppState, versions: &[Value]) -> Value {
+    let embedding = active_knowledge_embedding_config(state);
     json!({
         "version": next_knowledge_version_name(versions),
-        "signature": active_knowledge_signature(),
-        "binding": RUST_EMBEDDING_BINDING,
-        "model": RUST_EMBEDDING_MODEL,
-        "dimension": RUST_EMBEDDING_DIMENSION,
-        "base_url": RUST_EMBEDDING_BASE_URL,
-        "api_version": RUST_EMBEDDING_API_VERSION,
+        "signature": embedding.signature,
+        "binding": embedding.binding,
+        "model": embedding.model,
+        "dimension": embedding.dimension,
+        "base_url": embedding.base_url,
+        "api_version": embedding.api_version,
         "layout": "flat",
         "created_at": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         "ready": true,
@@ -6829,12 +7088,12 @@ fn build_active_index_version(versions: &[Value]) -> Value {
     })
 }
 
-fn write_active_knowledge_index_version(
+async fn write_active_knowledge_index_version(
     state: &AppState,
     name: &str,
     versions: &[Value],
 ) -> Result<Value, ApiError> {
-    let mut version = build_active_index_version(versions);
+    let mut version = build_active_index_version(state, versions);
     let version_name = version["version"]
         .as_str()
         .unwrap_or("version-1")
@@ -6849,7 +7108,13 @@ fn write_active_knowledge_index_version(
     version["storage_path"] = json!(version_dir.to_string_lossy());
     version["version_path"] = json!(version_dir.to_string_lossy());
 
-    let chunks = build_knowledge_index_chunks(state, name)?;
+    let mut chunks = build_knowledge_index_chunks(state, name)?;
+    let texts = chunks
+        .iter()
+        .map(|chunk| chunk["content"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let embeddings = embed_knowledge_texts(state, &texts).await?;
+    attach_embeddings_to_chunks(&mut chunks, embeddings)?;
     write_knowledge_index_files(&version_dir, &version["signature"], chunks)?;
 
     let bytes = serde_json::to_vec_pretty(&version).map_err(|error| {
@@ -6865,6 +7130,22 @@ fn write_active_knowledge_index_version(
         )
     })?;
     Ok(version)
+}
+
+fn attach_embeddings_to_chunks(
+    chunks: &mut [Value],
+    embeddings: Vec<Vec<f64>>,
+) -> Result<(), ApiError> {
+    if chunks.len() != embeddings.len() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "Embedding provider returned a mismatched number of chunk vectors",
+        ));
+    }
+    for (chunk, embedding) in chunks.iter_mut().zip(embeddings) {
+        chunk["embedding"] = json!(embedding);
+    }
+    Ok(())
 }
 
 fn write_knowledge_index_files(
@@ -6894,12 +7175,38 @@ fn write_knowledge_index_files(
         &json!({ "index_store/data": { "root": "socartes-rust-lexical-index" } }),
         "index version index store",
     )?;
+    let mut embedding_dict = Map::new();
+    let mut metadata_dict = Map::new();
+    let mut text_id_to_ref_doc_id = Map::new();
+    for chunk in chunk_index["chunks"].as_array().into_iter().flatten() {
+        let chunk_id = chunk["chunk_id"]
+            .as_str()
+            .or_else(|| chunk["source_id"].as_str())
+            .unwrap_or_default();
+        if chunk_id.is_empty() {
+            continue;
+        }
+        if chunk["embedding"].is_array() {
+            embedding_dict.insert(chunk_id.to_string(), chunk["embedding"].clone());
+            metadata_dict.insert(
+                chunk_id.to_string(),
+                json!({
+                    "source_id": chunk["source_id"],
+                    "title": chunk["title"],
+                    "source": chunk["source"],
+                    "page": chunk["page"],
+                    "provider": chunk["provider"]
+                }),
+            );
+            text_id_to_ref_doc_id.insert(chunk_id.to_string(), chunk["source_id"].clone());
+        }
+    }
     write_pretty_json(
         &version_dir.join("default__vector_store.json"),
         &json!({
-            "embedding_dict": {},
-            "metadata_dict": {},
-            "text_id_to_ref_doc_id": {}
+            "embedding_dict": embedding_dict,
+            "metadata_dict": metadata_dict,
+            "text_id_to_ref_doc_id": text_id_to_ref_doc_id
         }),
         "index version vector store",
     )?;
@@ -7004,10 +7311,10 @@ fn chunk_text_by_words(text: &str) -> Vec<String> {
     chunks
 }
 
-fn rewrite_active_knowledge_index(state: &AppState, name: &str) -> Result<bool, ApiError> {
+async fn rewrite_active_knowledge_index(state: &AppState, name: &str) -> Result<bool, ApiError> {
     let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
     let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
-    let Some(active) = find_active_index_version(&versions) else {
+    let Some(active) = find_active_index_version(state, &versions) else {
         return Ok(false);
     };
     let version_dir = active["version_path"]
@@ -7017,7 +7324,13 @@ fn rewrite_active_knowledge_index(state: &AppState, name: &str) -> Result<bool, 
         .unwrap_or_else(|| {
             knowledge_base_dir(state, name).join(active["version"].as_str().unwrap_or("version-1"))
         });
-    let chunks = build_knowledge_index_chunks(state, name)?;
+    let mut chunks = build_knowledge_index_chunks(state, name)?;
+    let texts = chunks
+        .iter()
+        .map(|chunk| chunk["content"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let embeddings = embed_knowledge_texts(state, &texts).await?;
+    attach_embeddings_to_chunks(&mut chunks, embeddings)?;
     write_knowledge_index_files(&version_dir, &active["signature"], chunks)?;
     Ok(true)
 }
@@ -7116,12 +7429,13 @@ fn write_upload_metadata(
     if !metadata["created_at"].is_string() {
         metadata["created_at"] = json!(now.clone());
     }
+    let embedding = active_knowledge_embedding_config(state);
     metadata["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
     metadata["needs_reindex"] = json!(false);
     metadata["embedding_mismatch"] = json!(false);
-    metadata["embedding_model"] = json!(RUST_EMBEDDING_MODEL);
-    metadata["embedding_dim"] = json!(RUST_EMBEDDING_DIMENSION);
-    metadata["embedding_signature"] = json!(active_knowledge_signature());
+    metadata["embedding_model"] = json!(embedding.model);
+    metadata["embedding_dim"] = json!(embedding.dimension);
+    metadata["embedding_signature"] = json!(embedding.signature);
     metadata["last_updated"] = json!(now.clone());
     metadata["last_indexed_at"] = json!(now.clone());
     metadata["last_indexed_count"] = json!(processed_files.len());
@@ -7174,6 +7488,7 @@ fn write_knowledge_metadata(
         .map(ToString::to_string)
         .unwrap_or_else(now_label);
 
+    let embedding = active_knowledge_embedding_config(state);
     let mut metadata = json!({
         "created_at": created_at,
         "last_updated": now_label(),
@@ -7181,9 +7496,9 @@ fn write_knowledge_metadata(
         "last_indexed_action": "upsert",
         "last_indexed_count": knowledge_files(state, name).unwrap_or_default().len(),
         "rag_provider": DEFAULT_RAG_PROVIDER,
-        "embedding_model": RUST_EMBEDDING_MODEL,
-        "embedding_dim": RUST_EMBEDDING_DIMENSION,
-        "embedding_signature": active_knowledge_signature(),
+        "embedding_model": embedding.model,
+        "embedding_dim": embedding.dimension,
+        "embedding_signature": embedding.signature,
         "needs_reindex": false,
         "embedding_mismatch": false
     });
@@ -7429,7 +7744,7 @@ async fn save_knowledge_base_from_multipart(
             saved_files.push(SavedKnowledgeFile { filename, hash });
         }
         if !saved_files.is_empty() {
-            if !rewrite_active_knowledge_index(state, &name)? {
+            if !rewrite_active_knowledge_index(state, &name).await? {
                 return Err(api_error(
                     StatusCode::CONFLICT,
                     &format!(
@@ -8785,7 +9100,7 @@ async fn execute_plugin_tool(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     let params = plugin_request_params(&payload);
-    match plugin_tool_result(&state, &tool_name, params) {
+    match plugin_tool_result(&state, &tool_name, params).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -8809,7 +9124,7 @@ async fn execute_plugin_tool_stream(
         }),
     ));
 
-    match plugin_tool_result(&state, &tool_name, params) {
+    match plugin_tool_result(&state, &tool_name, params).await {
         Ok(mut result) => {
             result["elapsed_ms"] = json!(1);
             body.push_str(&sse("result", result));
@@ -8864,7 +9179,7 @@ async fn execute_plugin_capability_stream(
         "language": payload["language"].as_str().unwrap_or("en"),
         "capability": capability_name
     });
-    let (_session_id, turn_id, events) = execute_chat_turn(&state, &request);
+    let (_session_id, turn_id, events) = execute_chat_turn(&state, &request).await;
     let mut final_data = json!({});
     for event in events {
         if event["type"] == "done" {
@@ -8898,7 +9213,11 @@ fn plugin_request_params(payload: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn plugin_tool_result(state: &AppState, tool_name: &str, params: Value) -> Result<Value, ApiError> {
+async fn plugin_tool_result(
+    state: &AppState,
+    tool_name: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
     if !plugin_tool_names().contains(&tool_name) {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -8925,7 +9244,7 @@ fn plugin_tool_result(state: &AppState, tool_name: &str, params: Value) -> Resul
                 .filter(|value| !value.is_empty())
                 .map(|value| vec![value.to_string()])
                 .unwrap_or_else(|| vec![read_default_knowledge_base(state)]);
-            let chunks = retrieve_chat_context(state, query, &kb_names);
+            let chunks = retrieve_chat_context(state, query, &kb_names).await;
             let content = if chunks.is_empty() {
                 format!("No Socartes knowledge base passages matched query: {query}")
             } else {
@@ -10437,7 +10756,7 @@ async fn run_test_chat_turn(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Json<Value> {
-    let (session_id, turn_id, _) = execute_chat_turn(&state, &payload);
+    let (session_id, turn_id, _) = execute_chat_turn(&state, &payload).await;
     Json(json!({ "session_id": session_id, "turn_id": turn_id }))
 }
 
@@ -10929,7 +11248,7 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         return;
     }
 
-    let turn = build_chat_turn(state, &payload);
+    let turn = build_chat_turn(state, &payload).await;
     let live_turn = state
         .chat_runtime
         .register_turn(&turn.turn_id, &turn.session_id)
@@ -11040,8 +11359,8 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
     state.chat_runtime.remove_turn(&turn.turn_id).await;
 }
 
-fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<Value>) {
-    let turn = build_chat_turn(state, payload);
+async fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<Value>) {
+    let turn = build_chat_turn(state, payload).await;
     let _ = persist_chat_turn(
         state,
         payload,
@@ -11060,7 +11379,7 @@ struct BuiltChatTurn {
     events: Vec<Value>,
 }
 
-fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
+async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
     let content = payload["content"]
         .as_str()
         .unwrap_or("Explain the Socartes Rust agent loop.");
@@ -11075,7 +11394,7 @@ fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         .map(|language| format!("Frontend language: {language}"))
         .unwrap_or_default();
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
-    let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases);
+    let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases).await;
     let trace = SocartesOrchestrator::new().run_with_retrieved_context(
         content,
         &learner_context,
@@ -12126,7 +12445,7 @@ fn retrieve(goal: &str) -> Vec<RetrievalChunk> {
     matches
 }
 
-fn retrieve_chat_context(
+async fn retrieve_chat_context(
     state: &AppState,
     goal: &str,
     selected_knowledge_bases: &[String],
@@ -12140,14 +12459,14 @@ fn retrieve_chat_context(
         if name == BUILTIN_KNOWLEDGE_BASE {
             chunks.extend(retrieve(goal));
         } else {
-            chunks.extend(retrieve_uploaded_knowledge_base(state, goal, name));
+            chunks.extend(retrieve_uploaded_knowledge_base(state, goal, name).await);
         }
     }
 
     dedupe_chunks(chunks).into_iter().take(5).collect()
 }
 
-fn retrieve_uploaded_knowledge_base(
+async fn retrieve_uploaded_knowledge_base(
     state: &AppState,
     goal: &str,
     name: &str,
@@ -12156,7 +12475,7 @@ fn retrieve_uploaded_knowledge_base(
         return Vec::new();
     }
 
-    if let Some(chunks) = retrieve_indexed_knowledge_base(state, goal, name) {
+    if let Some(chunks) = retrieve_indexed_knowledge_base(state, goal, name).await {
         return chunks;
     }
 
@@ -12217,14 +12536,14 @@ fn retrieve_uploaded_knowledge_base(
     scored.into_iter().take(3).map(|(_, chunk)| chunk).collect()
 }
 
-fn retrieve_indexed_knowledge_base(
+async fn retrieve_indexed_knowledge_base(
     state: &AppState,
     goal: &str,
     name: &str,
 ) -> Option<Vec<RetrievalChunk>> {
     let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
     let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
-    let active = find_active_index_version(&versions)?;
+    let active = find_active_index_version(state, &versions)?;
     let version_dir = active["version_path"]
         .as_str()
         .or_else(|| active["storage_path"].as_str())
@@ -12242,6 +12561,75 @@ fn retrieve_indexed_knowledge_base(
     let query_terms = tokenize(goal);
     if query_terms.is_empty() {
         return Some(Vec::new());
+    }
+
+    let indexed_chunks = index["chunks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if indexed_chunks
+        .iter()
+        .any(|chunk| chunk["embedding"].is_array())
+    {
+        let query_texts = vec![goal.to_string()];
+        let query_embedding = match embed_knowledge_texts(state, &query_texts).await {
+            Ok(mut embeddings) => embeddings.pop(),
+            Err(_) => return Some(Vec::new()),
+        };
+        let Some(query_embedding) = query_embedding else {
+            return Some(Vec::new());
+        };
+        let mut scored = indexed_chunks
+            .iter()
+            .filter_map(|chunk| {
+                let content = chunk["content"].as_str()?;
+                let title = chunk["title"].as_str().unwrap_or_default();
+                let source = chunk["source"].as_str().unwrap_or_default();
+                let embedding = embedding_from_value(&chunk["embedding"])?;
+                let score = cosine_similarity(&query_embedding, &embedding)?;
+                let source_id = chunk["source_id"]
+                    .as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{name}/{source}"));
+                let chunk_id = chunk["chunk_id"].as_str().map(ToString::to_string);
+                let focused_content = query_focused_excerpt(content, &query_terms, 900);
+                Some((
+                    score,
+                    source_id.clone(),
+                    RetrievalChunk {
+                        source_id,
+                        title: title.to_string(),
+                        content: focused_content,
+                        confidence: confidence_for_similarity(score).to_string(),
+                        source: (!source.is_empty()).then(|| source.to_string()),
+                        page: chunk["page"].as_str().map(ToString::to_string),
+                        chunk_id,
+                        score: Some(score),
+                        provider: Some(
+                            chunk["provider"]
+                                .as_str()
+                                .unwrap_or(DEFAULT_RAG_PROVIDER)
+                                .to_string(),
+                        ),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        return Some(
+            scored
+                .into_iter()
+                .take(5)
+                .map(|(_, _, chunk)| chunk)
+                .collect(),
+        );
     }
 
     let mut scored = index["chunks"]
@@ -12344,6 +12732,47 @@ fn confidence_for_score(score: usize) -> &'static str {
         0 => "low",
         1 => "medium",
         _ => "high",
+    }
+}
+
+fn confidence_for_similarity(score: f64) -> &'static str {
+    if score >= 0.75 {
+        "high"
+    } else if score >= 0.25 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn embedding_from_value(value: &Value) -> Option<Vec<f64>> {
+    let vector = value
+        .as_array()?
+        .iter()
+        .map(Value::as_f64)
+        .collect::<Option<Vec<_>>>()?;
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        None
+    } else {
+        Some(vector)
+    }
+}
+
+fn cosine_similarity(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.is_empty() || left.len() != right.len() {
+        return None;
+    }
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        None
+    } else {
+        Some(dot / (left_norm * right_norm))
     }
 }
 

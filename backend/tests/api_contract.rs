@@ -160,6 +160,66 @@ async fn spawn_embedding_request_recorder(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn spawn_semantic_embedding_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.lock().await.push(payload.clone());
+                let inputs = match &payload["input"] {
+                    Value::Array(items) => items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    Value::String(value) => vec![value.to_string()],
+                    _ => Vec::new(),
+                };
+                let data = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        let lower = text.to_lowercase();
+                        let embedding = if lower.contains("semantic-only answer")
+                            || lower.contains("semantic target")
+                        {
+                            vec![1.0, 0.0, 0.0]
+                        } else if lower.contains("lexical trap") {
+                            vec![0.0, 1.0, 0.0]
+                        } else {
+                            vec![0.0, 0.0, 1.0]
+                        };
+                        json!({
+                            "object": "embedding",
+                            "index": index,
+                            "embedding": embedding
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                axum::Json(json!({
+                    "object": "list",
+                    "data": data,
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": inputs.len(), "total_tokens": inputs.len()}
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), requests, task)
+}
+
 fn embedding_test_catalog(base_url: &str) -> Value {
     json!({
         "version": 1,
@@ -1444,6 +1504,145 @@ The cedar lantern unlock phrase is cobalt spiral, and the archive keeper writes 
     }));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_rag_uses_embedding_similarity_over_keyword_overlap() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_semantic_embedding_mock().await;
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": embedding_test_catalog(&base_url) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+
+    let boundary = "SOCARTESEMBEDDINGRAGBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+semantic-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"trap.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+Lexical trap: semantic target semantic target semantic target. This is a decoy note and not the correct course answer.\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"answer.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The semantic-only answer says the archive password is amber circuit. This file intentionally avoids the query keywords.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/semantic-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("semantic-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().expect("chunks array");
+    assert!(chunks.iter().all(|chunk| chunk["embedding"].is_array()));
+
+    let vector_store_path = root
+        .join("bases")
+        .join("semantic-course")
+        .join("version-1")
+        .join("default__vector_store.json");
+    let vector_store: Value =
+        serde_json::from_str(&fs::read_to_string(&vector_store_path).expect("vector store"))
+            .expect("valid vector store");
+    assert_eq!(
+        vector_store["embedding_dict"]
+            .as_object()
+            .expect("embedding dict")
+            .len(),
+        chunks.len()
+    );
+
+    let plugin_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "semantic target",
+                            "kb_name": "semantic-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    let sources = plugin["sources"].as_array().expect("sources array");
+    let source = sources.first().expect("semantic source");
+    assert_eq!(source["source"], "answer.md");
+    assert!(
+        source["content"]
+            .as_str()
+            .unwrap()
+            .contains("amber circuit")
+    );
+
+    let requests = requests.lock().await;
+    assert!(requests.iter().any(|request| request["input"].is_array()));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["input"] == json!(["semantic target"]))
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]

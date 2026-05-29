@@ -86,7 +86,7 @@ python3 tools/api_parity_scan.py \
 
 - `/api/v1/knowledge/*` 课程/知识库启动、创建、上传、设默认、reindex、任务流、删除、health、configs/config sync、default get、per-KB config、progress、linked-folder/sync-folder 管理入口
 - 课程 RAG index-version 状态：本地课程 reindex 会创建 Python-like `version-N/meta.json`，返回 `signature`/`noop`，并在 list/detail statistics 暴露 `index_versions`、`active_signature`、`active_match`、`rag_initialized`、`needs_reindex`
-- 课程 RAG 持久化索引：本地课程 reindex 现在会写 `version-N/chunks.json`、`docstore.json`、`index_store.json`、`default__vector_store.json`、`graph_store.json`、`image__vector_store.json`；检索优先读取 active signature 的 chunk index，source 输出保留旧 `source_id/title/content/confidence` 并补充 Python/LlamaIndex 风格 `provider/source/chunk_id/page/score`
+- 课程 RAG 持久化索引和向量检索：本地课程 reindex 现在会读取已保存的 embedding catalog，为 chunk 批量生成 embedding，并写入 `version-N/chunks.json` 与 `default__vector_store.json.embedding_dict`；检索优先读取 active signature 的 chunk vectors，对 query 使用同一 embedding 配置生成向量后按 cosine similarity 排序，source 输出保留旧 `source_id/title/content/confidence` 并补充 Python/LlamaIndex 风格 `provider/source/chunk_id/page/score`
 - 课程上传增量索引：`/api/v1/knowledge/{name}/upload` 现在要求课程已有 active index；当课程配置或 metadata 标记 `needs_reindex`、或课程尚未 reindex 出 active index 时返回 `409`，避免在 stale/missing index 上假成功；完成 reindex 后上传会重写 active `chunks.json`、维护 `metadata.json.file_hashes`、追加 `update_history`，并跳过已存在课程内容的重复上传而不改 metadata
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
@@ -115,13 +115,14 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`64` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`65` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
 - `cargo test --test api_contract course`：`3` 个课程/知识库契约测试通过
 - `cargo test --test api_contract knowledge_reindex_creates_signature_version_and_reports_active_match`：课程 reindex signature/version/noop/active_match 契约测试通过
 - `cargo test --test api_contract knowledge_reindex_persists_chunk_index_and_rag_uses_indexed_chunks`：课程 reindex 持久化 chunk index、plugin RAG 和 chat sources 使用 chunk 级 source 的契约测试通过
+- `cargo test --test api_contract knowledge_rag_uses_embedding_similarity_over_keyword_overlap`：课程 RAG 会按 embedding/cosine similarity 选中语义匹配 chunk，而不是按关键词重叠选中 decoy chunk；同时验证 `chunks.json` 和 `default__vector_store.json.embedding_dict` 写入向量
 - `cargo test --test api_contract knowledge_upload`：`2` 个课程上传契约测试通过，覆盖 missing/stale active index 返回 `409`、上传后 active chunk index 可检索、`file_hashes`/`update_history` 写入，以及重复内容不写入索引也不改 metadata
 - `cargo test --test api_contract rag_selected_uploaded_kb_returns_no_builtin_fallback_when_no_match`：选定上传课程无命中时不回退内置 RAG 的语义契约测试通过
 - `cargo test knowledge_python_config_progress_and_linked_folder_endpoints_match_contract`：Python-only knowledge 管理兼容端点契约测试通过
@@ -145,7 +146,7 @@ python3 tools/api_parity_scan.py \
 
 - 前端扫描里的 `/api/v1/book{param}` 是 `web/lib/book-api.ts` 中 `BASE + path` 包装导致的模板扫描伪影；真实运行路径是 `/api/v1/book/books`、`/api/v1/book/books/{book_id}` 等，Rust 已覆盖这些 Book 路由
 - `/api/v1/vision/analyze` 和 `/api/v1/vision/solve` 的路由、校验、REST image URL 下载、真实 WS 握手和 metadata-only 事件序列已补齐；但真实 VisionSolver/GeoGebra/LLM 图像分析流水线还没有移植到 Rust，这仍是语义级差距，不是路由级缺口
-- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback 边界和本地 index-version 状态合同，但仍缺真实 LlamaIndex/embedding/vector search 语义；unified WS 已补 replay/live subscribe/cancel/regenerate 的协议级语义，但底层 turn 仍是 deterministic Rust agent loop，不是真实 Python ChatOrchestrator/LLM 后台任务；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
+- parity scan 已无 Python-only 路由缺口，但这不等于所有端点都完成了完整业务语义迁移；课程 RAG 已补 selected-KB no-fallback、本地 index-version 状态合同、embedding 持久化和 query/vector cosine retrieval；仍未做到完整 LlamaIndex node/docstore JSON schema、精确 token chunking、PDF/DOCX/PPTX 解析和 legacy index 迁移全兼容；unified WS 已补 replay/live subscribe/cancel/regenerate 的协议级语义，但底层 turn 仍是 deterministic Rust agent loop，不是真实 Python ChatOrchestrator/LLM 后台任务；LLM、Vision、TutorBot 等仍需要继续做真实回放和语义 contract test
 
 ## 已知限制
 
