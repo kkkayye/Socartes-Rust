@@ -300,6 +300,55 @@ async fn spawn_status_request_recorder(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn spawn_sequential_request_recorder(
+    responses: Vec<Value>,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let responses = Arc::new(responses);
+    let response_index = Arc::new(AtomicU64::new(0));
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let responses = Arc::clone(&responses);
+            let response_index = Arc::clone(&response_index);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                let index = response_index.fetch_add(1, Ordering::Relaxed) as usize;
+                let response = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"choices": []}));
+                axum::Json(response)
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
 async fn spawn_semantic_embedding_mock() -> (
     String,
     Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -453,6 +502,44 @@ fn llm_test_catalog(base_url: &str) -> Value {
             }
         }
     })
+}
+
+async fn create_markdown_knowledge_base(
+    app: axum::Router,
+    name: &str,
+    filename: &str,
+    content: &str,
+) {
+    let boundary = format!(
+        "SOCARTESCOURSE{}",
+        TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut body = Vec::new();
+    push_multipart_text(&mut body, &boundary, "name", name);
+    push_multipart_file(
+        &mut body,
+        &boundary,
+        "files",
+        filename,
+        "text/markdown",
+        content.as_bytes(),
+    );
+    finish_multipart(&mut body, &boundary);
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
 }
 
 fn parse_sse_data_events(body: &str) -> Vec<Value> {
@@ -5255,6 +5342,425 @@ async fn chat_ws_start_turn_uses_selected_openai_compatible_llm() {
     );
 
     server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_executes_selected_llm_tool_calls_before_final_answer() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "chatcmpl-tool-first",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_rag_1",
+                        "type": "function",
+                        "function": {
+                            "name": "rag",
+                            "arguments": "{\"query\":\"What phrase unlocks the violet prism?\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-tool-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final selected LLM answer: the violet prism unlock phrase is silver delta."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let boundary = "SOCARTESTOOLCALLCOURSE";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+tool-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"violet-prism.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The violet prism unlock phrase is silver delta, and this phrase appears only in the uploaded course file.\r\n\
+--{boundary}--\r\n"
+    );
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Use the selected provider and course evidence to answer: What phrase unlocks the violet prism?",
+                "language": "en",
+                "tools": ["rag"],
+                "knowledge_bases": ["tool-course"],
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("tool-backed LLM turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "Final selected LLM answer: the violet prism unlock phrase is silver delta."
+    );
+    assert_eq!(content_event["metadata"]["model"], "provider-chat-model");
+    assert_eq!(content_event["metadata"]["profile_id"], "mock-llm");
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[1]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(recorded[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    assert_eq!(recorded[0]["payload"]["stream"], false);
+    assert_eq!(recorded[0]["payload"]["tool_choice"], "auto");
+    assert!(recorded[1]["payload"]["tools"].is_null());
+    assert!(recorded[1]["payload"]["tool_choice"].is_null());
+
+    let tools = recorded[0]["payload"]["tools"].as_array().expect("tools");
+    let rag_tool = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "rag")
+        .expect("rag tool schema");
+    assert_eq!(rag_tool["type"], "function");
+    assert_eq!(
+        rag_tool["function"]["parameters"]["properties"]["query"]["type"],
+        "string"
+    );
+    assert!(
+        rag_tool["function"]["parameters"]["properties"]
+            .get("kb_name")
+            .is_none(),
+        "selected course should be injected by backend, not exposed to the model"
+    );
+
+    let first_messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    assert!(first_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("violet prism"))
+    }));
+
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let assistant_tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .expect("assistant tool call message");
+    assert_eq!(assistant_tool_message["tool_calls"][0]["id"], "call_rag_1");
+    assert_eq!(
+        assistant_tool_message["tool_calls"][0]["function"]["name"],
+        "rag"
+    );
+    let tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_rag_1")
+        .expect("tool result message");
+    assert_eq!(tool_message["name"], "rag");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("silver delta"))
+    );
+    drop(recorded);
+
+    let session_id = events[0]["session_id"].as_str().unwrap().to_string();
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["status"], "completed");
+    assert_eq!(detail["turns"][0]["status"], "completed");
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(
+        assistant["content"],
+        "Final selected LLM answer: the violet prism unlock phrase is silver delta."
+    );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_selected_llm_tool_calls_are_normalized_truncated_and_bound_to_selected_course() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "chatcmpl-tool-normalize",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {
+                                "name": "rag",
+                                "arguments": "{\"query\":\"What phrase unlocks the violet prism?\",\"kb_name\":\"other-course\"}"
+                            }
+                        },
+                        {
+                            "id": "call_rag_malformed",
+                            "type": "function",
+                            "function": {
+                                "name": "rag",
+                                "arguments": "{'query':'What phrase unlocks the violet prism?',}"
+                            }
+                        },
+                        {
+                            "id": "call_brainstorm_1",
+                            "type": "function",
+                            "function": {
+                                "name": "brainstorm",
+                                "arguments": "{\"topic\":\"violet prism answer\"}"
+                            }
+                        },
+                        {
+                            "id": "call_brainstorm_2",
+                            "type": "function",
+                            "function": {
+                                "name": "brainstorm",
+                                "arguments": "{\"topic\":\"course evidence\"}"
+                            }
+                        },
+                        {
+                            "id": "call_brainstorm_3",
+                            "type": "function",
+                            "function": {
+                                "name": "brainstorm",
+                                "arguments": "{\"topic\":\"should be truncated\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-tool-normalize-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final selected LLM answer after normalized tool calls."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "selected-course",
+        "violet-prism.md",
+        "The violet prism unlock phrase is silver delta in the selected course.",
+    )
+    .await;
+    create_markdown_knowledge_base(
+        app.clone(),
+        "other-course",
+        "wrong-prism.md",
+        "The violet prism unlock phrase is wrong emerald in the unselected course.",
+    )
+    .await;
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "What phrase unlocks the violet prism?",
+        "language": "en",
+        "tools": ["rag", "brainstorm"],
+        "knowledge_bases": ["selected-course"],
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[0]["payload"]["tools"].is_array());
+    assert!(recorded[1]["payload"]["tools"].is_null());
+    assert!(recorded[1]["payload"]["tool_choice"].is_null());
+
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let assistant_tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .expect("assistant tool call message");
+    let assistant_tool_calls = assistant_tool_message["tool_calls"].as_array().unwrap();
+    assert_eq!(assistant_tool_calls.len(), 4);
+    assert_eq!(assistant_tool_calls[0]["id"], "call_0");
+    assert!(
+        assistant_tool_calls
+            .iter()
+            .all(|tool_call| tool_call["id"].as_str().is_some_and(|id| !id.is_empty()))
+    );
+    assert!(
+        !assistant_tool_calls
+            .iter()
+            .any(|tool_call| tool_call["id"] == "call_brainstorm_3")
+    );
+
+    let tool_messages = second_messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 4);
+    assert!(
+        tool_messages
+            .iter()
+            .any(|message| message["tool_call_id"] == "call_0"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("selected-course/violet-prism.md")
+                        && content.contains("silver delta")
+                        && !content.contains("wrong emerald")
+                }))
+    );
+    assert!(tool_messages.iter().any(|message| {
+        message["tool_call_id"] == "call_rag_malformed"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("silver delta"))
+    }));
+    drop(recorded);
+
     llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }

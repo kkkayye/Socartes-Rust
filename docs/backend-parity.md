@@ -92,7 +92,7 @@ python3 tools/api_parity_scan.py \
 - 课程 RAG 检索边界：选定上传课程时只从该课程返回匹配 source；无匹配时返回空 sources，不再回退到内置 `socartes-rust-rag` 资料造成来源串库
 - `/api/v1/sessions/*` 和 `/api/v1/chat/sessions/*` 会话列表、详情、改名、删除、quiz results
 - `/api/v1/ws` unified chat WebSocket：`start_turn/message` 会持久化完整 turn event 序列，`llm_selection` 会按 catalog 中同一 profile 下的 model id 精确校验，无效 selection 返回 `error(status=rejected)` 且不创建 turn；`subscribe_turn`/`resume_from` 可按 `seq` 回放已完成 turn 的尾部事件，也可在 turn 运行中接上 live events；`cancel_turn` 支持同连接、跨连接和已落盘 running turn 取消，并广播/补写 `error(status=cancelled)` + `done(status=cancelled)`；`regenerate` 复用上一条 user、删除尾部 assistant、写入 regenerate metadata 且不重复 user message；无效 regenerate `llm_selection` 会在删改历史前 rejected，保留原 user/assistant 历史；`subscribe_session` 可回放 session 最新 turn
-- `/api/v1/ws` selected LLM runtime：当 turn 选择非 `deterministic-agent-loop` 的 OpenAI-compatible profile/model 时，Rust 会从 settings catalog 解析 `base_url/api_key/api_version/extra_headers/model`，调用 `{base_url}/chat/completions` 的 non-streaming 成功路径，发送 `system + bounded history + current user` messages 和 `stream:false`，并把 provider answer 写入 `content` event 与持久化 assistant message；provider HTTP/JSON/content 错误会发 terminal `error(status=failed)` + `done(status=failed)`，session/turn 标为 `failed`，不写入假的 assistant completed 回答
+- `/api/v1/ws` selected LLM runtime：当 turn 选择非 `deterministic-agent-loop` 的 OpenAI-compatible profile/model 时，Rust 会从 settings catalog 解析 `base_url/api_key/api_version/extra_headers/model`，调用 `{base_url}/chat/completions` 的 non-streaming 成功路径，发送 `system + bounded history + current user` messages 和 `stream:false`，并把 provider answer 写入 `content` event 与持久化 assistant message；当 turn 启用工具且 provider 支持 native tool calling 时，会发送 OpenAI-compatible `tools` schema 与 `tool_choice:"auto"`，解析 assistant `tool_calls`，截断并归一化 tool call id，复用本地 `plugin_tool_result` 执行工具，把 selected course/RAG 的 `kb_name` 在后端强制绑定到当前 turn 选中的课程，RAG query 为空或 arguments 解析失败时回退到当前用户问题，再用一致的 assistant tool_calls + `role:"tool"` messages 发第二轮 completion 生成最终回答；第二轮会禁用 tools/tool_choice，避免重复 tool loop；provider HTTP/JSON/content 错误会发 terminal `error(status=failed)` + `done(status=failed)`，session/turn 标为 `failed`，不写入假的 assistant completed 回答
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
@@ -117,11 +117,11 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`69` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`71` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
-- `cargo test --test api_contract course`：`3` 个课程/知识库契约测试通过
+- `cargo test --test api_contract course`：`4` 个课程/知识库契约测试通过
 - `cargo test --test api_contract knowledge_reindex_creates_signature_version_and_reports_active_match`：课程 reindex signature/version/noop/active_match 契约测试通过
 - `cargo test --test api_contract knowledge_reindex_persists_chunk_index_and_rag_uses_indexed_chunks`：课程 reindex 持久化 chunk index、plugin RAG 和 chat sources 使用 chunk 级 source 的契约测试通过
 - `cargo test --test api_contract knowledge_rag_uses_embedding_similarity_over_keyword_overlap`：课程 RAG 会按 embedding/cosine similarity 选中语义匹配 chunk，而不是按关键词重叠选中 decoy chunk；同时验证 `chunks.json` 和 `default__vector_store.json.embedding_dict` 写入向量
@@ -134,7 +134,8 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract attachment_preview_route_serves_local_chat_files_like_python_contract`：chat attachment preview/download 契约测试通过
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
 - `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、REST image URL 下载/content-type 错误、真实 WS 握手和事件序列契约测试通过
-- `cargo test --test api_contract chat_ws_`：`12` 个 unified chat WebSocket 真实握手、turn event 持久化、`llm_selection` 无效 selection rejected、selected OpenAI-compatible LLM `/chat/completions` 成功路径、provider 失败 terminal error、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换和无效 selection 不破坏历史契约测试通过
+- `cargo test --test api_contract chat_ws_`：`13` 个 unified chat WebSocket 真实握手、turn event 持久化、`llm_selection` 无效 selection rejected、selected OpenAI-compatible LLM `/chat/completions` 成功路径、selected LLM native `tool_calls` -> 本地 RAG 工具执行 -> 第二轮 completion、provider 失败 terminal error、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换和无效 selection 不破坏历史契约测试通过
+- `cargo test --test api_contract chat_selected_llm_tool_calls_are_normalized_truncated_and_bound_to_selected_course`：selected LLM native tool call 的 id 归一化、最多 4 个 tool call 截断、第二轮禁用 tools、`rag.kb_name` 强制绑定 selected course、malformed arguments 回退用户问题的契约测试通过
 - `cargo test --test api_contract embedding_test`：`9` 个 system/settings embedding diagnostic 契约测试通过，覆盖不可达 provider 失败、system 固定 Python batch probe、Azure `api-version`/`api-key`/`extra_headers`、Cohere v2 payload/response、Ollama payload/response、settings detected dimension 写回且不发送 `dimensions`、已知模型能力表刷新、provider 失败 SSE、空 vector terminal failed 文案
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过

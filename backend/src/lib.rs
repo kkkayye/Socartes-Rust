@@ -33,6 +33,7 @@ pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
 const MIN_RETRIEVAL_SCORE: usize = 2;
 const BUILTIN_KNOWLEDGE_BASE: &str = "socartes-rust-rag";
 const DEFAULT_RAG_PROVIDER: &str = "llamaindex";
+const MAX_PARALLEL_CHAT_TOOL_CALLS: usize = 4;
 const RUST_EMBEDDING_BINDING: &str = "rust-local";
 const RUST_EMBEDDING_MODEL: &str = "deterministic-agent-loop";
 const RUST_EMBEDDING_DIMENSION: i64 = 0;
@@ -5008,6 +5009,12 @@ struct ChatRuntimeSelection {
 }
 
 #[derive(Debug, Clone)]
+struct ChatProviderResponse {
+    content: Option<String>,
+    tool_calls: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
 struct EmbeddingRuntimeSelection {
     binding: String,
     base_url: String,
@@ -5249,6 +5256,11 @@ fn chat_completion_endpoint(selection: &ChatRuntimeSelection) -> Result<String, 
     }
 }
 
+struct ChatCompletionBodyOptions<'a> {
+    enabled_tools: &'a [String],
+    additional_messages: &'a [Value],
+}
+
 fn chat_completion_body(
     selection: &ChatRuntimeSelection,
     state: &AppState,
@@ -5256,6 +5268,7 @@ fn chat_completion_body(
     content: &str,
     learner_context: &str,
     trace: &StudyTrace,
+    options: ChatCompletionBodyOptions<'_>,
 ) -> Value {
     let mut messages = vec![json!({
         "role": "system",
@@ -5266,11 +5279,18 @@ fn chat_completion_body(
         "role": "user",
         "content": content
     }));
-    json!({
+    messages.extend(options.additional_messages.iter().cloned());
+    let mut body = json!({
         "model": selection.model.as_str(),
         "messages": messages,
         "stream": false
-    })
+    });
+    let tool_definitions = openai_chat_tool_definitions(selection, options.enabled_tools);
+    if !tool_definitions.is_empty() {
+        body["tools"] = Value::Array(tool_definitions);
+        body["tool_choice"] = json!("auto");
+    }
+    body
 }
 
 fn chat_system_prompt(learner_context: &str, trace: &StudyTrace) -> String {
@@ -5348,7 +5368,7 @@ fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
 async fn call_chat_completion_provider(
     selection: &ChatRuntimeSelection,
     body: Value,
-) -> Result<String, String> {
+) -> Result<ChatProviderResponse, String> {
     let endpoint = chat_completion_endpoint(selection)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -5375,8 +5395,12 @@ async fn call_chat_completion_provider(
     }
     let payload = serde_json::from_str::<Value>(&text)
         .map_err(|error| format!("Invalid JSON response: {error}"))?;
-    parse_chat_completion_content(&payload)
-        .ok_or_else(|| "Chat completion response did not include assistant content".to_string())
+    let response = parse_chat_completion_response(&payload)
+        .ok_or_else(|| "Chat completion response did not include assistant content".to_string())?;
+    if response.content.is_none() && response.tool_calls.is_empty() {
+        return Err("Chat completion response did not include assistant content".to_string());
+    }
+    Ok(response)
 }
 
 fn apply_openai_compatible_request_headers(
@@ -5420,6 +5444,25 @@ fn parse_chat_completion_content(payload: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn parse_chat_completion_response(payload: &Value) -> Option<ChatProviderResponse> {
+    let message = &payload["choices"].as_array()?.first()?["message"];
+    let content = parse_chat_completion_content(payload);
+    let tool_calls = message["tool_calls"]
+        .as_array()
+        .map(|calls| {
+            calls
+                .iter()
+                .filter(|call| call["function"]["name"].as_str().is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ChatProviderResponse {
+        content,
+        tool_calls,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10307,6 +10350,242 @@ fn tool_parameter(
     })
 }
 
+fn requested_chat_tool_names(payload: &Value) -> Vec<String> {
+    let allowed = plugin_tool_names();
+    let mut seen = HashSet::new();
+    as_string_array(&payload["tools"])
+        .into_iter()
+        .filter(|name| allowed.contains(&name.as_str()))
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+fn supports_native_chat_tools(selection: &ChatRuntimeSelection) -> bool {
+    let binding = selection.binding.to_ascii_lowercase();
+    !matches!(
+        binding.as_str(),
+        "anthropic" | "claude" | "ollama" | "lm_studio" | "vllm" | "llama_cpp"
+    )
+}
+
+fn openai_chat_tool_definitions(
+    selection: &ChatRuntimeSelection,
+    enabled_tools: &[String],
+) -> Vec<Value> {
+    if enabled_tools.is_empty() || !supports_native_chat_tools(selection) {
+        return Vec::new();
+    }
+    let enabled = enabled_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    plugin_tool_definitions()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|definition| {
+            let name = definition["name"].as_str()?;
+            if !enabled.contains(name) {
+                return None;
+            }
+            let mut properties = Map::new();
+            let mut required = Vec::new();
+            for parameter in definition["parameters"].as_array().into_iter().flatten() {
+                let parameter_name = parameter["name"].as_str()?;
+                if name == "rag" && parameter_name == "kb_name" {
+                    continue;
+                }
+                let mut schema = Map::new();
+                schema.insert(
+                    "type".to_string(),
+                    json!(parameter["type"].as_str().unwrap_or("string")),
+                );
+                if let Some(description) = parameter["description"].as_str() {
+                    schema.insert("description".to_string(), json!(description));
+                }
+                if parameter["enum"].is_array() {
+                    schema.insert("enum".to_string(), parameter["enum"].clone());
+                }
+                if !parameter["default"].is_null() {
+                    schema.insert("default".to_string(), parameter["default"].clone());
+                }
+                if parameter["required"].as_bool() == Some(true) {
+                    required.push(json!(parameter_name));
+                }
+                properties.insert(parameter_name.to_string(), Value::Object(schema));
+            }
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": definition["description"].as_str().unwrap_or_default(),
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required
+                    }
+                }
+            }))
+        })
+        .collect()
+}
+
+async fn execute_chat_provider_tool_calls(
+    state: &AppState,
+    enabled_tools: &[String],
+    knowledge_bases: &[String],
+    fallback_query: &str,
+    tool_calls: &[Value],
+) -> (Vec<Value>, Vec<ToolResult>, Vec<Value>) {
+    let enabled = enabled_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let allowed = plugin_tool_names();
+    let mut tool_messages = Vec::new();
+    let mut trace_results = Vec::new();
+    let mut raw_results = Vec::new();
+
+    for (index, tool_call) in tool_calls
+        .iter()
+        .take(MAX_PARALLEL_CHAT_TOOL_CALLS)
+        .enumerate()
+    {
+        let name = tool_call["function"]["name"].as_str().unwrap_or_default();
+        let tool_call_id = tool_call["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("call_{index}"));
+        let params = chat_provider_tool_params(tool_call, name, knowledge_bases, fallback_query);
+        let result = if enabled.contains(name) && allowed.contains(&name) {
+            match plugin_tool_result(state, name, params.clone()).await {
+                Ok(value) => value,
+                Err((status, Json(error))) => {
+                    let detail = error["detail"].as_str().unwrap_or("tool execution failed");
+                    json!({
+                        "success": false,
+                        "content": format!("Error executing {name}: {detail}"),
+                        "sources": [],
+                        "metadata": {
+                            "error": detail,
+                            "status": status.as_u16()
+                        }
+                    })
+                }
+            }
+        } else {
+            json!({
+                "success": false,
+                "content": format!("Tool '{name}' is not enabled for this chat turn."),
+                "sources": [],
+                "metadata": {
+                    "error": "tool_not_enabled",
+                    "tool": name
+                }
+            })
+        };
+        let content = result["content"]
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| result.to_string());
+        tool_messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "content": content
+        }));
+        trace_results.push(ToolResult {
+            adapter: "llm_tool_call".to_string(),
+            action: name.to_string(),
+            output: content,
+            safe: result["success"].as_bool().unwrap_or(false),
+        });
+        raw_results.push(json!({
+            "id": tool_call_id,
+            "name": name,
+            "arguments": params,
+            "result": result
+        }));
+    }
+
+    (tool_messages, trace_results, raw_results)
+}
+
+fn chat_provider_tool_params(
+    tool_call: &Value,
+    tool_name: &str,
+    knowledge_bases: &[String],
+    fallback_query: &str,
+) -> Value {
+    let mut params = match &tool_call["function"]["arguments"] {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({})),
+        Value::Object(_) => tool_call["function"]["arguments"].clone(),
+        _ => json!({}),
+    };
+    if tool_name == "rag"
+        && let Some(object) = params.as_object_mut()
+    {
+        object.remove("kb_name");
+        let query_is_empty = object
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .is_empty();
+        if query_is_empty {
+            object.insert("query".to_string(), json!(fallback_query));
+        }
+        if let Some(kb_name) = knowledge_bases.first() {
+            object.insert("kb_name".to_string(), json!(kb_name));
+        }
+    }
+    params
+}
+
+fn normalized_chat_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .take(MAX_PARALLEL_CHAT_TOOL_CALLS)
+        .enumerate()
+        .map(|(index, tool_call)| {
+            let mut normalized = tool_call.clone();
+            if normalized["id"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                normalized["id"] = json!(format!("call_{index}"));
+            }
+            if normalized["type"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                normalized["type"] = json!("function");
+            }
+            normalized
+        })
+        .collect()
+}
+
+fn assistant_tool_call_message(response: &ChatProviderResponse, tool_calls: &[Value]) -> Value {
+    json!({
+        "role": "assistant",
+        "content": response
+            .content
+            .as_ref()
+            .map(|content| json!(content))
+            .unwrap_or(Value::Null),
+        "tool_calls": tool_calls
+    })
+}
+
 fn plugin_capability_names() -> Vec<&'static str> {
     vec![
         "chat",
@@ -12251,6 +12530,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         .map(|language| format!("Frontend language: {language}"))
         .unwrap_or_default();
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
+    let enabled_tools = requested_chat_tool_names(payload);
     let retrieved_context = retrieve_chat_context(state, content, &knowledge_bases).await;
     let mut trace = SocartesOrchestrator::new().run_with_retrieved_context(
         content,
@@ -12281,17 +12561,81 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             content,
             &learner_context,
             &trace,
+            ChatCompletionBodyOptions {
+                enabled_tools: &enabled_tools,
+                additional_messages: &[],
+            },
         );
         match call_chat_completion_provider(selection, body).await {
-            Ok(answer) => {
-                trace.final_answer = answer.clone();
-                trace.draft.content = answer;
-                provider_metadata = Some(json!({
+            Ok(response) => {
+                let mut metadata = json!({
                     "profile_id": selection.profile_id.as_str(),
                     "model_id": selection.model_id.as_str(),
                     "model": selection.model.as_str(),
                     "provider": selection.binding.as_str()
-                }));
+                });
+                let final_answer = if response.tool_calls.is_empty() {
+                    response.content.clone().ok_or_else(|| {
+                        "Chat completion response did not include assistant content".to_string()
+                    })
+                } else {
+                    let tool_calls = normalized_chat_tool_calls(&response.tool_calls);
+                    let (tool_messages, trace_tool_results, raw_tool_results) =
+                        execute_chat_provider_tool_calls(
+                            state,
+                            &enabled_tools,
+                            &knowledge_bases,
+                            content,
+                            &tool_calls,
+                        )
+                        .await;
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert("tool_calls".to_string(), json!(tool_calls.len()));
+                        object.insert("tool_results".to_string(), Value::Array(raw_tool_results));
+                    }
+                    trace.tool_results.extend(trace_tool_results);
+                    let mut additional_messages =
+                        vec![assistant_tool_call_message(&response, &tool_calls)];
+                    additional_messages.extend(tool_messages);
+                    let body = chat_completion_body(
+                        selection,
+                        state,
+                        &session_id,
+                        content,
+                        &learner_context,
+                        &trace,
+                        ChatCompletionBodyOptions {
+                            enabled_tools: &[],
+                            additional_messages: &additional_messages,
+                        },
+                    );
+                    match call_chat_completion_provider(selection, body).await {
+                        Ok(final_response) => final_response.content.clone().ok_or_else(|| {
+                            "Chat completion response after tool execution did not include assistant content"
+                                .to_string()
+                        }),
+                        Err(error) => Err(error),
+                    }
+                };
+                match final_answer {
+                    Ok(answer) => {
+                        trace.final_answer = answer.clone();
+                        trace.draft.content = answer;
+                        provider_metadata = Some(metadata);
+                    }
+                    Err(error) => {
+                        trace.review.status = "provider_error".to_string();
+                        trace.review.approved = false;
+                        trace.review.issues.push(CriticIssue {
+                            issue_type: "llm_provider".to_string(),
+                            claim: "The selected LLM provider did not return a usable response."
+                                .to_string(),
+                            instruction: error.clone(),
+                        });
+                        provider_metadata = Some(metadata);
+                        provider_error = Some(error);
+                    }
+                }
             }
             Err(error) => {
                 trace.review.status = "provider_error".to_string();
