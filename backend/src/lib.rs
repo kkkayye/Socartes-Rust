@@ -52,6 +52,8 @@ const TUTORBOT_EDITABLE_FILES: &[&str] = &[
     "HEARTBEAT.md",
 ];
 const SECRET_MASK: &str = "***";
+const INVALID_EMBEDDING_RESPONSE_DETAIL: &str =
+    "Embedding response must contain one non-empty vector per input";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StudyRequest {
@@ -4882,6 +4884,722 @@ fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<Stri
         .map(ToString::to_string)
 }
 
+#[derive(Debug, Clone)]
+struct EmbeddingRuntimeSelection {
+    binding: String,
+    base_url: String,
+    api_key: String,
+    api_version: String,
+    extra_headers: BTreeMap<String, String>,
+    model: String,
+    dimension: Option<i64>,
+    send_dimensions: bool,
+    supported_dimensions: Vec<i64>,
+}
+
+fn active_embedding_selection(catalog: &Value) -> Result<EmbeddingRuntimeSelection, String> {
+    let service = &catalog["services"]["embedding"];
+    let profiles = service["profiles"].as_array().ok_or_else(|| {
+        "No active embedding model is configured. Please set it in Settings > Catalog.".to_string()
+    })?;
+    let active_profile_id = service["active_profile_id"].as_str();
+    let profile = profiles
+        .iter()
+        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
+        .or_else(|| profiles.first())
+        .ok_or_else(|| {
+            "No active embedding model is configured. Please set it in Settings > Catalog."
+                .to_string()
+        })?;
+    let models = profile["models"].as_array().ok_or_else(|| {
+        "No active embedding model is configured. Please set it in Settings > Catalog.".to_string()
+    })?;
+    let active_model_id = service["active_model_id"].as_str();
+    let model = models
+        .iter()
+        .find(|model| Some(model["id"].as_str().unwrap_or_default()) == active_model_id)
+        .or_else(|| models.first())
+        .ok_or_else(|| {
+            "No active embedding model is configured. Please set it in Settings > Catalog."
+                .to_string()
+        })?;
+    let model_name = model["model"]
+        .as_str()
+        .or_else(|| model["name"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "No active embedding model is configured. Please set it in Settings > Catalog."
+                .to_string()
+        })?;
+    Ok(EmbeddingRuntimeSelection {
+        binding: profile["binding"]
+            .as_str()
+            .unwrap_or("openai")
+            .trim()
+            .to_string(),
+        base_url: profile["base_url"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        api_key: profile["api_key"].as_str().unwrap_or("").trim().to_string(),
+        api_version: profile["api_version"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        extra_headers: parse_string_map_field(&profile["extra_headers"]),
+        model: model_name.to_string(),
+        dimension: parse_i64_field(&model["dimension"]),
+        send_dimensions: model["send_dimensions"].as_bool().unwrap_or(false),
+        supported_dimensions: parse_i64_list_field(&model["supported_dimensions"]),
+    })
+}
+
+fn parse_i64_field(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_i64_list_field(value: &Value) -> Vec<i64> {
+    match value {
+        Value::Array(items) => items.iter().filter_map(parse_i64_field).collect(),
+        Value::String(text) => text
+            .split(',')
+            .filter_map(|item| item.trim().parse::<i64>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_string_map_field(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|(key, value)| {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let value = value
+                        .as_str()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| value.to_string());
+                    Some((key.to_string(), value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingProviderKind {
+    OpenAiCompatible,
+    Cohere,
+    Ollama,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingModelCapabilities {
+    default_dim: i64,
+    supported_dimensions: Vec<i64>,
+    supports_variable_dimensions: bool,
+    model_known: bool,
+}
+
+fn embedding_provider_kind(binding: &str) -> EmbeddingProviderKind {
+    match binding.trim().to_lowercase().as_str() {
+        "cohere" => EmbeddingProviderKind::Cohere,
+        "ollama" => EmbeddingProviderKind::Ollama,
+        _ => EmbeddingProviderKind::OpenAiCompatible,
+    }
+}
+
+fn embedding_model_capabilities(
+    selection: &EmbeddingRuntimeSelection,
+) -> EmbeddingModelCapabilities {
+    let capability = match embedding_provider_kind(&selection.binding) {
+        EmbeddingProviderKind::Cohere => match selection.model.as_str() {
+            "embed-v4.0" => Some((1024, vec![256, 512, 1024, 1536])),
+            "embed-english-v3.0" | "embed-multilingual-v3.0" => Some((1024, vec![1024])),
+            "embed-multilingual-light-v3.0" | "embed-english-light-v3.0" => Some((384, vec![384])),
+            _ => None,
+        },
+        EmbeddingProviderKind::Ollama => match selection.model.as_str() {
+            "all-minilm" => Some((384, Vec::new())),
+            "all-mpnet-base-v2" => Some((768, Vec::new())),
+            "nomic-embed-text" => Some((768, Vec::new())),
+            "mxbai-embed-large" => Some((1024, Vec::new())),
+            "snowflake-arctic-embed" => Some((1024, Vec::new())),
+            _ => None,
+        },
+        EmbeddingProviderKind::OpenAiCompatible => match selection.model.as_str() {
+            "text-embedding-3-large" => Some((3072, vec![256, 512, 1024, 3072])),
+            "text-embedding-3-small" => Some((1536, vec![512, 1536])),
+            "text-embedding-ada-002" => Some((1536, Vec::new())),
+            "jina-embeddings-v3" | "jina-embeddings-v4" => {
+                Some((1024, vec![32, 64, 128, 256, 512, 768, 1024]))
+            }
+            _ => None,
+        },
+    };
+    let (default_dim, supported_dimensions, model_known) = match capability {
+        Some((default_dim, supported_dimensions)) => (default_dim, supported_dimensions, true),
+        None => (
+            selection.dimension.unwrap_or_default(),
+            selection.supported_dimensions.clone(),
+            false,
+        ),
+    };
+    EmbeddingModelCapabilities {
+        default_dim,
+        supports_variable_dimensions: supported_dimensions.len() > 1,
+        supported_dimensions,
+        model_known,
+    }
+}
+
+fn embedding_endpoint(selection: &EmbeddingRuntimeSelection) -> Result<String, String> {
+    let trimmed = selection.base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(
+            "No effective embedding endpoint resolved. Please configure base_url/host for the active profile."
+                .to_string(),
+        );
+    }
+    if trimmed == RUST_EMBEDDING_BASE_URL || trimmed.starts_with("local://") {
+        return Ok(trimmed.to_string());
+    }
+    match embedding_provider_kind(&selection.binding) {
+        EmbeddingProviderKind::Cohere => {
+            if trimmed.ends_with("/embed") {
+                Ok(trimmed.to_string())
+            } else {
+                Ok(format!("{trimmed}/embed"))
+            }
+        }
+        EmbeddingProviderKind::Ollama => {
+            if trimmed.ends_with("/api/embed") {
+                Ok(trimmed.to_string())
+            } else {
+                Ok(format!("{trimmed}/api/embed"))
+            }
+        }
+        EmbeddingProviderKind::OpenAiCompatible => {
+            if trimmed.ends_with("/embeddings") {
+                Ok(trimmed.to_string())
+            } else {
+                Ok(format!("{trimmed}/embeddings"))
+            }
+        }
+    }
+}
+
+fn embedding_probe_body(
+    selection: &EmbeddingRuntimeSelection,
+    probe_texts: &[&str],
+    send_dimensions: bool,
+) -> Value {
+    match embedding_provider_kind(&selection.binding) {
+        EmbeddingProviderKind::Cohere => {
+            let cohere_v1 = selection.api_version == "v1"
+                || matches!(
+                    selection.model.as_str(),
+                    "embed-english-v3.0"
+                        | "embed-multilingual-v3.0"
+                        | "embed-multilingual-light-v3.0"
+                        | "embed-english-light-v3.0"
+                );
+            let mut body = if cohere_v1 {
+                json!({
+                    "model": selection.model,
+                    "texts": probe_texts,
+                    "input_type": "search_document",
+                    "truncate": "NONE"
+                })
+            } else {
+                json!({
+                    "model": selection.model,
+                    "texts": probe_texts,
+                    "embedding_types": ["float"],
+                    "input_type": "search_document",
+                    "truncate": "NONE"
+                })
+            };
+            if !cohere_v1
+                && let Some(dimension) = selection.dimension.filter(|dimension| *dimension > 0)
+            {
+                body["output_dimension"] = json!(dimension);
+            }
+            body
+        }
+        EmbeddingProviderKind::Ollama => {
+            let mut body = json!({
+                "model": selection.model,
+                "input": probe_texts,
+                "keep_alive": "5m"
+            });
+            if send_dimensions
+                && let Some(dimension) = selection.dimension.filter(|dimension| *dimension > 0)
+            {
+                body["dimensions"] = json!(dimension);
+            }
+            body
+        }
+        EmbeddingProviderKind::OpenAiCompatible => {
+            let mut body = json!({
+                "model": selection.model,
+                "input": probe_texts,
+                "encoding_format": "float"
+            });
+            if send_dimensions
+                && let Some(dimension) = selection.dimension.filter(|dimension| *dimension > 0)
+            {
+                body["dimensions"] = json!(dimension);
+            }
+            body
+        }
+    }
+}
+
+async fn run_embedding_connection_test(catalog: &Value) -> Value {
+    let start = SystemTime::now();
+    let selection = match active_embedding_selection(catalog) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return json!({
+                "success": false,
+                "message": format!("Embeddings configuration error: {error}"),
+                "model": null,
+                "response_time_ms": null,
+                "error": error
+            });
+        }
+    };
+    match probe_embedding_provider(
+        &selection,
+        &["test", "retrieval batch probe"],
+        selection.send_dimensions,
+    )
+    .await
+    {
+        Ok(_dimension) => json!({
+            "success": true,
+            "message": format!("Embeddings connection successful ({} provider)", selection.binding),
+            "model": selection.model,
+            "response_time_ms": elapsed_millis(start),
+            "error": null
+        }),
+        Err(EmbeddingProbeError::Configuration(error)) => json!({
+            "success": false,
+            "message": format!("Embeddings configuration error: {error}"),
+            "model": null,
+            "response_time_ms": null,
+            "error": error
+        }),
+        Err(EmbeddingProbeError::InvalidResponse(_error)) => json!({
+            "success": false,
+            "message": "Embeddings connection failed: Invalid response",
+            "model": selection.model,
+            "response_time_ms": null,
+            "error": INVALID_EMBEDDING_RESPONSE_DETAIL
+        }),
+        Err(EmbeddingProbeError::Connection(error)) => json!({
+            "success": false,
+            "message": format!("Embeddings connection failed: {error}"),
+            "model": null,
+            "response_time_ms": elapsed_millis(start),
+            "error": error
+        }),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EmbeddingProbeError {
+    Configuration(String),
+    Connection(String),
+    InvalidResponse(String),
+}
+
+async fn probe_embedding_provider(
+    selection: &EmbeddingRuntimeSelection,
+    probe_texts: &[&str],
+    send_dimensions: bool,
+) -> Result<usize, EmbeddingProbeError> {
+    let endpoint = embedding_endpoint(selection).map_err(EmbeddingProbeError::Configuration)?;
+    if selection.model == "deterministic-embedding"
+        || endpoint == RUST_EMBEDDING_BASE_URL
+        || endpoint.starts_with("local://")
+    {
+        return Ok(selection.dimension.unwrap_or(3072).max(1) as usize);
+    }
+    let body = embedding_probe_body(selection, probe_texts, send_dimensions);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    let mut request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if !selection.api_key.is_empty() {
+        if selection.api_version.is_empty() {
+            request = request.bearer_auth(&selection.api_key);
+        } else {
+            request = request
+                .query(&[("api-version", selection.api_version.as_str())])
+                .header("api-key", selection.api_key.as_str());
+        }
+    } else if !selection.api_version.is_empty() {
+        request = request.query(&[("api-version", selection.api_version.as_str())]);
+    }
+    for (name, value) in &selection.extra_headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| EmbeddingProbeError::Connection(error.to_string()))?;
+    if !status.is_success() {
+        return Err(EmbeddingProbeError::Connection(format!(
+            "HTTP {} from {endpoint}: {text}",
+            status.as_u16()
+        )));
+    }
+    let payload = serde_json::from_str::<Value>(&text).map_err(|error| {
+        EmbeddingProbeError::Connection(format!("Invalid JSON response: {error}"))
+    })?;
+    validate_embedding_probe_payload(selection, &payload, probe_texts.len())
+}
+
+fn validate_embedding_probe_payload(
+    selection: &EmbeddingRuntimeSelection,
+    payload: &Value,
+    expected_count: usize,
+) -> Result<usize, EmbeddingProbeError> {
+    let vectors = extract_embedding_vectors(selection, payload)?;
+    if vectors.len() != expected_count {
+        return Err(invalid_embedding_response(format!(
+            "Embedding service returned an unexpected number of vectors (expected {expected_count}, got {}).",
+            vectors.len()
+        )));
+    }
+    let mut dimension = None;
+    for vector in vectors {
+        if vector.is_empty() {
+            return Err(invalid_embedding_response(
+                "Embedding service returned an empty vector.",
+            ));
+        }
+        match dimension {
+            Some(expected) if expected != vector.len() => {
+                return Err(invalid_embedding_response(
+                    "Embedding service returned inconsistent vector dimensions.",
+                ));
+            }
+            Some(_) => {}
+            None => dimension = Some(vector.len()),
+        }
+    }
+    Ok(dimension.unwrap_or_default())
+}
+
+fn extract_embedding_vectors<'a>(
+    selection: &EmbeddingRuntimeSelection,
+    payload: &'a Value,
+) -> Result<Vec<&'a Vec<Value>>, EmbeddingProbeError> {
+    match embedding_provider_kind(&selection.binding) {
+        EmbeddingProviderKind::Cohere => {
+            let cohere_v1 = selection.api_version == "v1"
+                || matches!(
+                    selection.model.as_str(),
+                    "embed-english-v3.0"
+                        | "embed-multilingual-v3.0"
+                        | "embed-multilingual-light-v3.0"
+                        | "embed-english-light-v3.0"
+                );
+            let value = if cohere_v1 {
+                &payload["embeddings"]
+            } else {
+                &payload["embeddings"]["float"]
+            };
+            vector_array_items(value)
+        }
+        EmbeddingProviderKind::Ollama => vector_array_items(&payload["embeddings"]),
+        EmbeddingProviderKind::OpenAiCompatible => extract_openai_compatible_vectors(payload),
+    }
+}
+
+fn extract_openai_compatible_vectors(
+    payload: &Value,
+) -> Result<Vec<&Vec<Value>>, EmbeddingProbeError> {
+    if payload.get("error").is_some() {
+        return Err(invalid_embedding_response(
+            "Embedding provider returned an error payload.",
+        ));
+    }
+    for candidate in [
+        &payload["data"],
+        &payload["embeddings"],
+        &payload["embedding"],
+        &payload["result"]["data"],
+        &payload["result"]["embeddings"],
+        &payload["output"]["data"],
+        &payload["output"]["embeddings"],
+    ] {
+        if let Ok(vectors) = vector_array_items(candidate)
+            && !vectors.is_empty()
+        {
+            return Ok(vectors);
+        }
+        if let Some(vector) = candidate.as_array()
+            && vector.first().is_some_and(|value| value.is_number())
+        {
+            return Ok(vec![vector]);
+        }
+    }
+    Err(invalid_embedding_response(
+        INVALID_EMBEDDING_RESPONSE_DETAIL,
+    ))
+}
+
+fn vector_array_items(value: &Value) -> Result<Vec<&Vec<Value>>, EmbeddingProbeError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| invalid_embedding_response(INVALID_EMBEDDING_RESPONSE_DETAIL))?;
+    if items
+        .first()
+        .is_some_and(|item| item["embedding"].is_array())
+    {
+        return Ok(items
+            .iter()
+            .filter_map(|item| item["embedding"].as_array())
+            .collect());
+    }
+    if items.first().is_some_and(Value::is_array) {
+        return Ok(items.iter().filter_map(Value::as_array).collect());
+    }
+    Err(invalid_embedding_response(
+        INVALID_EMBEDDING_RESPONSE_DETAIL,
+    ))
+}
+
+fn invalid_embedding_response(message: impl Into<String>) -> EmbeddingProbeError {
+    EmbeddingProbeError::InvalidResponse(message.into())
+}
+
+fn elapsed_millis(start: SystemTime) -> f64 {
+    start
+        .elapsed()
+        .map(|elapsed| (elapsed.as_secs_f64() * 100_000.0).round() / 100.0)
+        .unwrap_or(0.0)
+}
+
+fn settings_test_run_suffix() -> String {
+    format!("{:010x}", unique_id() & 0xff_ff_ff_ff_ff)
+}
+
+fn settings_test_run_path(state: &AppState, run_id: &str) -> Result<PathBuf, ApiError> {
+    let Some(component) = safe_storage_component(run_id) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid settings test run id",
+        ));
+    };
+    Ok(state
+        .settings_root
+        .join("test-runs")
+        .join(format!("{component}.json")))
+}
+
+fn settings_data_event(payload: Value) -> String {
+    format!("data: {payload}\n\n")
+}
+
+fn settings_event_payload(event_type: &str, message: impl Into<String>) -> Value {
+    json!({
+        "type": event_type,
+        "message": message.into(),
+        "timestamp": now_seconds()
+    })
+}
+
+fn embedding_probe_error_message(error: EmbeddingProbeError) -> String {
+    match error {
+        EmbeddingProbeError::Configuration(message)
+        | EmbeddingProbeError::Connection(message)
+        | EmbeddingProbeError::InvalidResponse(message) => message,
+    }
+}
+
+async fn embedding_settings_events(state: &AppState, catalog: &Value) -> String {
+    let mut body = String::new();
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Preparing configuration snapshot.",
+    )));
+    let selection = match active_embedding_selection(catalog) {
+        Ok(selection) => selection,
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed", error,
+            )));
+            return body;
+        }
+    };
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Loading embedding config from the active catalog selection.",
+    )));
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!(
+            "Resolved embedding model `{}` with binding `{}`.",
+            selection.model, selection.binding
+        ),
+    )));
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!(
+            "Request target (POSTed exactly as shown in Settings): {}",
+            selection.base_url
+        ),
+    )));
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Probing native max dimension with a small batch (sending no `dimensions=` param).",
+    )));
+
+    let detected_dim = match probe_embedding_provider(
+        &selection,
+        &[
+            "DeepTutor embedding smoke test",
+            "DeepTutor retrieval batch probe",
+        ],
+        false,
+    )
+    .await
+    {
+        Ok(detected_dim) => detected_dim as i64,
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed",
+                embedding_probe_error_message(error),
+            )));
+            return body;
+        }
+    };
+    let capabilities = embedding_model_capabilities(&selection);
+    let default_dim = if capabilities.default_dim > 0 {
+        capabilities.default_dim
+    } else {
+        detected_dim
+    };
+    let supported_dimensions = capabilities.supported_dimensions.clone();
+    let saved_catalog =
+        catalog_with_detected_embedding_dimension(catalog, detected_dim, &supported_dimensions);
+    body.push_str(&settings_data_event(json!({
+        "type": "capabilities",
+        "message": format!("Probe returned {detected_dim}d."),
+        "timestamp": now_seconds(),
+        "detected_dim": detected_dim,
+        "default_dim": default_dim,
+        "supported_dimensions": supported_dimensions,
+        "supports_variable_dimensions": capabilities.supports_variable_dimensions,
+        "model_known": capabilities.model_known,
+        "active_dim": detected_dim,
+        "active_dim_source": "detected"
+    })));
+    body.push_str(&settings_data_event(json!({
+        "type": "response",
+        "message": "Embedding vector received.",
+        "timestamp": now_seconds(),
+        "actual_dimension": detected_dim,
+        "expected_dimension": selection.dimension
+    })));
+    match write_settings_json(state, "catalog.json", &saved_catalog) {
+        Ok(()) => body.push_str(&settings_data_event(json!({
+            "type": "catalog",
+            "message": "Saved detected embedding dimension to model_catalog.json.",
+            "timestamp": now_seconds(),
+            "catalog": saved_catalog
+        }))),
+        Err(error) => {
+            let detail = error.1.0["detail"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string();
+            body.push_str(&settings_data_event(settings_event_payload(
+                "warning",
+                format!("Could not save detected embedding dimension: {detail}"),
+            )));
+        }
+    }
+    body.push_str(&settings_data_event(settings_event_payload(
+        "completed",
+        "EMBEDDING test completed successfully.",
+    )));
+    body
+}
+
+fn catalog_with_detected_embedding_dimension(
+    catalog: &Value,
+    detected_dim: i64,
+    supported_dimensions: &[i64],
+) -> Value {
+    let mut saved = catalog.clone();
+    let active_profile_id = saved["services"]["embedding"]["active_profile_id"]
+        .as_str()
+        .map(ToString::to_string);
+    let active_model_id = saved["services"]["embedding"]["active_model_id"]
+        .as_str()
+        .map(ToString::to_string);
+    if let Some(profiles) = saved["services"]["embedding"]["profiles"].as_array_mut() {
+        let profile_index = profiles
+            .iter()
+            .position(|profile| {
+                active_profile_id
+                    .as_deref()
+                    .is_some_and(|id| profile["id"].as_str() == Some(id))
+            })
+            .unwrap_or(0);
+        if let Some(profile) = profiles.get_mut(profile_index)
+            && let Some(models) = profile["models"].as_array_mut()
+        {
+            let model_index = models
+                .iter()
+                .position(|model| {
+                    active_model_id
+                        .as_deref()
+                        .is_some_and(|id| model["id"].as_str() == Some(id))
+                })
+                .unwrap_or(0);
+            if let Some(model) = models.get_mut(model_index) {
+                model["dimension"] = json!(detected_dim.to_string());
+                model["supported_dimensions"] = json!(
+                    supported_dimensions
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+    }
+    saved
+}
+
 fn resolve_chat_llm_selection(state: &AppState, payload: &mut Value) {
     let has_explicit_selection = payload
         .get("llm_selection")
@@ -6973,24 +7691,62 @@ async fn reopen_settings_tour() -> Json<Value> {
 }
 
 async fn start_settings_test(
+    State(state): State<AppState>,
     Path(service): Path<String>,
     Json(payload): Json<Value>,
-) -> Json<Value> {
-    let _ = payload;
-    Json(json!({ "run_id": format!("{service}-{}", unique_id()) }))
+) -> axum::response::Response {
+    let run_id = format!("{service}-{}", settings_test_run_suffix());
+    if service == "embedding" {
+        let catalog = payload
+            .get("catalog")
+            .cloned()
+            .unwrap_or_else(|| load_settings_catalog(&state));
+        let snapshot = json!({
+            "service": service,
+            "catalog": catalog
+        });
+        let path = match settings_test_run_path(&state, &run_id) {
+            Ok(path) => path,
+            Err(error) => return error.into_response(),
+        };
+        if let Err(error) = write_json_file(&path, &snapshot) {
+            return error.into_response();
+        }
+    }
+    Json(json!({ "run_id": run_id })).into_response()
 }
 
 async fn settings_test_events(
+    State(state): State<AppState>,
     Path((service, run_id)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let service = service.replace('"', "");
     let run_id = run_id.replace('"', "");
+    if service == "embedding" {
+        let path = match settings_test_run_path(&state, &run_id) {
+            Ok(path) => path,
+            Err(error) => return error.into_response(),
+        };
+        let snapshot = match read_json_file(&path, "Settings test run not found") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error.into_response(),
+        };
+        let catalog = snapshot
+            .get("catalog")
+            .cloned()
+            .unwrap_or_else(|| load_settings_catalog(&state));
+        return (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            embedding_settings_events(&state, &catalog).await,
+        )
+            .into_response();
+    }
     let body = format!(
         "data: {{\"type\":\"started\",\"message\":\"Socartes Rust {service} diagnostics started\",\"run_id\":\"{run_id}\"}}\n\n\
 data: {{\"type\":\"capabilities\",\"message\":\"Detected deterministic Rust compatibility capabilities\",\"detected_dim\":3072,\"default_dim\":3072,\"supported_dimensions\":[1536,3072],\"supports_variable_dimensions\":true,\"model_known\":true,\"active_dim\":3072,\"active_dim_source\":\"catalog\"}}\n\n\
 data: {{\"type\":\"completed\",\"message\":\"{service} diagnostics completed\"}}\n\n"
     );
-    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
 async fn cancel_settings_test(Path((_service, _run_id)): Path<(String, String)>) -> Json<Value> {
@@ -7056,16 +7812,18 @@ async fn system_test_llm(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn system_test_embeddings(State(state): State<AppState>) -> Json<Value> {
-    let model = active_catalog_model_name(&load_settings_catalog(&state), "embedding")
-        .unwrap_or_else(|| "deterministic-embedding".to_string());
-    Json(json!({
-        "success": true,
-        "message": "Socartes Rust deterministic embedding test completed.",
-        "model": model,
-        "response_time_ms": 1.0,
-        "error": null
-    }))
+async fn system_test_embeddings(
+    State(state): State<AppState>,
+    payload: Option<Json<Value>>,
+) -> Json<Value> {
+    let payload = payload
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| json!({}));
+    let catalog = payload
+        .get("catalog")
+        .cloned()
+        .unwrap_or_else(|| load_settings_catalog(&state));
+    Json(run_embedding_connection_test(&catalog).await)
 }
 
 async fn system_test_search(State(state): State<AppState>) -> Json<Value> {

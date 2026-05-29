@@ -94,7 +94,8 @@ python3 tools/api_parity_scan.py \
 - `/api/v1/book/*` Book 首页、file-backed 书籍读取、创建、确认 proposal、确认 spine、编译页面、块编辑、deep dive、quiz attempt、supplement、page chat session、rebuild、health、fingerprint refresh、WebSocket 入口
 - `/api/outputs/{path}` 兼容原 DeepTutor public output 静态文件白名单
 - `/api/v1/settings*` UI/catalog/apply/themes/sidebar/test SSE/llm-options 兼容入口
-- `/api/v1/system*` status/runtime-topology/test LLM/test embeddings/test search 兼容入口
+- `/api/v1/system*` status/runtime-topology/test LLM/test embeddings/test search 兼容入口；`/api/v1/system/test/embeddings` 现在按 Python 语义执行真实 batch probe，校验两条向量返回、非空和维度一致，并区分配置错误、连接错误和 invalid response；OpenAI-compatible/Azure 会处理 `api-version`、`api-key` 和 `extra_headers`，Cohere v2/Ollama 会使用各自的 payload 与 response shape
+- `/api/v1/settings/tests/embedding/start` + `/events` 现在按 Python settings runner 语义保存 catalog 快照、返回 `embedding-<10 hex>` run id，SSE 执行真实 embedding probe，成功时发送 `capabilities`/`response`/`catalog`/`completed`，失败时发送 terminal `failed` 且不误报 completed；成功 probe 会从已知模型能力表刷新 `default_dim`、`supported_dimensions`、`supports_variable_dimensions`、`model_known` 并写回 catalog
 - `/api/v1/tutorbot*` TutorBot 列表、创建/启动、停止/销毁、详情/PATCH、recent、souls CRUD、channels schema、profile 文件、history、WebSocket 最小聊天入口
 - `/api/v1/notebook/*` 普通 Notebook 列表、统计、创建、详情、更新、删除、记录增删改、带 summary 的 SSE 保存入口
 - `/api/v1/question-notebook/*` 题目 Notebook entries、lookup/upsert、分类 CRUD、entry/category 关联与筛选
@@ -114,7 +115,7 @@ python3 tools/api_parity_scan.py \
 已运行的验证：
 
 - `cargo fmt --check`：通过
-- `cargo test`：`55` 个 API contract 测试 + `5` 个 orchestrator 测试通过
+- `cargo test`：`64` 个 API contract 测试 + `5` 个 orchestrator 测试通过
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过
 - `cargo check --release`：通过
 - `python3 tools/api_parity_scan.py --rust-root /home/coobabm/Socartes-Rust --deeptutor-root /home/coobabm/.gitnexus/repos/DeepTutor`：Python missing `0`，frontend missing 仅 `/api/v1/book{param}` 扫描伪影
@@ -129,6 +130,7 @@ python3 tools/api_parity_scan.py \
 - `cargo test --test api_contract legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts`：legacy settings/dashboard/agent-config/solve 契约测试通过
 - `cargo test --test api_contract vision_`：`4` 个 Vision REST/WebSocket 校验、REST image URL 下载/content-type 错误、真实 WS 握手和事件序列契约测试通过
 - `cargo test --test api_contract chat_ws_`：`10` 个 unified chat WebSocket 真实握手、turn event 持久化、`llm_selection` 无效 selection rejected、`subscribe_turn`/`resume_from` 回放、运行中 live subscribe、发起 socket 断开后完整 replay、同连接/跨连接/落盘 running turn 取消、regenerate 消息替换和无效 selection 不破坏历史契约测试通过
+- `cargo test --test api_contract embedding_test`：`9` 个 system/settings embedding diagnostic 契约测试通过，覆盖不可达 provider 失败、system 固定 Python batch probe、Azure `api-version`/`api-key`/`extra_headers`、Cohere v2 payload/response、Ollama payload/response、settings detected dimension 写回且不发送 `dimensions`、已知模型能力表刷新、provider 失败 SSE、空 vector terminal failed 文案
 - `cargo test skills_`：`5` 个 Skills API 契约测试通过
 - `cargo test plugins_`：`3` 个 Playground plugins API 契约测试通过
 - `cargo test page_agent_chat_completion`：`2` 个 Page agent OpenAI-compatible 契约测试通过

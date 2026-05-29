@@ -1,7 +1,10 @@
 use std::{
     fs,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -87,6 +90,118 @@ fn test_co_writer_docs_root(knowledge_root: &Path) -> std::path::PathBuf {
 
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
     test_data_root(knowledge_root).join("user")
+}
+
+async fn spawn_embedding_mock(
+    response: Value,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let response = response.clone();
+            async move {
+                requests.lock().await.push(payload);
+                axum::Json(response)
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), requests, task)
+}
+
+async fn spawn_embedding_request_recorder(
+    response: Value,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let response = response.clone();
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                axum::Json(response)
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+fn embedding_test_catalog(base_url: &str) -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "embedding": {
+                "active_profile_id": "tdd-embedding",
+                "active_model_id": "tdd-embedding-model",
+                "profiles": [
+                    {
+                        "id": "tdd-embedding",
+                        "name": "TDD Embedding",
+                        "binding": "openai",
+                        "base_url": base_url,
+                        "api_key": "test-key",
+                        "api_version": "",
+                        "extra_headers": {},
+                        "models": [
+                            {
+                                "id": "tdd-embedding-model",
+                                "name": "TDD Embedding Model",
+                                "model": "text-embedding-3-small",
+                                "dimension": "3",
+                                "send_dimensions": true,
+                                "supported_dimensions": "3"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    })
+}
+
+fn parse_sse_data_events(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str::<Value>(data).expect("sse data json"))
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -6057,6 +6172,579 @@ async fn settings_and_system_status_match_frontend_contract() {
     assert!(events_body.contains("\"type\":\"capabilities\""));
     assert!(events_body.contains("\"type\":\"completed\""));
 
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_embedding_test_reports_unreachable_provider_failure() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let catalog = embedding_test_catalog("http://127.0.0.1:9/v1");
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalog": catalog,
+                        "input": "socartes embedding smoke test"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("Embeddings connection failed")
+    );
+    assert!(payload["model"].is_null());
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].as_str().unwrap().contains("127.0.0.1"));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_embedding_test_uses_python_batch_probe_against_provider() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_embedding_mock(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]},
+            {"object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6]}
+        ],
+        "model": "text-embedding-3-small",
+        "usage": {"prompt_tokens": 4, "total_tokens": 4}
+    }))
+    .await;
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalog": embedding_test_catalog(&base_url),
+                        "input": "this should not replace the Python system probe"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["message"],
+        "Embeddings connection successful (openai provider)"
+    );
+    assert_eq!(payload["model"], "text-embedding-3-small");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["input"],
+        json!(["test", "retrieval batch probe"])
+    );
+    assert_eq!(requests[0]["model"], "text-embedding-3-small");
+    assert_eq!(requests[0]["dimensions"], 3);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_embedding_test_uses_azure_api_version_and_extra_headers() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]},
+            {"object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6]}
+        ],
+        "model": "socartes-azure-embedding"
+    }))
+    .await;
+    let mut catalog = embedding_test_catalog(&format!(
+        "{base_url}/openai/deployments/socartes/embeddings"
+    ));
+    catalog["services"]["embedding"]["profiles"][0]["binding"] = json!("azure_openai");
+    catalog["services"]["embedding"]["profiles"][0]["api_key"] = json!("azure-key");
+    catalog["services"]["embedding"]["profiles"][0]["api_version"] = json!("2024-02-01");
+    catalog["services"]["embedding"]["profiles"][0]["extra_headers"] = json!({
+        "x-socartes-test": "yes",
+        "x-ms-client-request-id": "contract-test"
+    });
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["model"] =
+        json!("socartes-azure-embedding");
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["message"],
+        "Embeddings connection successful (azure_openai provider)"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["uri"],
+        "/openai/deployments/socartes/embeddings?api-version=2024-02-01"
+    );
+    assert_eq!(requests[0]["headers"]["api-key"], "azure-key");
+    assert!(requests[0]["headers"]["authorization"].is_null());
+    assert_eq!(requests[0]["headers"]["x-socartes-test"], "yes");
+    assert_eq!(
+        requests[0]["headers"]["x-ms-client-request-id"],
+        "contract-test"
+    );
+    assert_eq!(
+        requests[0]["payload"]["input"],
+        json!(["test", "retrieval batch probe"])
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_embedding_test_uses_cohere_v2_payload_and_response_shape() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "embeddings": {
+            "float": [
+                [0.1, 0.2, 0.3, 0.4],
+                [0.5, 0.6, 0.7, 0.8]
+            ]
+        },
+        "model": "embed-v4.0",
+        "meta": {"billed_units": {"input_tokens": 4}}
+    }))
+    .await;
+    let mut catalog = embedding_test_catalog(&format!("{base_url}/v2/embed"));
+    catalog["services"]["embedding"]["profiles"][0]["binding"] = json!("cohere");
+    catalog["services"]["embedding"]["profiles"][0]["api_key"] = json!("cohere-key");
+    catalog["services"]["embedding"]["profiles"][0]["extra_headers"] =
+        json!({"x-socartes-test": "cohere"});
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["model"] = json!("embed-v4.0");
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"] = json!("512");
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["message"],
+        "Embeddings connection successful (cohere provider)"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/v2/embed");
+    assert_eq!(requests[0]["headers"]["authorization"], "Bearer cohere-key");
+    assert_eq!(requests[0]["headers"]["x-socartes-test"], "cohere");
+    assert_eq!(requests[0]["payload"]["model"], "embed-v4.0");
+    assert_eq!(
+        requests[0]["payload"]["texts"],
+        json!(["test", "retrieval batch probe"])
+    );
+    assert_eq!(requests[0]["payload"]["embedding_types"], json!(["float"]));
+    assert_eq!(requests[0]["payload"]["input_type"], "search_document");
+    assert_eq!(requests[0]["payload"]["output_dimension"], 512);
+    assert!(requests[0]["payload"]["input"].is_null());
+    assert!(requests[0]["payload"]["dimensions"].is_null());
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_embedding_test_uses_ollama_payload_and_response_shape() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "embeddings": [
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6]
+        ],
+        "model": "nomic-embed-text",
+        "prompt_eval_count": 4,
+        "total_duration": 123
+    }))
+    .await;
+    let mut catalog = embedding_test_catalog(&format!("{base_url}/api/embed"));
+    catalog["services"]["embedding"]["profiles"][0]["binding"] = json!("ollama");
+    catalog["services"]["embedding"]["profiles"][0]["api_key"] = json!("");
+    catalog["services"]["embedding"]["profiles"][0]["extra_headers"] =
+        json!({"x-socartes-test": "ollama"});
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["model"] =
+        json!("nomic-embed-text");
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"] = json!("768");
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["send_dimensions"] = json!(false);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["message"],
+        "Embeddings connection successful (ollama provider)"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/api/embed");
+    assert!(requests[0]["headers"]["authorization"].is_null());
+    assert_eq!(requests[0]["headers"]["x-socartes-test"], "ollama");
+    assert_eq!(requests[0]["payload"]["model"], "nomic-embed-text");
+    assert_eq!(
+        requests[0]["payload"]["input"],
+        json!(["test", "retrieval batch probe"])
+    );
+    assert_eq!(requests[0]["payload"]["keep_alive"], "5m");
+    assert!(requests[0]["payload"]["dimensions"].is_null());
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_embedding_test_events_report_provider_failure() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/embedding/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalog": embedding_test_catalog("http://127.0.0.1:9/v1")
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(run_id.len(), "embedding-".len() + 10);
+    assert!(
+        run_id
+            .strip_prefix("embedding-")
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/embedding/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        events_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let events_body = text_response(events_response).await;
+    assert!(events_body.contains("\"type\":\"failed\""));
+    assert!(events_body.contains("127.0.0.1"));
+    assert!(!events_body.contains("\"type\":\"completed\""));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_embedding_test_events_detect_dimension_without_dimensions_param() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_embedding_mock(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]},
+            {"object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6]}
+        ],
+        "model": "text-embedding-3-small",
+        "usage": {"prompt_tokens": 4, "total_tokens": 4}
+    }))
+    .await;
+    let mut catalog = embedding_test_catalog(&base_url);
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"] = json!("999");
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/embedding/start")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/embedding/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    let capabilities = events
+        .iter()
+        .find(|event| event["type"] == "capabilities")
+        .expect("capabilities event");
+    assert_eq!(capabilities["detected_dim"], 3);
+    assert_eq!(capabilities["active_dim"], 3);
+    assert_eq!(capabilities["active_dim_source"], "detected");
+    let response = events
+        .iter()
+        .find(|event| event["type"] == "response")
+        .expect("response event");
+    assert_eq!(response["actual_dimension"], 3);
+    assert_eq!(response["expected_dimension"], 999);
+    let catalog_event = events
+        .iter()
+        .find(|event| event["type"] == "catalog")
+        .expect("catalog event");
+    assert_eq!(
+        catalog_event["catalog"]["services"]["embedding"]["profiles"][0]["models"][0]["dimension"],
+        "3"
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["message"],
+        "EMBEDDING test completed successfully."
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["input"],
+        json!([
+            "DeepTutor embedding smoke test",
+            "DeepTutor retrieval batch probe"
+        ])
+    );
+    assert!(requests[0].get("dimensions").is_none());
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_embedding_test_events_refresh_known_model_capabilities() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let vector: Vec<f64> = vec![0.1; 1536];
+    let (base_url, _requests, server) = spawn_embedding_mock(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": vector},
+            {"object": "embedding", "index": 1, "embedding": vec![0.2; 1536]}
+        ],
+        "model": "text-embedding-3-small",
+        "usage": {"prompt_tokens": 4, "total_tokens": 4}
+    }))
+    .await;
+    let mut catalog = embedding_test_catalog(&base_url);
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"] = json!("999");
+    catalog["services"]["embedding"]["profiles"][0]["models"][0]["supported_dimensions"] =
+        json!("");
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/embedding/start")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/embedding/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    let capabilities = events
+        .iter()
+        .find(|event| event["type"] == "capabilities")
+        .expect("capabilities event");
+    assert_eq!(capabilities["detected_dim"], 1536);
+    assert_eq!(capabilities["default_dim"], 1536);
+    assert_eq!(capabilities["supported_dimensions"], json!([512, 1536]));
+    assert_eq!(capabilities["supports_variable_dimensions"], true);
+    assert_eq!(capabilities["model_known"], true);
+
+    let catalog_event = events
+        .iter()
+        .find(|event| event["type"] == "catalog")
+        .expect("catalog event");
+    assert_eq!(
+        catalog_event["catalog"]["services"]["embedding"]["profiles"][0]["models"][0]["dimension"],
+        "1536"
+    );
+    assert_eq!(
+        catalog_event["catalog"]["services"]["embedding"]["profiles"][0]["models"][0]["supported_dimensions"],
+        "512,1536"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_embedding_test_events_report_empty_vector_failure() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, _requests, server) = spawn_embedding_mock(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": []},
+            {"object": "embedding", "index": 1, "embedding": []}
+        ],
+        "model": "text-embedding-3-small"
+    }))
+    .await;
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/embedding/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": embedding_test_catalog(&base_url)}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/embedding/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    let failed = events
+        .iter()
+        .find(|event| event["type"] == "failed")
+        .expect("failed event");
+    assert_eq!(
+        failed["message"],
+        "Embedding service returned an empty vector."
+    );
+    assert!(!events.iter().any(|event| event["type"] == "completed"));
+
+    server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
