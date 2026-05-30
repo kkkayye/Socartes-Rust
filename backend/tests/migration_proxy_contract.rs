@@ -617,6 +617,89 @@ book = "shadow"
 }
 
 #[tokio::test]
+async fn tutorbot_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    let upstream = Router::new().route("/api/v1/tutorbot/test-bot/ws", get(echo_ws));
+    let upstream_addr = spawn_app(upstream).await;
+
+    let native_messages = Arc::new(Mutex::new(Vec::<String>::new()));
+    let native_header_seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let native = Router::new().route(
+        "/api/v1/tutorbot/test-bot/ws",
+        get({
+            let native_messages = native_messages.clone();
+            let native_header_seen = native_header_seen.clone();
+            move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                let native_messages = native_messages.clone();
+                let native_header_seen = native_header_seen.clone();
+                async move {
+                    native_header_seen
+                        .lock()
+                        .await
+                        .push(is_shadow_native_ws_request(
+                            &headers,
+                            "socartes-test-shadow-token",
+                        ));
+                    observed_native_ws(ws, native_messages).await
+                }
+            }
+        }),
+    );
+    let native_addr = spawn_app(native).await;
+    let config = format!(
+        r#"
+enabled = true
+python_base_url = "http://{upstream_addr}"
+python_ws_base_url = "ws://{upstream_addr}"
+fallback = "proxy"
+
+[routes]
+tutorbot = "shadow"
+"#
+    );
+    let env_guard = MigrationEnvGuard::with_config(&config, &format!("ws://{native_addr}")).await;
+    let app =
+        app_with_knowledge_root_and_auth(env_guard.data_root().join("knowledge_bases"), false);
+    let app_addr = spawn_app(app).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{app_addr}/api/v1/tutorbot/test-bot/ws?turn=1"
+    ))
+    .await
+    .expect("tutorbot websocket should connect through app router");
+    socket
+        .send(TungsteniteMessage::Text("hello tutorbot shadow".into()))
+        .await
+        .expect("client message should send");
+    let echoed = socket
+        .next()
+        .await
+        .expect("python echo should arrive")
+        .expect("python echo should be ok");
+    assert_eq!(
+        echoed,
+        TungsteniteMessage::Text("python:hello tutorbot shadow".into())
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "native shadow frames must not be forwarded to the client"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if native_messages.lock().await.as_slice() == ["hello tutorbot shadow"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native websocket should receive the client frame");
+    assert_eq!(native_header_seen.lock().await.as_slice(), [true]);
+}
+
+#[tokio::test]
 async fn disabled_migration_fallback_returns_404_without_python() {
     let runtime = Arc::new(MigrationRuntime::from_config_for_tests(
         MigrationConfig::default(),
