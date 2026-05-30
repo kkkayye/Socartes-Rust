@@ -18438,7 +18438,7 @@ async fn tutorbot_chat_response(
         });
     };
 
-    let enabled_tools = requested_chat_tool_names(payload);
+    let enabled_tools = requested_tutorbot_chat_tool_names(payload, config);
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
     let mut metadata = json!({
         "profile_id": selection.profile_id.as_str(),
@@ -24578,12 +24578,79 @@ fn tool_parameter(
 }
 
 fn requested_chat_tool_names(payload: &Value) -> Vec<String> {
-    let allowed = plugin_tool_names();
+    let allowed = builtin_chat_tool_name_set();
+    requested_chat_tool_names_with_allowed(payload, &allowed)
+}
+
+fn requested_tutorbot_chat_tool_names(payload: &Value, config: &Value) -> Vec<String> {
+    let mut allowed = builtin_chat_tool_name_set();
+    allowed.extend(configured_tutorbot_mcp_tool_names(config));
+    let allow_all_prefixes = tutorbot_mcp_allow_all_prefixes(config);
     let mut seen = HashSet::new();
     as_string_array(&payload["tools"])
         .into_iter()
-        .filter(|name| allowed.contains(&name.as_str()))
+        .filter(|name| {
+            allowed.contains(name)
+                || allow_all_prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        })
         .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+fn builtin_chat_tool_name_set() -> HashSet<String> {
+    plugin_tool_names()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn requested_chat_tool_names_with_allowed(
+    payload: &Value,
+    allowed_tool_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    as_string_array(&payload["tools"])
+        .into_iter()
+        .filter(|name| allowed_tool_names.contains(name))
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+fn configured_tutorbot_mcp_tool_names(config: &Value) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(servers) = config["tools"]["mcp_servers"].as_object() else {
+        return names;
+    };
+    for (server_name, server_config) in servers {
+        let wrapped_prefix = format!("mcp_{server_name}_");
+        for tool_name in as_string_array(&server_config["enabled_tools"]) {
+            if tool_name == "*" {
+                continue;
+            }
+            if tool_name.starts_with(&wrapped_prefix) {
+                names.insert(tool_name);
+            } else {
+                names.insert(format!("{wrapped_prefix}{tool_name}"));
+            }
+        }
+    }
+    names
+}
+
+fn tutorbot_mcp_allow_all_prefixes(config: &Value) -> Vec<String> {
+    let Some(servers) = config["tools"]["mcp_servers"].as_object() else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter(|(_, server_config)| {
+            as_string_array(&server_config["enabled_tools"])
+                .iter()
+                .any(|tool| tool == "*")
+        })
+        .map(|(server_name, _)| format!("mcp_{server_name}_"))
         .collect()
 }
 
@@ -31444,6 +31511,41 @@ mod tests {
                 .await
                 .expect("stream closed after failed")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn requested_tutorbot_chat_tool_names_includes_configured_mcp_tools_and_deduplicates() {
+        let config = normalize_tutorbot_config(
+            "mcp-bot",
+            json!({
+                "tools": {
+                    "mcp_servers": {
+                        "files": {
+                            "enabled_tools": ["read_file", "mcp_files_write_file"]
+                        }
+                    }
+                }
+            }),
+        );
+        let payload = json!({
+            "tools": [
+                "rag",
+                "mcp_files_read_file",
+                "mcp_files_read_file",
+                "mcp_files_write_file",
+                "mcp_files_delete_file",
+                "unknown_tool"
+            ]
+        });
+
+        assert_eq!(
+            requested_tutorbot_chat_tool_names(&payload, &config),
+            vec![
+                "rag".to_string(),
+                "mcp_files_read_file".to_string(),
+                "mcp_files_write_file".to_string()
+            ]
         );
     }
 }
