@@ -194,6 +194,10 @@ const TUTORBOT_EDITABLE_FILES: &[&str] = &[
 ];
 const SECRET_MASK: &str = "***";
 const SETTINGS_SECRET_MASK: &str = "********";
+const SETTINGS_CATALOG_FILE: &str = "model_catalog.json";
+const LEGACY_SETTINGS_CATALOG_FILE: &str = "catalog.json";
+const UI_SETTINGS_FILE: &str = "interface.json";
+const LEGACY_UI_SETTINGS_FILE: &str = "ui.json";
 const INVALID_EMBEDDING_RESPONSE_DETAIL: &str =
     "Embedding response must contain one non-empty vector per input";
 
@@ -1333,7 +1337,7 @@ impl AppState {
             .unwrap_or_else(|| user_data_root.clone());
         let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| data_root.join("settings"));
+            .unwrap_or_else(|| user_data_root.join("settings"));
         let attachment_root = env::var_os("CHAT_ATTACHMENT_DIR")
             .or_else(|| env::var_os("SOCARTES_ATTACHMENT_ROOT"))
             .map(PathBuf::from)
@@ -10996,6 +11000,12 @@ fn read_settings_json(state: &AppState, filename: &str) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+fn read_first_settings_json(state: &AppState, filenames: &[&str]) -> Option<Value> {
+    filenames
+        .iter()
+        .find_map(|filename| read_settings_json(state, filename))
+}
+
 fn write_settings_json(state: &AppState, filename: &str, value: &Value) -> Result<(), ApiError> {
     fs::create_dir_all(&*state.settings_root).map_err(|error| {
         api_error(
@@ -11019,14 +11029,20 @@ fn write_settings_json(state: &AppState, filename: &str, value: &Value) -> Resul
 
 fn load_ui_settings(state: &AppState) -> Value {
     let mut defaults = default_ui_settings();
-    if let Some(saved) = read_settings_json(state, "ui.json") {
+    if let Some(saved) =
+        read_first_settings_json(state, &[UI_SETTINGS_FILE, LEGACY_UI_SETTINGS_FILE])
+    {
         merge_object_value(&mut defaults, &saved);
     }
     defaults
 }
 
 fn load_settings_catalog(state: &AppState) -> Value {
-    read_settings_json(state, "catalog.json").unwrap_or_else(default_settings_catalog)
+    read_first_settings_json(
+        state,
+        &[SETTINGS_CATALOG_FILE, LEGACY_SETTINGS_CATALOG_FILE],
+    )
+    .unwrap_or_else(default_settings_catalog)
 }
 
 fn default_ui_settings() -> Value {
@@ -15114,7 +15130,7 @@ async fn embedding_settings_events(state: &AppState, catalog: &Value) -> String 
         "actual_dimension": detected_dim,
         "expected_dimension": selection.dimension
     })));
-    match write_settings_json(state, "catalog.json", &saved_catalog) {
+    match write_settings_json(state, SETTINGS_CATALOG_FILE, &saved_catalog) {
         Ok(()) => body.push_str(&settings_data_event(json!({
             "type": "catalog",
             "message": "Saved detected embedding dimension to model_catalog.json.",
@@ -15254,7 +15270,7 @@ async fn llm_settings_events(state: &AppState, catalog: &Value) -> String {
         &source,
         &detected_at,
     );
-    match write_settings_json(state, "catalog.json", &saved_catalog) {
+    match write_settings_json(state, SETTINGS_CATALOG_FILE, &saved_catalog) {
         Ok(()) => body.push_str(&settings_data_event(json!({
             "type": "catalog",
             "message": "Saved updated model metadata to model_catalog.json.",
@@ -20222,9 +20238,7 @@ fn fallback_knowledge_embedding_config() -> KnowledgeEmbeddingConfig {
 }
 
 fn active_knowledge_embedding_config(state: &AppState) -> KnowledgeEmbeddingConfig {
-    let Some(catalog) = read_settings_json(state, "catalog.json") else {
-        return fallback_knowledge_embedding_config();
-    };
+    let catalog = load_settings_catalog(state);
     let Ok(selection) = active_embedding_selection(&catalog) else {
         return fallback_knowledge_embedding_config();
     };
@@ -21779,7 +21793,7 @@ async fn update_settings_catalog(
         .unwrap_or_else(default_settings_catalog);
     let catalog =
         restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
-    match write_settings_json(&state, "catalog.json", &catalog) {
+    match write_settings_json(&state, SETTINGS_CATALOG_FILE, &catalog) {
         Ok(()) => Json(json!({ "catalog": redact_settings_catalog(&catalog) })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21800,7 +21814,7 @@ async fn apply_settings_catalog(
         .unwrap_or_else(|| load_settings_catalog(&state));
     let catalog =
         restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
-    if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
+    if let Err(error) = write_settings_json(&state, SETTINGS_CATALOG_FILE, &catalog) {
         return error.into_response();
     }
     let env = render_settings_env(&catalog);
@@ -21832,7 +21846,7 @@ async fn update_ui_settings_endpoint(
     if payload["sidebar_nav_order"].is_object() {
         ui["sidebar_nav_order"] = payload["sidebar_nav_order"].clone();
     }
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(ui).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21845,7 +21859,7 @@ async fn update_theme_endpoint(
     let theme = payload["theme"].as_str().unwrap_or("light");
     let mut ui = load_ui_settings(&state);
     ui["theme"] = json!(theme);
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(json!({ "theme": theme })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21858,7 +21872,7 @@ async fn update_language_endpoint(
     let language = payload["language"].as_str().unwrap_or("en");
     let mut ui = load_ui_settings(&state);
     ui["language"] = json!(language);
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(json!({ "language": language })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21866,7 +21880,7 @@ async fn update_language_endpoint(
 
 async fn reset_settings_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     let ui = default_ui_settings();
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(ui).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21898,7 +21912,7 @@ async fn update_sidebar_description(
     let description = payload["description"].as_str().unwrap_or("").to_string();
     let mut ui = load_ui_settings(&state);
     ui["sidebar_description"] = json!(description);
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(json!({ "description": description })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21915,7 +21929,7 @@ async fn update_sidebar_nav_order(
         .unwrap_or_else(|| default_ui_settings()["sidebar_nav_order"].clone());
     let mut ui = load_ui_settings(&state);
     ui["sidebar_nav_order"] = nav_order.clone();
-    match write_settings_json(&state, "ui.json", &ui) {
+    match write_settings_json(&state, UI_SETTINGS_FILE, &ui) {
         Ok(()) => Json(json!({ "nav_order": nav_order })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -21950,7 +21964,7 @@ async fn complete_settings_tour(
         .unwrap_or_else(|| load_settings_catalog(&state));
     let catalog =
         restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
-    if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
+    if let Err(error) = write_settings_json(&state, SETTINGS_CATALOG_FILE, &catalog) {
         return error.into_response();
     }
     let env = render_settings_env(&catalog);

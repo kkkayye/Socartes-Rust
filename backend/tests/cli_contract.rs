@@ -1256,7 +1256,7 @@ fn init_top_level_wizard_creates_runtime_layout_and_settings() {
         "data/user/workspace/notebook",
         "data/user/workspace/chat/attachments",
         "data/memory",
-        "data/settings",
+        "data/user/settings",
     ] {
         assert!(
             home.join(relative).is_dir(),
@@ -1265,16 +1265,16 @@ fn init_top_level_wizard_creates_runtime_layout_and_settings() {
         );
     }
 
-    let catalog_text = fs::read_to_string(home.join("data/settings/catalog.json"))
-        .expect("catalog.json should be written");
+    let catalog_text = fs::read_to_string(home.join("data/user/settings/model_catalog.json"))
+        .expect("model_catalog.json should be written");
     let catalog: Value = serde_json::from_str(&catalog_text).unwrap();
     assert_eq!(
         catalog["services"]["llm"]["active_profile_id"],
         "socartes-rust"
     );
     assert!(
-        home.join("data/settings/ui.json").is_file(),
-        "ui.json should be written"
+        home.join("data/user/settings/interface.json").is_file(),
+        "interface.json should be written"
     );
 
     let _ = fs::remove_dir_all(home);
@@ -1308,7 +1308,8 @@ fn init_wizard_subcommand_creates_same_runtime_layout() {
     assert_eq!(value["initialized"], true);
     assert_eq!(value["cli_only"], true);
     let ui: Value = serde_json::from_slice(
-        &fs::read(home.join("data/settings/ui.json")).expect("ui settings should exist"),
+        &fs::read(home.join("data/user/settings/interface.json"))
+            .expect("ui settings should exist"),
     )
     .expect("ui settings should be JSON");
     assert_eq!(ui["language"], "zh");
@@ -1364,7 +1365,7 @@ fn init_wizard_prompts_for_runtime_settings_when_not_preseeded() {
     );
 
     let catalog: Value = serde_json::from_str(
-        &fs::read_to_string(home.join("data/settings/catalog.json"))
+        &fs::read_to_string(home.join("data/user/settings/model_catalog.json"))
             .expect("catalog should be written"),
     )
     .unwrap();
@@ -1398,7 +1399,8 @@ fn init_wizard_prompts_for_runtime_settings_when_not_preseeded() {
     );
 
     let ui: Value = serde_json::from_str(
-        &fs::read_to_string(home.join("data/settings/ui.json")).expect("ui should be written"),
+        &fs::read_to_string(home.join("data/user/settings/interface.json"))
+            .expect("ui should be written"),
     )
     .unwrap();
     assert_eq!(ui["ports"]["backend"], 8129);
@@ -1411,10 +1413,10 @@ fn init_wizard_prompts_for_runtime_settings_when_not_preseeded() {
 #[test]
 fn config_show_reads_local_runtime_settings_without_api_like_python() {
     let home = unique_temp_dir("config");
-    let settings_root = home.join("data/settings");
+    let settings_root = home.join("data/user/settings");
     fs::create_dir_all(&settings_root).expect("settings directory should be created");
     fs::write(
-        settings_root.join("catalog.json"),
+        settings_root.join("model_catalog.json"),
         serde_json::to_vec_pretty(&json!({
             "services": {
                 "llm": {
@@ -1458,7 +1460,7 @@ fn config_show_reads_local_runtime_settings_without_api_like_python() {
     )
     .expect("catalog should be written");
     fs::write(
-        settings_root.join("ui.json"),
+        settings_root.join("interface.json"),
         serde_json::to_vec_pretty(&json!({
             "language": "zh",
             "ports": {"backend": 8123, "frontend": 3123},
@@ -1677,7 +1679,7 @@ fn init_accepts_non_interactive_runtime_settings_like_python_wizard() {
         String::from_utf8_lossy(&output.stderr)
     );
     let catalog: Value = serde_json::from_str(
-        &fs::read_to_string(home.join("data/settings/catalog.json"))
+        &fs::read_to_string(home.join("data/user/settings/model_catalog.json"))
             .expect("catalog should be written"),
     )
     .unwrap();
@@ -1705,7 +1707,8 @@ fn init_accepts_non_interactive_runtime_settings_like_python_wizard() {
     );
 
     let ui: Value = serde_json::from_str(
-        &fs::read_to_string(home.join("data/settings/ui.json")).expect("ui should be written"),
+        &fs::read_to_string(home.join("data/user/settings/interface.json"))
+            .expect("ui should be written"),
     )
     .unwrap();
     assert_eq!(ui["ports"]["backend"], 8123);

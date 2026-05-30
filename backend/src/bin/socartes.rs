@@ -2343,8 +2343,12 @@ fn local_config_summary(home: Option<PathBuf>) -> CliResult<Value> {
         ],
         default_cli_catalog(),
     )?;
-    let ui = read_json_or_default(
-        &paths.settings_root.join("ui.json"),
+    let ui = read_first_json_or_default(
+        &[
+            paths.user_settings_root.join("interface.json"),
+            paths.settings_root.join("interface.json"),
+            paths.settings_root.join("ui.json"),
+        ],
         default_cli_ui_settings(),
     )?;
     let main_yaml = read_main_yaml_summary(&[
@@ -2407,14 +2411,6 @@ fn read_first_json_or_default(paths: &[PathBuf], default: Value) -> CliResult<Va
         }
     }
     Ok(default)
-}
-
-fn read_json_or_default(path: &Path, default: Value) -> CliResult<Value> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(default),
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[derive(Debug, Default)]
@@ -3171,7 +3167,6 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
             .join("chat")
             .join("attachments"),
         data_root.join("memory"),
-        data_root.join("settings"),
         data_root.join("user").join("settings"),
         data_root.join("auth").join("users"),
         data_root.join("tutorbot"),
@@ -3181,23 +3176,16 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
         fs::create_dir_all(dir)?;
     }
 
-    let settings_root = data_root.join("settings");
+    let settings_root = data_root.join("user").join("settings");
     write_json_if_absent(
-        &settings_root.join("catalog.json"),
+        &settings_root.join("model_catalog.json"),
         &configured_cli_catalog(&args.runtime),
     )?;
     write_json_if_absent(
-        &settings_root.join("ui.json"),
+        &settings_root.join("interface.json"),
         &configured_cli_ui_settings(&args.runtime),
     )?;
     write_init_env_file(&project_root.join(".env"), &args.runtime)?;
-    write_interface_settings(
-        &data_root
-            .join("user")
-            .join("settings")
-            .join("interface.json"),
-        &args.runtime,
-    )?;
     write_json_if_absent(
         &data_root.join("knowledge").join("kb_config.json"),
         &json!({ "knowledge_bases": {} }),
@@ -3209,7 +3197,7 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
         "data_dir": data_root,
         "settings": settings_root,
         "env_file": project_root.join(".env"),
-        "interface_settings": data_root.join("user").join("settings").join("interface.json"),
+        "interface_settings": settings_root.join("interface.json"),
         "created": dirs
     }))
 }
@@ -3425,42 +3413,6 @@ fn configured_cli_env(options: &RuntimeInitOptions) -> Vec<(&'static str, String
         ),
         ("SEARCH_PROXY", String::new()),
     ]
-}
-
-fn write_interface_settings(path: &Path, options: &RuntimeInitOptions) -> CliResult {
-    let mut payload = match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({})),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
-        Err(error) => return Err(error.into()),
-    };
-    if !payload.is_object() {
-        payload = json!({});
-    }
-    payload["theme"] = payload
-        .get("theme")
-        .cloned()
-        .filter(|value| value.is_string())
-        .unwrap_or_else(|| json!("light"));
-    payload["language"] = json!(
-        options
-            .language
-            .as_deref()
-            .map(normalize_init_language)
-            .unwrap_or("en")
-    );
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
-    Ok(())
-}
-
-fn normalize_init_language(language: &str) -> &str {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "zh" | "cn" | "chinese" => "zh",
-        "ko" | "kr" | "korean" => "ko",
-        _ => "en",
-    }
 }
 
 fn default_cli_ui_settings() -> Value {

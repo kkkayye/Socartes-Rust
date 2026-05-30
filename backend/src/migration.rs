@@ -816,12 +816,6 @@ fn default_config_path() -> PathBuf {
     if let Some(path) = env::var_os("SOCARTES_MIGRATION_CONFIG") {
         return PathBuf::from(path);
     }
-    for candidate in ["migration.toml", "../migration.toml"] {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return path;
-        }
-    }
     PathBuf::from("migration.toml")
 }
 

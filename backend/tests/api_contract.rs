@@ -4883,8 +4883,13 @@ async fn settings_auth_enabled_role_crops_match_python_contract() {
         json_response(masked_update_response).await["catalog"]["services"]["llm"]["profiles"][0]["api_key"],
         "********"
     );
-    let persisted_catalog = fs::read_to_string(test_data_root(&root).join("settings/catalog.json"))
-        .expect("persisted catalog");
+    let persisted_catalog = fs::read_to_string(
+        test_data_root(&root)
+            .join("user")
+            .join("settings")
+            .join("model_catalog.json"),
+    )
+    .expect("persisted catalog");
     assert!(persisted_catalog.contains("llm-secret"));
     assert!(!persisted_catalog.contains("\"api_key\": \"********\""));
 
@@ -5152,9 +5157,12 @@ async fn multi_user_access_resources_and_grants_match_python_contract() {
     let bob_token = auth_token_from_set_cookie(&bob_login_response);
 
     let data_root = test_data_root(&root);
-    fs::create_dir_all(data_root.join("settings")).unwrap();
+    fs::create_dir_all(data_root.join("user").join("settings")).unwrap();
     fs::write(
-        data_root.join("settings").join("catalog.json"),
+        data_root
+            .join("user")
+            .join("settings")
+            .join("model_catalog.json"),
         serde_json::to_string_pretty(&llm_test_catalog("https://llm.internal/v1")).unwrap(),
     )
     .unwrap();
@@ -28220,6 +28228,102 @@ async fn settings_and_system_status_match_frontend_contract() {
 }
 
 #[tokio::test]
+async fn settings_share_python_canonical_files_during_strangler_migration() {
+    let root = unique_test_knowledge_root();
+    let data_root = test_data_root(&root);
+    let settings_root = data_root.join("user").join("settings");
+    fs::create_dir_all(&settings_root).unwrap();
+
+    let mut catalog = llm_test_catalog("https://python-catalog.example/v1");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] =
+        json!("python-canonical-model");
+    fs::write(
+        settings_root.join("model_catalog.json"),
+        serde_json::to_string_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        settings_root.join("interface.json"),
+        serde_json::to_string_pretty(&json!({
+            "theme": "glass",
+            "language": "ko",
+            "sidebar_description": "Shared Python settings"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let app = app_with_knowledge_root(&root);
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+    let settings = json_response(settings_response).await;
+    assert_eq!(settings["ui"]["theme"], "glass");
+    assert_eq!(settings["ui"]["language"], "ko");
+    assert_eq!(
+        settings["catalog"]["services"]["llm"]["profiles"][0]["base_url"],
+        "https://python-catalog.example/v1"
+    );
+    assert_eq!(
+        settings["catalog"]["services"]["llm"]["profiles"][0]["models"][0]["model"],
+        "python-canonical-model"
+    );
+
+    let ui_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/ui")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"theme": "dark"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ui_response.status(), http::StatusCode::OK);
+    let interface_json = fs::read_to_string(settings_root.join("interface.json")).unwrap();
+    assert!(interface_json.contains("\"theme\": \"dark\""));
+    assert!(
+        !settings_root.join("ui.json").exists(),
+        "Rust must not write a parallel UI settings file while Python is the fallback backend"
+    );
+
+    let mut updated_catalog = settings["catalog"].clone();
+    updated_catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] =
+        json!("rust-write-shared-model");
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": updated_catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    let model_catalog_json = fs::read_to_string(settings_root.join("model_catalog.json")).unwrap();
+    assert!(model_catalog_json.contains("rust-write-shared-model"));
+    assert!(
+        !settings_root.join("catalog.json").exists(),
+        "Rust must not write a parallel model catalog while Python is the fallback backend"
+    );
+
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[tokio::test]
 async fn system_status_search_reports_configured_for_duckduckgo_like_python() {
     let _env = SearchEnvGuard::clear().await;
     let root = unique_test_knowledge_root();
@@ -29985,9 +30089,13 @@ async fn settings_tour_complete_restores_masked_catalog_secrets_and_redacts_env_
         complete_masked_payload["env"]["SOCARTES_SEARCH_API_KEY"],
         "********"
     );
-    let persisted_after_masked =
-        fs::read_to_string(test_data_root(&root).join("settings/catalog.json"))
-            .expect("persisted catalog after masked tour complete");
+    let persisted_after_masked = fs::read_to_string(
+        test_data_root(&root)
+            .join("user")
+            .join("settings")
+            .join("model_catalog.json"),
+    )
+    .expect("persisted catalog after masked tour complete");
     assert!(persisted_after_masked.contains("tour-llm-secret"));
     assert!(persisted_after_masked.contains("tour-embedding-secret"));
     assert!(persisted_after_masked.contains("tour-search-secret"));
