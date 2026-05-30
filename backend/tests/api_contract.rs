@@ -14448,6 +14448,255 @@ async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
 }
 
 #[tokio::test]
+async fn tutorbot_management_accepts_python_style_mcp_server_config() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "mcp-bot",
+                        "name": "MCP Bot",
+                        "channels": {
+                            "send_progress": true,
+                            "send_tool_hints": true
+                        },
+                        "agents": {
+                            "defaults": {
+                                "workspace": "default",
+                                "model": "gpt-5.5",
+                                "provider": "openai-compatible",
+                                "max_tokens": 4096,
+                                "context_window_tokens": 128000,
+                                "temperature": 0.2,
+                                "max_tool_iterations": 12,
+                                "reasoning_effort": "medium",
+                                "team_max_workers": 3,
+                                "team_worker_max_iterations": 5
+                            }
+                        },
+                        "tools": {
+                            "restrict_to_workspace": true,
+                            "web": {
+                                "proxy": "http://proxy.local:8080",
+                                "search": {
+                                    "provider": "brave",
+                                    "api_key": "search-secret",
+                                    "base_url": "https://api.search.local",
+                                    "max_results": 5
+                                }
+                            },
+                            "exec": {
+                                "timeout": 30,
+                                "path_append": ["/usr/local/bin"]
+                            },
+                            "mcp_servers": {
+                                "docs": {
+                                    "type": "streamableHttp",
+                                    "url": "https://mcp.example.test/mcp",
+                                    "headers": {
+                                        "Authorization": "Bearer mcp-secret"
+                                    },
+                                    "tool_timeout": 30,
+                                    "enabled_tools": ["search", "mcp_docs_fetch"]
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+    let created = json_response(create_response).await;
+    assert_eq!(created["agents"]["defaults"]["model"], "gpt-5.5");
+    assert_eq!(created["agents"]["defaults"]["max_tool_iterations"], 12);
+    assert_eq!(created["channels"]["send_tool_hints"], true);
+    assert_eq!(created["tools"]["restrict_to_workspace"], true);
+    assert_eq!(created["tools"]["web"]["proxy"], "http://proxy.local:8080");
+    assert_eq!(created["tools"]["web"]["search"]["provider"], "brave");
+    assert_eq!(created["tools"]["web"]["search"]["api_key"], "***");
+    assert_eq!(
+        created["tools"]["mcp_servers"]["docs"]["type"],
+        "streamableHttp"
+    );
+    assert_eq!(
+        created["tools"]["mcp_servers"]["docs"]["url"],
+        "https://mcp.example.test/mcp"
+    );
+    assert_eq!(
+        created["tools"]["mcp_servers"]["docs"]["headers"]["Authorization"],
+        "***"
+    );
+    assert_eq!(
+        created["tools"]["mcp_servers"]["docs"]["enabled_tools"],
+        json!(["search", "mcp_docs_fetch"])
+    );
+
+    let stored_config_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("mcp-bot")
+        .join("config.json");
+    let stored: Value = serde_json::from_str(
+        &std::fs::read_to_string(&stored_config_path).expect("bot config should be persisted"),
+    )
+    .expect("bot config should be JSON");
+    assert_eq!(stored["tools"]["web"]["search"]["api_key"], "search-secret");
+    assert_eq!(
+        stored["tools"]["mcp_servers"]["docs"]["headers"]["Authorization"],
+        "Bearer mcp-secret"
+    );
+
+    let patch_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/tutorbot/mcp-bot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tools": {
+                            "web": {
+                                "search": {
+                                    "api_key": "***",
+                                    "max_results": 7
+                                }
+                            },
+                            "mcp_servers": {
+                                "docs": {
+                                    "headers": {
+                                        "Authorization": "***"
+                                    },
+                                    "enabled_tools": ["*"]
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_response.status(), http::StatusCode::OK);
+    let patched = json_response(patch_response).await;
+    assert_eq!(patched["tools"]["web"]["search"]["api_key"], "***");
+    assert_eq!(patched["tools"]["web"]["search"]["max_results"], 7);
+    assert_eq!(
+        patched["tools"]["mcp_servers"]["docs"]["headers"]["Authorization"],
+        "***"
+    );
+    assert_eq!(
+        patched["tools"]["mcp_servers"]["docs"]["enabled_tools"],
+        json!(["*"])
+    );
+
+    let stored_after_patch: Value = serde_json::from_str(
+        &std::fs::read_to_string(&stored_config_path).expect("bot config should still exist"),
+    )
+    .expect("bot config should be JSON after patch");
+    assert_eq!(
+        stored_after_patch["tools"]["web"]["search"]["api_key"],
+        "search-secret"
+    );
+    assert_eq!(
+        stored_after_patch["tools"]["mcp_servers"]["docs"]["headers"]["Authorization"],
+        "Bearer mcp-secret"
+    );
+    assert_eq!(
+        stored_after_patch["tools"]["mcp_servers"]["docs"]["enabled_tools"],
+        json!(["*"])
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_management_accepts_python_camel_case_config_aliases() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let create_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "camel-mcp-bot",
+                        "agents": {
+                            "defaults": {
+                                "contextWindowTokens": 2048,
+                                "maxToolIterations": 8,
+                                "teamMaxWorkers": 2,
+                                "teamWorkerMaxIterations": 3
+                            }
+                        },
+                        "tools": {
+                            "restrictToWorkspace": true,
+                            "web": {
+                                "search": {
+                                    "maxResults": 9
+                                }
+                            },
+                            "exec": {
+                                "pathAppend": "/opt/socartes/bin"
+                            },
+                            "mcpServers": {
+                                "files": {
+                                    "toolTimeout": 12,
+                                    "enabledTools": ["read_file"],
+                                    "url": "http://localhost:3001/mcp"
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+    let created = json_response(create_response).await;
+    assert_eq!(created["agents"]["defaults"]["context_window_tokens"], 2048);
+    assert_eq!(created["agents"]["defaults"]["max_tool_iterations"], 8);
+    assert_eq!(created["agents"]["defaults"]["team_max_workers"], 2);
+    assert_eq!(
+        created["agents"]["defaults"]["team_worker_max_iterations"],
+        3
+    );
+    assert_eq!(created["tools"]["restrict_to_workspace"], true);
+    assert_eq!(created["tools"]["web"]["search"]["max_results"], 9);
+    assert_eq!(created["tools"]["exec"]["path_append"], "/opt/socartes/bin");
+    assert_eq!(created["tools"]["mcp_servers"]["files"]["tool_timeout"], 12);
+    assert_eq!(
+        created["tools"]["mcp_servers"]["files"]["enabled_tools"],
+        json!(["read_file"])
+    );
+    assert_eq!(
+        created["tools"]["mcp_servers"]["files"]["url"],
+        "http://localhost:3001/mcp"
+    );
+    assert!(
+        created["tools"].get("mcpServers").is_none(),
+        "camelCase MCP aliases should be normalized to snake_case: {created}"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn tutorbot_ws_runs_selected_provider_tool_loop_and_persists_history() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![

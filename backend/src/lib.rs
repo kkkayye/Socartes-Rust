@@ -16088,6 +16088,37 @@ fn default_tutorbot_config(bot_id: &str) -> Value {
             "send_progress": true,
             "send_tool_hints": false
         },
+        "agents": {
+            "defaults": {
+                "workspace": "~/.socartes/tutorbot/workspace",
+                "model": "anthropic/claude-opus-4-5",
+                "provider": "auto",
+                "max_tokens": 8192,
+                "context_window_tokens": 65536,
+                "temperature": 0.1,
+                "max_tool_iterations": MAX_TUTORBOT_TOOL_ITERATIONS,
+                "reasoning_effort": null,
+                "team_max_workers": 5,
+                "team_worker_max_iterations": 25
+            }
+        },
+        "tools": {
+            "web": {
+                "proxy": null,
+                "search": {
+                    "provider": "brave",
+                    "api_key": "",
+                    "base_url": "",
+                    "max_results": 5
+                }
+            },
+            "exec": {
+                "timeout": 60,
+                "path_append": ""
+            },
+            "restrict_to_workspace": false,
+            "mcp_servers": {}
+        },
         "model": null,
         "llm_selection": null,
         "running": false,
@@ -16106,6 +16137,8 @@ fn normalize_tutorbot_config(bot_id: &str, mut config: Value) -> Value {
         "description",
         "persona",
         "channels",
+        "agents",
+        "tools",
         "model",
         "llm_selection",
         "running",
@@ -16119,7 +16152,92 @@ fn normalize_tutorbot_config(bot_id: &str, mut config: Value) -> Value {
     if !config["channels"].is_object() {
         config["channels"] = default["channels"].clone();
     }
+    if !config["agents"].is_object() {
+        config["agents"] = default["agents"].clone();
+    }
+    if !config["tools"].is_object() {
+        config["tools"] = default["tools"].clone();
+    }
+    normalize_tutorbot_config_aliases(&mut config);
+    merge_json_defaults(&mut config["channels"], &default["channels"]);
+    merge_json_defaults(&mut config["agents"], &default["agents"]);
+    merge_json_defaults(&mut config["tools"], &default["tools"]);
     config
+}
+
+fn normalize_tutorbot_config_aliases(config: &mut Value) {
+    if let Some(defaults) = config
+        .get_mut("agents")
+        .and_then(|agents| agents.get_mut("defaults"))
+        .and_then(Value::as_object_mut)
+    {
+        move_json_alias(defaults, "maxTokens", "max_tokens");
+        move_json_alias(defaults, "contextWindowTokens", "context_window_tokens");
+        move_json_alias(defaults, "maxToolIterations", "max_tool_iterations");
+        move_json_alias(defaults, "memoryWindow", "memory_window");
+        move_json_alias(defaults, "reasoningEffort", "reasoning_effort");
+        move_json_alias(defaults, "teamMaxWorkers", "team_max_workers");
+        move_json_alias(
+            defaults,
+            "teamWorkerMaxIterations",
+            "team_worker_max_iterations",
+        );
+    }
+
+    let Some(tools) = config.get_mut("tools").and_then(Value::as_object_mut) else {
+        return;
+    };
+    move_json_alias(tools, "restrictToWorkspace", "restrict_to_workspace");
+    move_json_alias(tools, "mcpServers", "mcp_servers");
+
+    if let Some(search) = tools
+        .get_mut("web")
+        .and_then(|web| web.get_mut("search"))
+        .and_then(Value::as_object_mut)
+    {
+        move_json_alias(search, "apiKey", "api_key");
+        move_json_alias(search, "baseUrl", "base_url");
+        move_json_alias(search, "maxResults", "max_results");
+    }
+    if let Some(exec) = tools.get_mut("exec").and_then(Value::as_object_mut) {
+        move_json_alias(exec, "pathAppend", "path_append");
+    }
+    if let Some(servers) = tools.get_mut("mcp_servers").and_then(Value::as_object_mut) {
+        for server in servers.values_mut() {
+            if let Some(server) = server.as_object_mut() {
+                move_json_alias(server, "toolTimeout", "tool_timeout");
+                move_json_alias(server, "enabledTools", "enabled_tools");
+            }
+        }
+    }
+}
+
+fn move_json_alias(object: &mut Map<String, Value>, alias: &str, canonical: &str) {
+    if object.contains_key(canonical) {
+        object.remove(alias);
+        return;
+    }
+    if let Some(value) = object.remove(alias) {
+        object.insert(canonical.to_string(), value);
+    }
+}
+
+fn merge_json_defaults(value: &mut Value, defaults: &Value) {
+    if defaults.is_object() && !value.is_object() {
+        *value = defaults.clone();
+        return;
+    }
+    let (Some(value_object), Some(default_object)) = (value.as_object_mut(), defaults.as_object())
+    else {
+        return;
+    };
+    for (key, default_value) in default_object {
+        if let Some(existing) = value_object.get_mut(key) {
+            merge_json_defaults(existing, default_value);
+        } else {
+            value_object.insert(key.clone(), default_value.clone());
+        }
+    }
 }
 
 fn apply_tutorbot_payload(config: &mut Value, payload: &Value, merge_channels: bool) {
@@ -16138,6 +16256,20 @@ fn apply_tutorbot_payload(config: &mut Value, payload: &Value, merge_channels: b
             channels.clone()
         };
     }
+    if let Some(agents) = payload.get("agents").filter(|value| value.is_object()) {
+        config["agents"] = if merge_channels {
+            merge_masked_json_config_update(agents, &config["agents"])
+        } else {
+            agents.clone()
+        };
+    }
+    if let Some(tools) = payload.get("tools").filter(|value| value.is_object()) {
+        config["tools"] = if merge_channels {
+            merge_masked_json_config_update(tools, &config["tools"])
+        } else {
+            tools.clone()
+        };
+    }
 }
 
 fn tutorbot_detail(bot_id: &str, config: &Value, mask_secrets: bool) -> Value {
@@ -16147,6 +16279,8 @@ fn tutorbot_detail(bot_id: &str, config: &Value, mask_secrets: bool) -> Value {
         "description": config["description"].as_str().unwrap_or(""),
         "persona": config["persona"].as_str().unwrap_or(""),
         "channels": if mask_secrets { mask_json_secrets(&config["channels"], None) } else { config["channels"].clone() },
+        "agents": config["agents"].clone(),
+        "tools": if mask_secrets { mask_json_secrets(&config["tools"], None) } else { config["tools"].clone() },
         "model": config["model"].clone(),
         "llm_selection": config["llm_selection"].clone(),
         "running": config["running"].as_bool().unwrap_or(false),
@@ -16333,6 +16467,7 @@ fn is_secret_key(key: &str) -> bool {
         "api_key",
         "apikey",
         "encrypt_key",
+        "authorization",
     ]
     .iter()
     .any(|hint| lowered.contains(hint))
@@ -16361,6 +16496,39 @@ fn mask_json_secrets(value: &Value, key_hint: Option<&str>) -> Value {
 
 fn merge_masked_json_secrets(incoming: &Value, current: &Value) -> Value {
     merge_masked_json_secrets_with_key(incoming, current, None)
+}
+
+fn merge_masked_json_config_update(incoming: &Value, current: &Value) -> Value {
+    merge_masked_json_config_update_with_key(incoming, current, None)
+}
+
+fn merge_masked_json_config_update_with_key(
+    incoming: &Value,
+    current: &Value,
+    key_hint: Option<&str>,
+) -> Value {
+    match incoming {
+        Value::Object(object) => {
+            let mut merged = current.as_object().cloned().unwrap_or_default();
+            for (key, value) in object {
+                merged.insert(
+                    key.clone(),
+                    merge_masked_json_config_update_with_key(value, &current[key], Some(key)),
+                );
+            }
+            Value::Object(merged)
+        }
+        Value::String(text)
+            if key_hint.is_some_and(is_secret_key)
+                && text == SECRET_MASK
+                && current
+                    .as_str()
+                    .is_some_and(|existing| !existing.is_empty()) =>
+        {
+            current.clone()
+        }
+        _ => incoming.clone(),
+    }
 }
 
 fn merge_masked_json_secrets_with_key(
@@ -21879,6 +22047,7 @@ async fn start_tutorbot(
     let mut config =
         read_tutorbot_config(&state, &bot_id).unwrap_or_else(|| default_tutorbot_config(&bot_id));
     apply_tutorbot_payload(&mut config, &payload, false);
+    config = normalize_tutorbot_config(&bot_id, config);
     config["running"] = json!(true);
     config["started_at"] = json!(now_rfc3339());
     config["last_reload_error"] = Value::Null;
@@ -22065,6 +22234,7 @@ async fn update_tutorbot(
     };
 
     apply_tutorbot_payload(&mut config, &payload, true);
+    config = normalize_tutorbot_config(&bot_id, config);
     if let Some(persona) = payload["persona"].as_str()
         && let Err(error) = write_tutorbot_workspace_file(&state, &bot_id, "SOUL.md", persona)
     {
