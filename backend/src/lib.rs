@@ -45,6 +45,7 @@ const MIN_RETRIEVAL_SCORE: usize = 2;
 const BUILTIN_KNOWLEDGE_BASE: &str = "socartes-rust-rag";
 const DEFAULT_RAG_PROVIDER: &str = "llamaindex";
 const MAX_PARALLEL_CHAT_TOOL_CALLS: usize = 4;
+const MAX_TUTORBOT_TOOL_ITERATIONS: usize = 40;
 const RUST_EMBEDDING_BINDING: &str = "rust-local";
 const RUST_EMBEDDING_MODEL: &str = "deterministic-agent-loop";
 const RUST_EMBEDDING_DIMENSION: i64 = 0;
@@ -18277,25 +18278,32 @@ async fn tutorbot_chat_response(
         "model": selection.model.as_str(),
         "provider": selection.binding.as_str()
     });
-    let body = tutorbot_chat_completion_body(
-        &selection,
-        state,
-        bot_id,
-        config,
-        content,
-        &enabled_tools,
-        &[],
-    );
-    let response = call_chat_completion_provider(&selection, body).await?;
-    let answer = if response.tool_calls.is_empty() {
-        merge_chat_provider_response_metadata(&mut metadata, &response);
-        response
-            .content
-            .clone()
-            .ok_or_else(|| "TutorBot LLM response did not include assistant content".to_string())?
-    } else {
+    let mut additional_messages = Vec::new();
+    let mut raw_tool_results = Vec::new();
+    let mut total_tool_calls = 0usize;
+    let mut answer = None::<String>;
+
+    for _ in 0..MAX_TUTORBOT_TOOL_ITERATIONS {
+        let body = tutorbot_chat_completion_body(
+            &selection,
+            state,
+            bot_id,
+            config,
+            content,
+            &enabled_tools,
+            &additional_messages,
+        );
+        let response = call_chat_completion_provider(&selection, body).await?;
+        if response.tool_calls.is_empty() {
+            merge_chat_provider_response_metadata(&mut metadata, &response);
+            answer = Some(response.content.clone().ok_or_else(|| {
+                "TutorBot LLM response did not include assistant content".to_string()
+            })?);
+            break;
+        }
+
         let tool_calls = normalized_chat_tool_calls(&response.tool_calls);
-        let (tool_messages, _trace_results, raw_tool_results) = execute_chat_provider_tool_calls(
+        let (tool_messages, _trace_results, call_tool_results) = execute_chat_provider_tool_calls(
             state,
             &enabled_tools,
             &knowledge_bases,
@@ -18304,28 +18312,27 @@ async fn tutorbot_chat_response(
             None,
         )
         .await;
-        if let Some(object) = metadata.as_object_mut() {
-            object.insert("tool_calls".to_string(), json!(tool_calls.len()));
-            object.insert("tool_results".to_string(), Value::Array(raw_tool_results));
-        }
-        let mut additional_messages = vec![assistant_tool_call_message(&response, &tool_calls)];
+        total_tool_calls += tool_calls.len();
+        raw_tool_results.extend(call_tool_results);
+        additional_messages.push(assistant_tool_call_message(&response, &tool_calls));
         additional_messages.extend(tool_messages);
-        let body = tutorbot_chat_completion_body(
-            &selection,
-            state,
-            bot_id,
-            config,
-            content,
-            &[],
-            &additional_messages,
-        );
-        let final_response = call_chat_completion_provider(&selection, body).await?;
-        merge_chat_provider_response_metadata(&mut metadata, &final_response);
-        final_response.content.clone().ok_or_else(|| {
-            "TutorBot LLM response after tool execution did not include assistant content"
-                .to_string()
-        })?
-    };
+    }
+
+    if total_tool_calls > 0
+        && let Some(object) = metadata.as_object_mut()
+    {
+        object.insert("tool_calls".to_string(), json!(total_tool_calls));
+        object.insert("tool_results".to_string(), Value::Array(raw_tool_results));
+    }
+
+    let answer = answer.unwrap_or_else(|| {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("finish_reason".to_string(), json!("max_tool_iterations"));
+        }
+        format!(
+            "I reached the maximum number of tool call iterations ({MAX_TUTORBOT_TOOL_ITERATIONS}) without completing the task. You can try breaking the task into smaller steps."
+        )
+    });
 
     Ok(TutorBotTurnResult {
         content: answer,

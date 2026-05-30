@@ -14466,8 +14466,8 @@ async fn tutorbot_ws_runs_selected_provider_tool_loop_and_persists_history() {
     assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
     assert_eq!(recorded[0]["payload"]["tool_choice"], "auto");
     assert!(recorded[0]["payload"]["tools"].is_array());
-    assert!(recorded[1]["payload"]["tools"].is_null());
-    assert!(recorded[1]["payload"]["tool_choice"].is_null());
+    assert_eq!(recorded[1]["payload"]["tool_choice"], "auto");
+    assert!(recorded[1]["payload"]["tools"].is_array());
 
     let first_messages = recorded[0]["payload"]["messages"].as_array().unwrap();
     assert!(first_messages.iter().any(|message| {
@@ -14519,6 +14519,202 @@ async fn tutorbot_ws_runs_selected_provider_tool_loop_and_persists_history() {
         message["role"] == "assistant"
             && message["content"] == "TutorBot final provider answer with silver delta."
     }));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_runs_multi_turn_provider_tool_loop_until_final_answer() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "tutorbot-tool-first",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_rag_first",
+                        "type": "function",
+                        "function": {
+                            "name": "rag",
+                            "arguments": "{\"query\":\"Find the first violet prism clue.\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "tutorbot-tool-second",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_rag_second",
+                        "type": "function",
+                        "function": {
+                            "name": "rag",
+                            "arguments": "{\"query\":\"Find the second violet prism clue.\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "tutorbot-tool-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Both clues resolve to silver delta."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "multi-tool-course",
+        "violet-prism.md",
+        "The first violet prism clue says silver. The second violet prism clue says delta.",
+    )
+    .await;
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "multi-provider-bot",
+                        "name": "Multi Provider TutorBot",
+                        "persona": "# Soul\n\nIterate with tools until the answer is complete.",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/tutorbot/multi-provider-bot/ws"))
+            .await
+            .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "content": "Combine the violet prism clues.",
+                "chat_id": "web",
+                "tools": ["rag"],
+                "knowledge_bases": ["multi-tool-course"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("TutorBot multi-tool turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let terminal = event["type"] == "done" || event["type"] == "error";
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !events.iter().any(|event| event["type"] == "error"),
+        "multi-turn tool loop should not surface an error: {events:?}"
+    );
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "Both clues resolve to silver delta."
+    );
+    assert_eq!(content_event["metadata"]["tool_calls"], 2);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded[0]["payload"]["tools"].is_array());
+    assert!(recorded[1]["payload"]["tools"].is_array());
+    assert!(recorded[2]["payload"]["tools"].is_array());
+
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    assert!(second_messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "call_rag_first"
+    }));
+
+    let third_messages = recorded[2]["payload"]["messages"].as_array().unwrap();
+    assert!(third_messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "call_rag_first"
+    }));
+    assert!(third_messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "call_rag_second"
+    }));
+    drop(recorded);
 
     server.abort();
     llm_server.abort();
