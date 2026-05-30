@@ -35,6 +35,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SEARCH_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static BOOK_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static MATH_ANIMATOR_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SEARCH_ENV_KEYS: &[&str] = &[
     "SEARCH_PROVIDER",
     "BRAVE_SEARCH_API_KEY",
@@ -55,6 +56,11 @@ struct SearchEnvGuard {
 
 struct BookCompileEnvGuard {
     saved_delay: Option<String>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+struct MathAnimatorEnvGuard {
+    saved_command: Option<String>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -129,6 +135,36 @@ impl Drop for BookCompileEnvGuard {
             match &self.saved_delay {
                 Some(value) => std::env::set_var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS", value),
                 None => std::env::remove_var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS"),
+            }
+        }
+    }
+}
+
+impl MathAnimatorEnvGuard {
+    async fn with_command(command: &Path) -> Self {
+        let guard = MATH_ANIMATOR_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let saved_command = std::env::var("SOCARTES_MANIM_COMMAND").ok();
+        // SAFETY: this test-only guard serializes writers for this env var and restores it on drop.
+        unsafe {
+            std::env::set_var("SOCARTES_MANIM_COMMAND", command);
+        }
+        Self {
+            saved_command,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for MathAnimatorEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: MATH_ANIMATOR_ENV_MUTEX is still held while this guard restores the variable.
+        unsafe {
+            match &self.saved_command {
+                Some(value) => std::env::set_var("SOCARTES_MANIM_COMMAND", value),
+                None => std::env::remove_var("SOCARTES_MANIM_COMMAND"),
             }
         }
     }
@@ -12836,6 +12872,190 @@ async fn visualize_execute_stream_returns_structured_visualization_result() {
             .contains("Socartes answers the goal"),
         "visualize should not use generic chat fallback content"
     );
+}
+
+#[tokio::test]
+async fn math_animator_execute_stream_invokes_manim_and_returns_artifact_like_python() {
+    let root = unique_test_knowledge_root();
+    let data_root = test_data_root(&root);
+    fs::create_dir_all(&data_root).unwrap();
+    let fake_manim = data_root.join("fake-manim.sh");
+    fs::write(
+        &fake_manim,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+quality="${1:-}"
+code_path="${2:-}"
+scene_name="${3:-}"
+shift 3
+media_dir=""
+save_last_frame="0"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --media_dir)
+      media_dir="$2"
+      shift 2
+      ;;
+    -s)
+      save_last_frame="1"
+      shift
+      ;;
+    --format|--progress_bar)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -z "$media_dir" ]; then
+  echo "missing --media_dir" >&2
+  exit 2
+fi
+echo "fake manim quality=$quality code=$code_path scene=$scene_name"
+if [ "$save_last_frame" = "1" ]; then
+  output="$media_dir/images/${scene_name}.png"
+else
+  output="$media_dir/videos/${scene_name}.mp4"
+fi
+mkdir -p "$(dirname "$output")"
+printf "fake render for %s" "$scene_name" > "$output"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&fake_manim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_manim, permissions).unwrap();
+    }
+    let _guard = MathAnimatorEnvGuard::with_command(&fake_manim).await;
+    let app = app_with_knowledge_root(&root);
+    let code = r#"from manim import *
+
+class SocartesScene(Scene):
+    def construct(self):
+        self.add(Text("Socartes"))
+"#;
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/math_animator/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "math-animator-session",
+                        "content": "Animate a Socartes scene.",
+                        "tools": [],
+                        "knowledge_bases": [],
+                        "language": "en",
+                        "config": {
+                            "output_mode": "video",
+                            "quality": "low",
+                            "code": code
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    let events = parse_sse_events(&stream);
+    for stage in [
+        "concept_analysis",
+        "concept_design",
+        "code_generation",
+        "code_retry",
+        "summary",
+        "render_output",
+    ] {
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| event["type"] == "stage_start" && event["stage"] == stage),
+            "math_animator should emit Python-style {stage} stage_start events: {events:?}"
+        );
+    }
+    assert!(
+        events.iter().any(|(_, event)| {
+            event["type"] == "progress"
+                && event["stage"] == "render_output"
+                && event["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("fake manim"))
+        }),
+        "math_animator should stream renderer stdout as render_output progress: {events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|(name, event)| name == "result" && event["success"] == true)
+        .map(|(_, event)| event)
+        .expect("math_animator result event");
+    let result_data = &result["data"]["result"];
+    assert_eq!(result_data["output_mode"], "video");
+    assert_eq!(result_data["code"]["language"], "python");
+    assert_eq!(result_data["render"]["quality"], "low");
+    assert_eq!(result_data["render"]["retry_attempts"], 0);
+    assert_eq!(result_data["render"]["retry_history"], json!([]));
+    assert!(
+        result_data["render"]["source_code_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/source/scene.py"))
+    );
+    let artifact = &result_data["artifacts"][0];
+    assert_eq!(artifact["type"], "video");
+    assert_eq!(artifact["content_type"], "video/mp4");
+    let artifact_url = artifact["url"].as_str().expect("artifact url");
+    assert!(
+        artifact_url.starts_with("/api/outputs/workspace/chat/math_animator/"),
+        "artifact URL should use the Python-compatible public output root: {artifact_url}"
+    );
+    assert!(artifact_url.ends_with(".mp4"));
+
+    let artifact_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(artifact_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(artifact_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        text_response(artifact_response).await,
+        "fake render for SocartesScene"
+    );
+
+    let turn_id = result["data"]["turn_id"].as_str().expect("turn id");
+    let source_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/outputs/workspace/chat/math_animator/{turn_id}/source/scene.py"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(source_response.status(), http::StatusCode::FORBIDDEN);
+
+    let _ = std::fs::remove_dir_all(data_root);
 }
 
 #[tokio::test]

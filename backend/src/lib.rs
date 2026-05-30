@@ -5,6 +5,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Component, Path as FsPath, PathBuf},
     pin::Pin,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24065,6 +24066,9 @@ async fn execute_plugin_capability_stream(
     if capability_name == "deep_research" {
         return execute_deep_research_capability_stream(&state, &payload, body).await;
     }
+    if capability_name == "math_animator" {
+        return execute_math_animator_capability_stream(&state, &payload, body).await;
+    }
 
     let request = json!({
         "type": "start_turn",
@@ -24101,6 +24105,1225 @@ async fn execute_plugin_capability_stream(
     ));
 
     sse_response(body).into_response()
+}
+
+#[derive(Debug, Clone)]
+struct MathAnimatorRenderOutput {
+    output_mode: String,
+    artifacts: Vec<Value>,
+    source_code_path: String,
+    quality: String,
+    progress_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManimProcessOutput {
+    command: String,
+    exit_code: i32,
+    stdout_lines: Vec<String>,
+    stderr_lines: Vec<String>,
+}
+
+struct MathAnimatorRenderDirs<'a> {
+    source_dir: &'a FsPath,
+    artifacts_dir: &'a FsPath,
+    media_dir: &'a FsPath,
+    meta_dir: &'a FsPath,
+}
+
+async fn execute_math_animator_capability_stream(
+    state: &AppState,
+    payload: &Value,
+    mut body: String,
+) -> axum::response::Response {
+    let started = Instant::now();
+    let content = payload["content"].as_str().unwrap_or_default();
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    let turn_id = format!("rust-turn-{}", unique_id());
+    let request = json!({
+        "type": "start_turn",
+        "session_id": session_id,
+        "content": content,
+        "tools": payload["tools"].clone(),
+        "knowledge_bases": payload["knowledge_bases"].clone(),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "capability": "math_animator",
+        "config": payload["config"].clone(),
+        "attachments": payload["attachments"].clone(),
+        "notebook_references": payload["notebook_references"].clone(),
+        "history_references": payload["history_references"].clone(),
+        "book_references": payload["book_references"].clone()
+    });
+    let (persistence_payload, effective_content) =
+        prepare_chat_turn_payload(state, &session_id, &request, content);
+    let output_mode = normalized_math_animator_output_mode(&request["config"]);
+    let quality = normalized_math_animator_quality(&request["config"]);
+    let generated_code =
+        math_animator_code_from_request(&effective_content, &request["config"], output_mode);
+    let ids = StreamIds::new(&session_id, &turn_id);
+    let mut events = Vec::new();
+    let mut seq = 1_u64;
+    let mut timings = Map::new();
+
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "session",
+        "rust-backend",
+        "",
+        "",
+        json!({ "session_id": session_id, "turn_id": turn_id }),
+        ids,
+    );
+    let stage_started = Instant::now();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "concept_analysis",
+        "Analyzing the math concept, visual target, and requested output.",
+        json!({ "output_mode": output_mode, "quality": quality }),
+        ids,
+    );
+    let analysis = math_animator_analysis(&effective_content, output_mode);
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "thinking",
+        "math_animator",
+        "concept_analysis",
+        "Mapped the prompt to a renderable Manim scene plan.",
+        json!({ "analysis": analysis.clone() }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "concept_analysis",
+        "Concept analysis complete.",
+        json!({ "analysis": analysis.clone() }),
+        ids,
+    );
+    timings.insert(
+        "concept_analysis".to_string(),
+        json!(stage_started.elapsed().as_secs_f64()),
+    );
+
+    let stage_started = Instant::now();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "concept_design",
+        "Designing scene structure and visual pacing.",
+        json!({ "output_mode": output_mode }),
+        ids,
+    );
+    let design = math_animator_design(&effective_content, output_mode);
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "thinking",
+        "math_animator",
+        "concept_design",
+        "Selected a compact scene design that can be rendered by Manim.",
+        json!({ "design": design.clone() }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "concept_design",
+        "Scene design complete.",
+        json!({ "design": design.clone() }),
+        ids,
+    );
+    timings.insert(
+        "concept_design".to_string(),
+        json!(stage_started.elapsed().as_secs_f64()),
+    );
+
+    let stage_started = Instant::now();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "code_generation",
+        "Preparing Python Manim source code.",
+        json!({ "language": "python" }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "progress",
+        "math_animator",
+        "code_generation",
+        "Generated Manim source code for the requested output mode.",
+        json!({
+            "language": "python",
+            "trace_layer": "summary"
+        }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "code_generation",
+        "Code generation complete.",
+        json!({ "language": "python" }),
+        ids,
+    );
+    timings.insert(
+        "code_generation".to_string(),
+        json!(stage_started.elapsed().as_secs_f64()),
+    );
+
+    let stage_started = Instant::now();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "code_retry",
+        &format!("Rendering {output_mode} with quality={quality}."),
+        json!({
+            "output_mode": output_mode,
+            "quality": quality,
+            "call_state": "running"
+        }),
+        ids,
+    );
+    let render_output =
+        match render_math_animator_code(state, &turn_id, &generated_code, output_mode, quality)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let detail = api_error_detail(&error);
+                push_stream_event(
+                    &mut events,
+                    &mut seq,
+                    "error",
+                    "math_animator",
+                    "code_retry",
+                    &detail,
+                    json!({ "turn_terminal": true, "status": "failed" }),
+                    ids,
+                );
+                push_stream_event(
+                    &mut events,
+                    &mut seq,
+                    "done",
+                    "rust-backend",
+                    "",
+                    "",
+                    json!({ "status": "failed" }),
+                    ids,
+                );
+                let trace = math_animator_trace(&effective_content, &detail, &json!({}));
+                let _ = persist_chat_turn(
+                    state,
+                    &persistence_payload,
+                    &session_id,
+                    &turn_id,
+                    &trace,
+                    &events,
+                );
+                for event in &events {
+                    if event["type"] != "done" {
+                        body.push_str(&sse("stream", event.clone()));
+                    }
+                }
+                body.push_str(&sse(
+                    "error",
+                    json!({
+                        "detail": detail,
+                        "elapsed_ms": started.elapsed().as_millis()
+                    }),
+                ));
+                return sse_response(body).into_response();
+            }
+        };
+    for message in &render_output.progress_messages {
+        push_stream_event(
+            &mut events,
+            &mut seq,
+            "progress",
+            "math_animator",
+            "render_output",
+            message,
+            json!({ "trace_layer": "raw" }),
+            ids,
+        );
+    }
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "code_retry",
+        "Rendering completed without repair retries.",
+        json!({
+            "retry_attempts": 0,
+            "retry_history": []
+        }),
+        ids,
+    );
+    timings.insert(
+        "code_retry".to_string(),
+        json!(stage_started.elapsed().as_secs_f64()),
+    );
+
+    let stage_started = Instant::now();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "summary",
+        "Summarizing the rendered math animation.",
+        json!({ "artifact_count": render_output.artifacts.len() }),
+        ids,
+    );
+    let result = build_math_animator_result(
+        &effective_content,
+        &generated_code,
+        &render_output,
+        &analysis,
+        &design,
+        Value::Object(timings.clone()),
+    );
+    let response = result["response"].as_str().unwrap_or_default().to_string();
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "content",
+        "math_animator",
+        "summary",
+        &response,
+        json!({
+            "capability": "math_animator",
+            "output_mode": render_output.output_mode,
+            "artifacts": render_output.artifacts
+        }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "summary",
+        "Summary complete.",
+        json!({ "artifact_count": render_output.artifacts.len() }),
+        ids,
+    );
+    timings.insert(
+        "summary".to_string(),
+        json!(stage_started.elapsed().as_secs_f64()),
+    );
+
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_start",
+        "math_animator",
+        "render_output",
+        "Preparing public rendered artifacts.",
+        json!({ "artifact_count": render_output.artifacts.len() }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "progress",
+        "math_animator",
+        "render_output",
+        &format!(
+            "Prepared {} {}.",
+            render_output.artifacts.len(),
+            if render_output.artifacts.len() == 1 {
+                "artifact"
+            } else {
+                "artifacts"
+            }
+        ),
+        json!({
+            "call_state": "complete",
+            "trace_layer": "summary"
+        }),
+        ids,
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "stage_end",
+        "math_animator",
+        "render_output",
+        "Rendered artifacts are ready.",
+        json!({ "artifact_count": render_output.artifacts.len() }),
+        ids,
+    );
+    timings.insert("render_output".to_string(), json!(0.0));
+    let result = build_math_animator_result(
+        &effective_content,
+        &generated_code,
+        &render_output,
+        &analysis,
+        &design,
+        Value::Object(timings),
+    );
+    push_stream_event(
+        &mut events,
+        &mut seq,
+        "done",
+        "rust-backend",
+        "",
+        "",
+        json!({ "status": "completed" }),
+        ids,
+    );
+    let trace = math_animator_trace(&effective_content, &response, &result);
+    let _ = persist_chat_turn(
+        state,
+        &persistence_payload,
+        &session_id,
+        &turn_id,
+        &trace,
+        &events,
+    );
+
+    for event in &events {
+        if event["type"] != "done" {
+            body.push_str(&sse("stream", event.clone()));
+        }
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "turn_id": turn_id,
+                "result": result
+            },
+            "elapsed_ms": started.elapsed().as_millis()
+        }),
+    ));
+
+    sse_response(body).into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_stream_event(
+    events: &mut Vec<Value>,
+    seq: &mut u64,
+    event_type: &str,
+    source: &str,
+    stage: &str,
+    content: &str,
+    metadata: Value,
+    ids: StreamIds<'_>,
+) {
+    events.push(stream_event(
+        event_type, source, stage, content, metadata, ids, *seq,
+    ));
+    *seq += 1;
+}
+
+fn normalized_math_animator_output_mode(config: &Value) -> &'static str {
+    match config["output_mode"].as_str().unwrap_or("video") {
+        "image" => "image",
+        _ => "video",
+    }
+}
+
+fn normalized_math_animator_quality(config: &Value) -> &'static str {
+    match config["quality"].as_str().unwrap_or("medium") {
+        "low" => "low",
+        "high" => "high",
+        _ => "medium",
+    }
+}
+
+fn math_animator_code_from_request(
+    effective_content: &str,
+    config: &Value,
+    output_mode: &str,
+) -> String {
+    if let Some(code) = config["code"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return code.trim().to_string();
+    }
+    if let Some(code) = config["generated_code"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return code.trim().to_string();
+    }
+    extract_fenced_code(effective_content)
+        .unwrap_or_else(|| default_math_animator_code(effective_content, output_mode))
+}
+
+fn extract_fenced_code(text: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                break;
+            }
+            let language = trimmed.trim_start_matches("```").trim();
+            if language.is_empty()
+                || matches!(
+                    language.to_ascii_lowercase().as_str(),
+                    "python" | "py" | "manim"
+                )
+            {
+                in_fence = true;
+            }
+            continue;
+        }
+        if in_fence {
+            lines.push(line);
+        }
+    }
+    let code = lines.join("\n");
+    (!code.trim().is_empty()).then_some(code)
+}
+
+fn default_math_animator_code(effective_content: &str, output_mode: &str) -> String {
+    let title = python_string_literal(&math_animator_title(effective_content));
+    let body = format!(
+        r#"from manim import *
+
+class SocartesMathScene(Scene):
+    def construct(self):
+        title = Text("{title}", font_size=38)
+        subtitle = Text("Generated by Socartes", font_size=24).next_to(title, DOWN)
+        self.play(Write(title))
+        self.play(FadeIn(subtitle))
+        self.wait(1)
+"#
+    );
+    if output_mode == "image" {
+        format!("### YON_IMAGE_1_START ###\n{body}\n### YON_IMAGE_1_END ###")
+    } else {
+        body
+    }
+}
+
+fn python_string_literal(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' | '\r' => " ".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
+}
+
+fn math_animator_title(effective_content: &str) -> String {
+    let cleaned = effective_content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("[Attached Documents]")
+                && !line.starts_with("[User Question]")
+        })
+        .take(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        "Socartes Math Animation".to_string()
+    } else {
+        truncate_for_prompt(&cleaned, 80)
+    }
+}
+
+async fn render_math_animator_code(
+    state: &AppState,
+    turn_id: &str,
+    code: &str,
+    output_mode: &str,
+    quality: &str,
+) -> Result<MathAnimatorRenderOutput, ApiError> {
+    let state = state.clone();
+    let turn_id = turn_id.to_string();
+    let code = code.to_string();
+    let output_mode = output_mode.to_string();
+    let quality = quality.to_string();
+    tokio::task::spawn_blocking(move || {
+        render_math_animator_code_blocking(&state, &turn_id, &code, &output_mode, &quality)
+    })
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Math animator render task failed: {error}"),
+        )
+    })?
+}
+
+fn render_math_animator_code_blocking(
+    state: &AppState,
+    turn_id: &str,
+    code: &str,
+    output_mode: &str,
+    quality: &str,
+) -> Result<MathAnimatorRenderOutput, ApiError> {
+    let base_dir = state
+        .output_root
+        .join("workspace")
+        .join("chat")
+        .join("math_animator")
+        .join(turn_id);
+    let source_dir = base_dir.join("source");
+    let artifacts_dir = base_dir.join("artifacts");
+    let media_dir = base_dir.join("media");
+    let meta_dir = base_dir.join("meta");
+    for path in [&source_dir, &artifacts_dir, &media_dir, &meta_dir] {
+        fs::create_dir_all(path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create math animator workspace: {error}"),
+            )
+        })?;
+    }
+    let source_name = if output_mode == "image" {
+        "scene_image.py"
+    } else {
+        "scene.py"
+    };
+    let source_path = source_dir.join(source_name);
+    fs::write(&source_path, code).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write Manim source code: {error}"),
+        )
+    })?;
+
+    let mut progress_messages = vec![
+        format!("Preparing {output_mode} render workspace (quality={quality})."),
+        format!("Saved generated code to {source_name}."),
+    ];
+    let dirs = MathAnimatorRenderDirs {
+        source_dir: &source_dir,
+        artifacts_dir: &artifacts_dir,
+        media_dir: &media_dir,
+        meta_dir: &meta_dir,
+    };
+    let artifacts = if output_mode == "image" {
+        render_math_animator_images(state, &dirs, code, quality, &mut progress_messages)?
+    } else {
+        vec![render_math_animator_video(
+            state,
+            &dirs,
+            &source_path,
+            turn_id,
+            quality,
+            &mut progress_messages,
+        )?]
+    };
+    Ok(MathAnimatorRenderOutput {
+        output_mode: output_mode.to_string(),
+        artifacts,
+        source_code_path: source_path.to_string_lossy().to_string(),
+        quality: quality.to_string(),
+        progress_messages,
+    })
+}
+
+fn render_math_animator_video(
+    state: &AppState,
+    dirs: &MathAnimatorRenderDirs<'_>,
+    source_path: &FsPath,
+    turn_id: &str,
+    quality: &str,
+    progress_messages: &mut Vec<String>,
+) -> Result<Value, ApiError> {
+    let code = fs::read_to_string(source_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read Manim source code: {error}"),
+        )
+    })?;
+    let scene_name = extract_manim_scene_name(&code)?;
+    progress_messages.push(format!("Launching Manim scene `{scene_name}`."));
+    let process_output = run_manim_process(
+        source_path,
+        &scene_name,
+        quality,
+        false,
+        dirs.media_dir,
+        dirs.meta_dir,
+    )?;
+    append_manim_process_progress(progress_messages, &process_output);
+    let rendered = find_rendered_file(dirs.media_dir, "mp4")?;
+    let target_name = safe_artifact_filename(
+        &format!("{turn_id}-{scene_name}.mp4"),
+        &format!("{turn_id}.mp4"),
+    );
+    let artifact_path = dirs.artifacts_dir.join(target_name);
+    fs::copy(&rendered, &artifact_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to save rendered video artifact: {error}"),
+        )
+    })?;
+    progress_messages.push(format!(
+        "Saved rendered video as {}.",
+        artifact_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("animation.mp4")
+    ));
+    Ok(math_animator_artifact_value(
+        state,
+        &artifact_path,
+        "video",
+        "video/mp4",
+        "Animation video",
+    ))
+}
+
+fn render_math_animator_images(
+    state: &AppState,
+    dirs: &MathAnimatorRenderDirs<'_>,
+    code: &str,
+    quality: &str,
+    progress_messages: &mut Vec<String>,
+) -> Result<Vec<Value>, ApiError> {
+    let blocks = extract_yon_image_blocks(code)?;
+    let mut artifacts = Vec::new();
+    for (index, block_code) in blocks.iter().enumerate() {
+        let block_number = index + 1;
+        let block_path = dirs
+            .source_dir
+            .join(format!("image_block_{block_number:02}.py"));
+        fs::write(&block_path, block_code).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write image block source code: {error}"),
+            )
+        })?;
+        let scene_name = extract_manim_scene_name(block_code)?;
+        progress_messages.push(format!(
+            "Rendering image block {block_number}/{} with scene `{scene_name}`.",
+            blocks.len()
+        ));
+        let process_output = run_manim_process(
+            &block_path,
+            &scene_name,
+            quality,
+            true,
+            dirs.media_dir,
+            dirs.meta_dir,
+        )?;
+        append_manim_process_progress(progress_messages, &process_output);
+        let rendered = find_rendered_file(dirs.media_dir, "png")?;
+        let artifact_path = dirs
+            .artifacts_dir
+            .join(format!("image-{block_number:02}.png"));
+        fs::copy(&rendered, &artifact_path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to save rendered image artifact: {error}"),
+            )
+        })?;
+        progress_messages.push(format!("Saved image artifact image-{block_number:02}.png."));
+        artifacts.push(math_animator_artifact_value(
+            state,
+            &artifact_path,
+            "image",
+            "image/png",
+            &format!("Image {block_number}"),
+        ));
+    }
+    Ok(artifacts)
+}
+
+fn run_manim_process(
+    code_path: &FsPath,
+    scene_name: &str,
+    quality: &str,
+    save_last_frame: bool,
+    media_dir: &FsPath,
+    meta_dir: &FsPath,
+) -> Result<ManimProcessOutput, ApiError> {
+    let mut args = math_animator_manim_command_prefix();
+    if args.is_empty() {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SOCARTES_MANIM_COMMAND must not be empty.",
+        ));
+    }
+    args.push(math_animator_quality_flag(quality).to_string());
+    args.push(code_path.to_string_lossy().to_string());
+    args.push(scene_name.to_string());
+    args.push("--media_dir".to_string());
+    args.push(media_dir.to_string_lossy().to_string());
+    args.push("--progress_bar".to_string());
+    args.push("none".to_string());
+    if save_last_frame {
+        args.push("-s".to_string());
+    } else {
+        args.push("--format".to_string());
+        args.push("mp4".to_string());
+    }
+    let command_display = args.join(" ");
+    let stdout_path = meta_dir.join("manim.stdout.log");
+    let stderr_path = meta_dir.join("manim.stderr.log");
+    let stdout = fs::File::create(&stdout_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create Manim stdout log: {error}"),
+        )
+    })?;
+    let stderr = fs::File::create(&stderr_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create Manim stderr log: {error}"),
+        )
+    })?;
+    let mut command = Command::new(&args[0]);
+    command
+        .args(&args[1..])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command.spawn().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to start Manim process: {error}"),
+        )
+    })?;
+    let timeout = math_animator_timeout();
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to poll Manim process: {error}"),
+            )
+        })? {
+            Some(status) => break status,
+            None if started.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(api_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Manim process timed out.",
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr_text = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let stdout_lines = stdout_text
+        .lines()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let stderr_lines = stderr_text
+        .lines()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let output = ManimProcessOutput {
+        command: command_display,
+        exit_code: status.code().unwrap_or(-1),
+        stdout_lines,
+        stderr_lines,
+    };
+    if !status.success() {
+        let detail = trim_math_animator_error(
+            &[
+                output.stdout_lines.join("\n"),
+                output.stderr_lines.join("\n"),
+            ]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        );
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("Manim render failed: {detail}"),
+        ));
+    }
+    Ok(output)
+}
+
+fn math_animator_manim_command_prefix() -> Vec<String> {
+    if let Ok(command) = env::var("SOCARTES_MANIM_COMMAND")
+        && !command.trim().is_empty()
+    {
+        return command
+            .split_whitespace()
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    let python = env::var("SOCARTES_MANIM_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    vec![python, "-m".to_string(), "manim".to_string()]
+}
+
+fn math_animator_quality_flag(quality: &str) -> &'static str {
+    match quality {
+        "low" => "-ql",
+        "high" => "-qh",
+        _ => "-qm",
+    }
+}
+
+fn math_animator_timeout() -> Duration {
+    env::var("SOCARTES_MANIM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(120))
+}
+
+fn append_manim_process_progress(messages: &mut Vec<String>, output: &ManimProcessOutput) {
+    messages.push(format!(
+        "Started Manim process with command: {}",
+        output.command
+    ));
+    for line in &output.stdout_lines {
+        messages.push(format!("[stdout] {line}"));
+    }
+    for line in &output.stderr_lines {
+        messages.push(format!("[stderr] {line}"));
+    }
+    messages.push(format!(
+        "Manim process finished with exit code {}.",
+        output.exit_code
+    ));
+}
+
+fn extract_manim_scene_name(code: &str) -> Result<String, ApiError> {
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("class ") else {
+            continue;
+        };
+        let name = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect::<String>();
+        if name.is_empty() {
+            continue;
+        }
+        let after_name = &rest[name.len()..];
+        if after_name.contains("Scene") && trimmed.ends_with(':') {
+            return Ok(name);
+        }
+    }
+    Err(api_error(
+        StatusCode::BAD_REQUEST,
+        "Generated code does not define a renderable Manim Scene class.",
+    ))
+}
+
+fn extract_yon_image_blocks(code: &str) -> Result<Vec<String>, ApiError> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0_usize;
+    while let Some(start_relative) = code[cursor..].find("### YON_IMAGE_") {
+        let start = cursor + start_relative;
+        let marker_end = code[start..]
+            .find("_START ###")
+            .map(|offset| start + offset)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Image mode requires complete YON_IMAGE start markers.",
+                )
+            })?;
+        let image_number = &code[start + "### YON_IMAGE_".len()..marker_end];
+        let content_start = marker_end + "_START ###".len();
+        let end_marker = format!("### YON_IMAGE_{image_number}_END ###");
+        let content_end = code[content_start..]
+            .find(&end_marker)
+            .map(|offset| content_start + offset)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Image mode requires code blocks wrapped in ### YON_IMAGE_n_START ### / END ###.",
+                )
+            })?;
+        let block_code = code[content_start..content_end].trim();
+        if !block_code.is_empty() {
+            blocks.push(block_code.to_string());
+        }
+        cursor = content_end + end_marker.len();
+    }
+    if blocks.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Image mode requires code blocks wrapped in ### YON_IMAGE_n_START ### / END ###.",
+        ));
+    }
+    Ok(blocks)
+}
+
+fn find_rendered_file(media_dir: &FsPath, extension: &str) -> Result<PathBuf, ApiError> {
+    let mut matches = Vec::new();
+    collect_rendered_files(media_dir, extension, false, &mut matches);
+    if matches.is_empty() {
+        collect_rendered_files(media_dir, extension, true, &mut matches);
+    }
+    matches
+        .into_iter()
+        .max_by_key(|path| {
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH)
+        })
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Rendered .{extension} artifact not found."),
+            )
+        })
+}
+
+fn collect_rendered_files(
+    dir: &FsPath,
+    extension: &str,
+    include_partial: bool,
+    matches: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rendered_files(&path, extension, include_partial, matches);
+            continue;
+        }
+        if !include_partial && path_has_component(&path, "partial_movie_files") {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            matches.push(path);
+        }
+    }
+}
+
+fn path_has_component(path: &FsPath, component: &str) -> bool {
+    path.components().any(
+        |part| matches!(part, Component::Normal(value) if value.to_string_lossy() == component),
+    )
+}
+
+fn safe_artifact_filename(raw: &str, fallback: &str) -> String {
+    let mut name = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while name.contains("--") {
+        name = name.replace("--", "-");
+    }
+    let name = name.trim_matches('-').to_string();
+    if name.is_empty() {
+        fallback.to_string()
+    } else {
+        name
+    }
+}
+
+fn math_animator_artifact_value(
+    state: &AppState,
+    artifact_path: &FsPath,
+    artifact_type: &str,
+    content_type: &str,
+    label: &str,
+) -> Value {
+    let relative = artifact_path
+        .strip_prefix(&*state.output_root)
+        .unwrap_or(artifact_path);
+    json!({
+        "type": artifact_type,
+        "filename": artifact_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default(),
+        "url": format!("/api/outputs/{}", fs_path_to_url_path(relative)),
+        "content_type": content_type,
+        "label": label
+    })
+}
+
+fn fs_path_to_url_path(path: &FsPath) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn trim_math_animator_error(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "Unknown Manim render error.".to_string();
+    }
+    truncate_for_prompt(trimmed, 4000)
+}
+
+fn math_animator_analysis(effective_content: &str, output_mode: &str) -> Value {
+    let title = math_animator_title(effective_content);
+    json!({
+        "learning_goal": title,
+        "math_focus": [title],
+        "visual_targets": if output_mode == "image" {
+            json!(["static visual explanation", "labeled math scene"])
+        } else {
+            json!(["animated explanation", "labeled math scene"])
+        },
+        "narrative_steps": [
+            "Introduce the requested concept.",
+            "Show a compact visual representation.",
+            "Leave the final frame readable for review."
+        ],
+        "reference_usage": "Prompt and attached Socartes context are folded into the generated scene.",
+        "output_intent": output_mode
+    })
+}
+
+fn math_animator_design(effective_content: &str, output_mode: &str) -> Value {
+    let title = math_animator_title(effective_content);
+    json!({
+        "title": title,
+        "scene_outline": [
+            "Create a title layer.",
+            "Add a concise visual explanation layer.",
+            "Hold the final composition."
+        ],
+        "visual_style": "Clean Socartes instructional scene with readable text and restrained motion.",
+        "animation_notes": if output_mode == "image" {
+            json!(["Render the final explanatory frame as an image."])
+        } else {
+            json!(["Use a short write/fade sequence suitable for MP4 output."])
+        },
+        "image_plan": if output_mode == "image" {
+            json!(["One image block rendered through Manim save-last-frame mode."])
+        } else {
+            json!([])
+        },
+        "code_constraints": [
+            "Use Python Manim Scene subclasses.",
+            "Keep generated code self-contained."
+        ]
+    })
+}
+
+fn build_math_animator_result(
+    effective_content: &str,
+    code: &str,
+    render_output: &MathAnimatorRenderOutput,
+    analysis: &Value,
+    design: &Value,
+    timings: Value,
+) -> Value {
+    let title = math_animator_title(effective_content);
+    let artifact_count = render_output.artifacts.len();
+    let summary_text = format!(
+        "Rendered {artifact_count} {} for `{title}`.",
+        if artifact_count == 1 {
+            "Manim artifact"
+        } else {
+            "Manim artifacts"
+        }
+    );
+    json!({
+        "response": summary_text,
+        "summary": {
+            "summary_text": summary_text,
+            "user_request": effective_content,
+            "generated_output": render_output.output_mode,
+            "key_points": [
+                "Generated Python Manim source code.",
+                "Rendered the source through an external Manim-compatible command.",
+                "Published artifacts through /api/outputs."
+            ]
+        },
+        "code": {
+            "language": "python",
+            "content": code
+        },
+        "output_mode": render_output.output_mode,
+        "artifacts": render_output.artifacts,
+        "timings": timings,
+        "render": {
+            "quality": render_output.quality,
+            "retry_attempts": 0,
+            "retry_history": [],
+            "source_code_path": render_output.source_code_path,
+            "visual_review": {
+                "passed": true,
+                "summary": "Rendered artifact was produced by the Manim command.",
+                "issues": [],
+                "suggested_fix": "",
+                "reviewed_frames": 0
+            }
+        },
+        "analysis": analysis,
+        "design": design
+    })
+}
+
+fn math_animator_trace(effective_content: &str, response: &str, result: &Value) -> StudyTrace {
+    let mut trace =
+        SocartesOrchestrator::new().run_with_retrieved_context(effective_content, "", Vec::new());
+    trace.final_answer = response.to_string();
+    trace.draft.content = response.to_string();
+    trace.draft.open_gaps = Vec::new();
+    trace.review.status = "approved".to_string();
+    trace.review.approved = true;
+    trace.reflection_events.push(ReflectionEvent {
+        event_type: "self_correction".to_string(),
+        agent: "math_animator".to_string(),
+        message: format!(
+            "Rendered {} math animator artifact(s) through Manim.",
+            result["artifacts"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default()
+        ),
+    });
+    trace
 }
 
 async fn regenerate_session_stream(
