@@ -1013,6 +1013,9 @@ fn start_cleans_started_processes_when_frontend_readiness_times_out() {
 
     let backend_code = format!(
         "import http.server, os\n\
+         devnull = open(os.devnull, 'w')\n\
+         os.dup2(devnull.fileno(), 1)\n\
+         os.dup2(devnull.fileno(), 2)\n\
          from pathlib import Path\n\
          Path(r'{pid_path}').write_text(str(os.getpid()))\n\
          server = http.server.ThreadingHTTPServer(('127.0.0.1', int(os.environ['BACKEND_PORT'])), http.server.SimpleHTTPRequestHandler)\n\

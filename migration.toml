@@ -1,0 +1,16 @@
+enabled = false
+python_base_url = "http://127.0.0.1:8001"
+python_ws_base_url = "ws://127.0.0.1:8001"
+fallback = "proxy"
+
+[routes]
+chat = "proxy"
+book = "proxy"
+knowledge = "proxy"
+solve = "proxy"
+tutorbot = "proxy"
+quiz = "proxy"
+vision = "proxy"
+notebook = "proxy"
+tools = "proxy"
+co_writer = "proxy"

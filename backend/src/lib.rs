@@ -16,10 +16,10 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        Extension, Multipart, Path, Query, Request, State,
+        Extension, Multipart, OriginalUri, Path, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+
+pub mod migration;
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -646,6 +648,7 @@ struct AppState {
     knowledge_tasks: Arc<KnowledgeTaskRuntimeState>,
     book_runtime: Arc<BookRuntimeState>,
     tutorbot_runtime: Arc<TutorbotRuntimeState>,
+    migration: Arc<migration::MigrationRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -1324,6 +1327,7 @@ impl AppState {
                 notifications: Mutex::new(HashMap::new()),
                 btw_tasks: Mutex::new(HashMap::new()),
             }),
+            migration: Arc::new(migration::MigrationRuntime::from_env()),
         }
     }
 }
@@ -1910,6 +1914,10 @@ fn router_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/learn", post(learn))
         .route("/api/v1/story-rag/ask", post(ask_story_rag))
+        .route(
+            "/api/v1/admin/migration/reload",
+            post(reload_migration_config),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_guard_middleware,
@@ -1938,7 +1946,59 @@ fn router_with_state(state: AppState) -> Router {
         .route("/api/v1/ws", get(chat_ws))
         .route("/api/v1/book/ws", get(book_ws))
         .route("/api/outputs/{*file_path}", get(read_output_file))
+        .fallback(migration_fallback)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            migration_gate_middleware,
+        ))
         .with_state(state)
+}
+
+async fn migration_gate_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mode = state.migration.mode_for_path(request.uri().path());
+    if !mode.should_proxy() {
+        return next.run(request).await;
+    }
+    let mut response = migration::proxy_to_python(state.migration.clone(), request).await;
+    if mode == migration::MigrationMode::Shadow {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-socartes-migration-mode"),
+            HeaderValue::from_static("shadow"),
+        );
+    }
+    response
+}
+
+async fn migration_fallback(State(state): State<AppState>, request: Request) -> Response {
+    migration::proxy_fallback_or_404(state.migration.clone(), request).await
+}
+
+async fn reload_migration_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers) {
+        return *response;
+    }
+    match state.migration.reload_from_disk() {
+        Ok(config) => Json(json!({
+            "ok": true,
+            "enabled": config.enabled,
+            "python_base_url": config.python_base_url,
+            "python_ws_base_url": config.python_ws_base_url,
+            "fallback": config.fallback,
+            "routes": config.routes
+        }))
+        .into_response(),
+        Err(error) => api_error(StatusCode::BAD_REQUEST, &error.to_string()).into_response(),
+    }
+}
+
+fn path_and_query(uri: &axum::http::Uri) -> String {
+    uri.path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string())
 }
 
 async fn auth_guard_middleware(
@@ -3225,11 +3285,20 @@ struct KnowledgeProgressWsQuery {
 
 async fn knowledge_progress_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     Path(name): Path<String>,
     Query(query): Query<KnowledgeProgressWsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -4858,9 +4927,18 @@ async fn refresh_book_fingerprints(
 
 async fn book_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -4905,9 +4983,18 @@ async fn send_book_ws_api_error(socket: &mut WebSocket, fallback: &str, error: A
 
 async fn question_generate_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -4917,9 +5004,18 @@ async fn question_generate_ws(
 
 async fn question_mimic_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -22196,9 +22292,18 @@ async fn vision_analyze(
 
 async fn vision_solve_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -23173,10 +23278,19 @@ async fn tutorbot_history(
 
 async fn tutorbot_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     Path(bot_id): Path<String>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;
     }
@@ -27724,10 +27838,19 @@ async fn run_test_chat_turn(
 
 async fn chat_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<UnifiedWsAuthQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     let auth_payload = if state.auth_enabled {
         let token = extract_unified_ws_token(&headers, &query);
         let payload = match token.as_deref() {
@@ -27735,13 +27858,14 @@ async fn chat_ws(
             None => None,
         };
         let Some(payload) = payload else {
-            return ws.on_upgrade(close_unauthorized_ws);
+            return ws.on_upgrade(close_unauthorized_ws).into_response();
         };
         Some(payload)
     } else {
         None
     };
     ws.on_upgrade(move |socket| handle_chat_socket(socket, state, auth_payload))
+        .into_response()
 }
 
 async fn close_unauthorized_ws(mut socket: WebSocket) {
@@ -27755,9 +27879,18 @@ async fn close_unauthorized_ws(mut socket: WebSocket) {
 
 async fn legacy_chat_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     let auth_payload = match require_ws_auth_response(&state, &headers) {
         Ok(payload) => payload,
         Err(response) => return *response,
@@ -27768,9 +27901,18 @@ async fn legacy_chat_ws(
 
 async fn legacy_solve_ws(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.migration.mode_for_path(uri.path()).should_proxy() {
+        return migration::proxy_ws_to_python(
+            state.migration.clone(),
+            path_and_query(&uri),
+            headers,
+            ws,
+        );
+    }
     let auth_payload = match require_ws_auth_response(&state, &headers) {
         Ok(payload) => payload,
         Err(response) => return *response,

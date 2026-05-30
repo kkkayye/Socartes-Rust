@@ -41,6 +41,40 @@ PORT=8080 cargo run
 
 Open `http://127.0.0.1:8000/docs` for Swagger UI-compatible API documentation, or `http://127.0.0.1:8000/redoc` for ReDoc-compatible documentation.
 
+## Python Strangler Proxy
+
+The Rust server can sit in front of the existing Python backend while
+capabilities are migrated one at a time. Keep Python bound to an internal port
+such as `127.0.0.1:8001`, run Rust on the public port, then enable
+`migration.toml`:
+
+```toml
+enabled = true
+python_base_url = "http://127.0.0.1:8001"
+python_ws_base_url = "ws://127.0.0.1:8001"
+fallback = "proxy"
+
+[routes]
+chat = "proxy"
+book = "proxy"
+knowledge = "proxy"
+```
+
+Known capabilities can be switched between `native`, `proxy`, and `shadow`.
+`proxy` forwards the request to Python, `native` keeps the Rust handler, and
+`shadow` currently returns Python's response while marking the response with
+`x-socartes-migration-mode: shadow` for migration logs. Reload the file without
+restarting Rust:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/admin/migration/reload
+```
+
+HTTP and SSE responses are streamed byte-for-byte from Python. WebSocket
+endpoints such as `/api/v1/ws`, `/api/v1/book/ws`,
+`/api/v1/knowledge/{name}/progress/ws`, tutorbot, quiz, and vision routes use a
+bidirectional splice.
+
 ## Docker
 
 Build and run the Rust backend image from the repository root:
