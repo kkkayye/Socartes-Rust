@@ -32,6 +32,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode as jwt_decode,
     encode as jwt_encode,
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -630,6 +631,7 @@ struct AppState {
     data_root: Arc<PathBuf>,
     knowledge_root: Arc<PathBuf>,
     session_root: Arc<PathBuf>,
+    session_sqlite_db: Arc<Option<PathBuf>>,
     book_root: Arc<PathBuf>,
     output_root: Arc<PathBuf>,
     settings_root: Arc<PathBuf>,
@@ -1329,6 +1331,9 @@ impl AppState {
         let session_root = env::var_os("SOCARTES_SESSION_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("sessions"));
+        let session_sqlite_db = env::var_os("SOCARTES_SESSION_SQLITE_DB")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty());
         let book_root = env::var_os("SOCARTES_BOOK_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| user_data_root.join("workspace").join("book"));
@@ -1374,6 +1379,7 @@ impl AppState {
             data_root: Arc::new(data_root),
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
+            session_sqlite_db: Arc::new(session_sqlite_db),
             book_root: Arc::new(book_root),
             output_root: Arc::new(output_root),
             settings_root: Arc::new(settings_root),
@@ -23570,6 +23576,13 @@ async fn list_sessions(
             Err(error) => error.into_response(),
         };
     }
+    if session_sqlite_enabled(&state) {
+        return match session_summaries_sqlite(&state) {
+            Ok(sessions) => Json(json!({ "sessions": paginate_values(sessions, limit, offset) }))
+                .into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     Json(json!({ "sessions": paginate_values(session_summaries(&state), limit, offset) }))
         .into_response()
 }
@@ -23581,6 +23594,12 @@ async fn list_legacy_chat_sessions(
     let limit = query.limit.unwrap_or(20).clamp(1, 200);
     if session_pocketbase_enabled(&state) {
         return match session_summaries_pocketbase(&state).await {
+            Ok(sessions) => Json(Value::Array(paginate_values(sessions, limit, 0))).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
+    if session_sqlite_enabled(&state) {
+        return match session_summaries_sqlite(&state) {
             Ok(sessions) => Json(Value::Array(paginate_values(sessions, limit, 0))).into_response(),
             Err(error) => error.into_response(),
         };
@@ -23646,6 +23665,13 @@ async fn delete_session(
             Err(error) => error.into_response(),
         };
     }
+    if session_sqlite_enabled(&state) {
+        return match delete_session_sqlite(&state, &session_id) {
+            Ok(true) => Json(json!({ "deleted": true, "session_id": session_id })).into_response(),
+            Ok(false) => api_error(StatusCode::NOT_FOUND, "Session not found").into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     let path = session_path(&state, &session_id);
     if !path.exists() {
         return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
@@ -23671,6 +23697,17 @@ async fn delete_legacy_session(
                 "session_id": session_id
             }))
             .into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
+    if session_sqlite_enabled(&state) {
+        return match delete_session_sqlite(&state, &session_id) {
+            Ok(true) => Json(json!({
+                "status": "deleted",
+                "session_id": session_id
+            }))
+            .into_response(),
+            Ok(false) => api_error(StatusCode::NOT_FOUND, "Session not found").into_response(),
             Err(error) => error.into_response(),
         };
     }
@@ -31367,6 +31404,605 @@ fn session_path(state: &AppState, session_id: &str) -> PathBuf {
     state.session_root.join(format!("{component}.json"))
 }
 
+fn session_sqlite_db_path(state: &AppState) -> Option<&FsPath> {
+    state
+        .session_sqlite_db
+        .as_ref()
+        .as_ref()
+        .map(PathBuf::as_path)
+}
+
+fn session_sqlite_enabled(state: &AppState) -> bool {
+    session_sqlite_db_path(state).is_some()
+}
+
+fn session_sqlite_error(action: &str, error: rusqlite::Error) -> ApiError {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!("SQLite session store {action} failed: {error}"),
+    )
+}
+
+fn open_session_sqlite(state: &AppState) -> Result<Connection, ApiError> {
+    let Some(path) = session_sqlite_db_path(state) else {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SQLite session store is not configured",
+        ));
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create SQLite session directory: {error}"),
+            )
+        })?;
+    }
+    let conn = Connection::open(path).map_err(|error| session_sqlite_error("open", error))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .map_err(|error| session_sqlite_error("configure busy timeout", error))?;
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New conversation',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            compressed_summary TEXT DEFAULT '',
+            summary_up_to_msg_id INTEGER DEFAULT 0,
+            preferences_json TEXT DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            capability TEXT DEFAULT '',
+            events_json TEXT DEFAULT '',
+            attachments_json TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session_created
+            ON messages(session_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+            ON sessions(updated_at DESC);
+        CREATE TABLE IF NOT EXISTS turns (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            capability TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            finished_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_turns_session_updated
+            ON turns(session_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_turns_session_status
+            ON turns(session_id, status, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS turn_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            source TEXT DEFAULT '',
+            stage TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '',
+            timestamp REAL NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(turn_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_events_turn_seq
+            ON turn_events(turn_id, seq);
+        "#,
+    )
+    .map_err(|error| session_sqlite_error("initialize schema", error))?;
+    Ok(conn)
+}
+
+fn sqlite_json_field(text: Option<String>, default_value: Value) -> Value {
+    text.and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .unwrap_or(default_value)
+}
+
+fn json_string_field(value: &Value, default_value: &str) -> String {
+    if value.is_null() {
+        return default_value.to_string();
+    }
+    serde_json::to_string(value).unwrap_or_else(|_| default_value.to_string())
+}
+
+fn text_value(value: &Value, key: &str, default_value: &str) -> String {
+    value[key].as_str().unwrap_or(default_value).to_string()
+}
+
+fn number_value(value: &Value, key: &str, default_value: f64) -> f64 {
+    value[key].as_f64().unwrap_or(default_value)
+}
+
+fn sqlite_session_messages(conn: &Connection, session_id: &str) -> Result<Vec<Value>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, session_id, role, content, capability, events_json,
+                   attachments_json, metadata_json, created_at
+            FROM messages
+            WHERE session_id = ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .map_err(|error| session_sqlite_error("prepare messages", error))?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>("id")?,
+                "session_id": row.get::<_, String>("session_id")?,
+                "role": row.get::<_, String>("role")?,
+                "content": row.get::<_, String>("content")?,
+                "capability": row.get::<_, Option<String>>("capability")?.unwrap_or_default(),
+                "events": sqlite_json_field(row.get::<_, Option<String>>("events_json")?, json!([])),
+                "attachments": sqlite_json_field(row.get::<_, Option<String>>("attachments_json")?, json!([])),
+                "metadata": sqlite_json_field(row.get::<_, Option<String>>("metadata_json")?, json!({})),
+                "created_at": row.get::<_, f64>("created_at")?
+            }))
+        })
+        .map_err(|error| session_sqlite_error("query messages", error))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row.map_err(|error| session_sqlite_error("read message", error))?);
+    }
+    Ok(messages)
+}
+
+fn sqlite_session_turns(conn: &Connection, session_id: &str) -> Result<Vec<Value>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT t.id, t.session_id, t.capability, t.status, t.error, t.created_at,
+                   t.updated_at, t.finished_at,
+                   COALESCE((SELECT MAX(seq) FROM turn_events te WHERE te.turn_id = t.id), 0) AS last_seq,
+                   COALESCE((SELECT COUNT(*) FROM turn_events te WHERE te.turn_id = t.id), 0) AS event_count
+            FROM turns t
+            WHERE t.session_id = ?1
+            ORDER BY t.updated_at ASC, t.id ASC
+            "#,
+        )
+        .map_err(|error| session_sqlite_error("prepare turns", error))?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            let finished_at = row.get::<_, Option<f64>>("finished_at")?;
+            let completed_at = finished_at.map(|value| json!(value)).unwrap_or(Value::Null);
+            let turn_id = row.get::<_, String>("id")?;
+            Ok(json!({
+                "id": turn_id,
+                "turn_id": turn_id,
+                "session_id": row.get::<_, String>("session_id")?,
+                "capability": row.get::<_, Option<String>>("capability")?.unwrap_or_default(),
+                "status": row.get::<_, String>("status")?,
+                "error": row.get::<_, Option<String>>("error")?.unwrap_or_default(),
+                "started_at": row.get::<_, f64>("created_at")?,
+                "created_at": row.get::<_, f64>("created_at")?,
+                "updated_at": row.get::<_, f64>("updated_at")?,
+                "completed_at": completed_at,
+                "finished_at": completed_at,
+                "last_seq": row.get::<_, i64>("last_seq")?,
+                "event_count": row.get::<_, i64>("event_count")?
+            }))
+        })
+        .map_err(|error| session_sqlite_error("query turns", error))?;
+    let mut turns = Vec::new();
+    for row in rows {
+        turns.push(row.map_err(|error| session_sqlite_error("read turn", error))?);
+    }
+    Ok(turns)
+}
+
+fn sqlite_turn_events(
+    conn: &Connection,
+    turn_id: &str,
+    after_seq: u64,
+) -> Result<Vec<Value>, ApiError> {
+    let session_id = conn
+        .query_row(
+            "SELECT session_id FROM turns WHERE id = ?1",
+            params![turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| session_sqlite_error("find turn", error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found"))?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT turn_id, seq, type, source, stage, content, metadata_json, timestamp
+            FROM turn_events
+            WHERE turn_id = ?1 AND seq > ?2
+            ORDER BY seq ASC
+            "#,
+        )
+        .map_err(|error| session_sqlite_error("prepare turn events", error))?;
+    let rows = stmt
+        .query_map(params![turn_id, after_seq as i64], |row| {
+            Ok(json!({
+                "type": row.get::<_, String>("type")?,
+                "source": row.get::<_, Option<String>>("source")?.unwrap_or_default(),
+                "stage": row.get::<_, Option<String>>("stage")?.unwrap_or_default(),
+                "content": row.get::<_, Option<String>>("content")?.unwrap_or_default(),
+                "metadata": sqlite_json_field(row.get::<_, Option<String>>("metadata_json")?, json!({})),
+                "session_id": session_id,
+                "turn_id": row.get::<_, String>("turn_id")?,
+                "seq": row.get::<_, i64>("seq")?,
+                "timestamp": row.get::<_, f64>("timestamp")?
+            }))
+        })
+        .map_err(|error| session_sqlite_error("query turn events", error))?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(|error| session_sqlite_error("read turn event", error))?);
+    }
+    Ok(events)
+}
+
+fn read_session_sqlite(state: &AppState, session_id: &str) -> Result<Value, ApiError> {
+    let conn = open_session_sqlite(state)?;
+    let mut session = conn
+        .query_row(
+            r#"
+            SELECT s.id, s.title, s.created_at, s.updated_at, s.compressed_summary,
+                   s.summary_up_to_msg_id, s.preferences_json,
+                   COALESCE((SELECT t.status FROM turns t WHERE t.session_id = s.id ORDER BY t.updated_at DESC LIMIT 1), 'idle') AS status,
+                   COALESCE((SELECT t.id FROM turns t WHERE t.session_id = s.id AND t.status = 'running' ORDER BY t.updated_at DESC LIMIT 1), '') AS active_turn_id,
+                   COALESCE((SELECT t.capability FROM turns t WHERE t.session_id = s.id ORDER BY t.updated_at DESC LIMIT 1), '') AS capability
+            FROM sessions s
+            WHERE s.id = ?1
+            "#,
+            params![session_id],
+            |row| {
+                let id = row.get::<_, String>("id")?;
+                let active_turn_id = row.get::<_, String>("active_turn_id")?;
+                Ok(json!({
+                    "id": id,
+                    "session_id": id,
+                    "title": row.get::<_, String>("title")?,
+                    "created_at": row.get::<_, f64>("created_at")?,
+                    "updated_at": row.get::<_, f64>("updated_at")?,
+                    "compressed_summary": row.get::<_, Option<String>>("compressed_summary")?.unwrap_or_default(),
+                    "summary_up_to_msg_id": row.get::<_, Option<i64>>("summary_up_to_msg_id")?.unwrap_or_default(),
+                    "preferences": sqlite_json_field(row.get::<_, Option<String>>("preferences_json")?, json!({})),
+                    "status": row.get::<_, String>("status")?,
+                    "capability": row.get::<_, Option<String>>("capability")?.unwrap_or_default(),
+                    "active_turn_id": if active_turn_id.is_empty() { Value::Null } else { json!(active_turn_id) }
+                }))
+            },
+        )
+        .optional()
+        .map_err(|error| session_sqlite_error("read session", error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Session not found"))?;
+    let messages = sqlite_session_messages(&conn, session_id)?;
+    let turns = sqlite_session_turns(&conn, session_id)?;
+    let active_turns = turns
+        .iter()
+        .filter(|turn| turn["status"] == "running")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut event_map = Map::new();
+    for turn in &turns {
+        let Some(turn_id) = turn["id"].as_str() else {
+            continue;
+        };
+        event_map.insert(
+            turn_id.to_string(),
+            Value::Array(sqlite_turn_events(&conn, turn_id, 0)?),
+        );
+    }
+    session["messages"] = Value::Array(messages);
+    session["turns"] = Value::Array(turns);
+    session["active_turns"] = Value::Array(active_turns);
+    session["turn_events"] = Value::Object(event_map);
+    Ok(session)
+}
+
+fn session_summaries_sqlite(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let conn = open_session_sqlite(state)?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                s.id,
+                s.title,
+                s.created_at,
+                s.updated_at,
+                s.preferences_json,
+                COUNT(m.id) AS message_count,
+                COALESCE((SELECT t.status FROM turns t WHERE t.session_id = s.id ORDER BY t.updated_at DESC LIMIT 1), 'idle') AS status,
+                COALESCE((SELECT t.id FROM turns t WHERE t.session_id = s.id AND t.status = 'running' ORDER BY t.updated_at DESC LIMIT 1), '') AS active_turn_id,
+                COALESCE((SELECT m2.content FROM messages m2 WHERE m2.session_id = s.id AND TRIM(COALESCE(m2.content, '')) != '' ORDER BY m2.id DESC LIMIT 1), '') AS last_message
+            FROM sessions s
+            LEFT JOIN messages m ON m.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC
+            "#,
+        )
+        .map_err(|error| session_sqlite_error("prepare session summaries", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id = row.get::<_, String>("id")?;
+            let active_turn_id = row.get::<_, String>("active_turn_id")?;
+            Ok(json!({
+                "id": id,
+                "session_id": id,
+                "title": row.get::<_, String>("title")?,
+                "created_at": row.get::<_, f64>("created_at")?,
+                "updated_at": row.get::<_, f64>("updated_at")?,
+                "message_count": row.get::<_, i64>("message_count")?,
+                "last_message": row.get::<_, Option<String>>("last_message")?.unwrap_or_default(),
+                "status": row.get::<_, String>("status")?,
+                "active_turn_id": if active_turn_id.is_empty() { Value::Null } else { json!(active_turn_id) },
+                "preferences": sqlite_json_field(row.get::<_, Option<String>>("preferences_json")?, json!({}))
+            }))
+        })
+        .map_err(|error| session_sqlite_error("query session summaries", error))?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row.map_err(|error| session_sqlite_error("read session summary", error))?);
+    }
+    Ok(sessions)
+}
+
+fn session_records_sqlite(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let conn = open_session_sqlite(state)?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM sessions ORDER BY updated_at DESC")
+        .map_err(|error| session_sqlite_error("prepare session records", error))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| session_sqlite_error("query session records", error))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|error| session_sqlite_error("read session id", error))?);
+    }
+    drop(stmt);
+    drop(conn);
+    let mut sessions = Vec::new();
+    for id in ids {
+        sessions.push(read_session_sqlite(state, &id)?);
+    }
+    Ok(sessions)
+}
+
+fn write_session_sqlite(
+    state: &AppState,
+    session_id: &str,
+    session: &Value,
+) -> Result<(), ApiError> {
+    let mut conn = open_session_sqlite(state)?;
+    let existing_message_ids = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE session_id = ?1")
+            .map_err(|error| session_sqlite_error("prepare existing messages", error))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, i64>(0))
+            .map_err(|error| session_sqlite_error("query existing messages", error))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            ids.insert(row.map_err(|error| session_sqlite_error("read existing message", error))?);
+        }
+        ids
+    };
+    let tx = conn
+        .transaction()
+        .map_err(|error| session_sqlite_error("begin transaction", error))?;
+    let now = now_seconds();
+    tx.execute(
+        r#"
+        INSERT INTO sessions (id, title, created_at, updated_at, compressed_summary, summary_up_to_msg_id, preferences_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(id) DO UPDATE SET
+            title = excluded.title,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            compressed_summary = excluded.compressed_summary,
+            summary_up_to_msg_id = excluded.summary_up_to_msg_id,
+            preferences_json = excluded.preferences_json
+        "#,
+        params![
+            session_id,
+            text_value(session, "title", "New conversation"),
+            number_value(session, "created_at", now),
+            number_value(session, "updated_at", now),
+            text_value(session, "compressed_summary", ""),
+            session["summary_up_to_msg_id"].as_i64().unwrap_or_default(),
+            json_string_field(&session["preferences"], "{}"),
+        ],
+    )
+    .map_err(|error| session_sqlite_error("upsert session", error))?;
+    tx.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete old messages", error))?;
+    tx.execute(
+        "DELETE FROM turn_events WHERE turn_id IN (SELECT id FROM turns WHERE session_id = ?1)",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete old turn events", error))?;
+    tx.execute(
+        "DELETE FROM turns WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete old turns", error))?;
+
+    if let Some(messages) = session["messages"].as_array() {
+        for message in messages {
+            let role = text_value(message, "role", "assistant");
+            let content = text_value(message, "content", "");
+            let capability = text_value(message, "capability", "");
+            let events_json = json_string_field(&message["events"], "[]");
+            let attachments_json = json_string_field(&message["attachments"], "[]");
+            let metadata_json = json_string_field(&message["metadata"], "{}");
+            let created_at = number_value(message, "created_at", now);
+            if let Some(message_id) = message["id"].as_i64()
+                && existing_message_ids.contains(&message_id)
+            {
+                tx.execute(
+                    r#"
+                    INSERT INTO messages (id, session_id, role, content, capability, events_json, attachments_json, metadata_json, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#,
+                    params![
+                        message_id,
+                        session_id,
+                        role,
+                        content,
+                        capability,
+                        events_json,
+                        attachments_json,
+                        metadata_json,
+                        created_at,
+                    ],
+                )
+                .map_err(|error| session_sqlite_error("insert preserved message", error))?;
+                continue;
+            }
+            tx.execute(
+                r#"
+                INSERT INTO messages (session_id, role, content, capability, events_json, attachments_json, metadata_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    session_id,
+                    role,
+                    content,
+                    capability,
+                    events_json,
+                    attachments_json,
+                    metadata_json,
+                    created_at,
+                ],
+            )
+            .map_err(|error| session_sqlite_error("insert message", error))?;
+        }
+    }
+
+    let mut inserted_turn_ids = HashSet::new();
+    if let Some(turns) = session["turns"].as_array() {
+        for turn in turns {
+            let turn_id = turn["id"]
+                .as_str()
+                .or_else(|| turn["turn_id"].as_str())
+                .unwrap_or_default();
+            if turn_id.is_empty() {
+                continue;
+            }
+            inserted_turn_ids.insert(turn_id.to_string());
+            let created_at = turn["created_at"]
+                .as_f64()
+                .or_else(|| turn["started_at"].as_f64())
+                .unwrap_or(now);
+            let updated_at = turn["updated_at"]
+                .as_f64()
+                .or_else(|| turn["completed_at"].as_f64())
+                .or_else(|| turn["finished_at"].as_f64())
+                .unwrap_or(now);
+            let finished_at = turn["finished_at"]
+                .as_f64()
+                .or_else(|| turn["completed_at"].as_f64());
+            tx.execute(
+                r#"
+                INSERT INTO turns (id, session_id, capability, status, error, created_at, updated_at, finished_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    turn_id,
+                    session_id,
+                    text_value(turn, "capability", ""),
+                    text_value(turn, "status", "running"),
+                    text_value(turn, "error", ""),
+                    created_at,
+                    updated_at,
+                    finished_at,
+                ],
+            )
+            .map_err(|error| session_sqlite_error("insert turn", error))?;
+        }
+    }
+
+    if let Some(turn_events) = session["turn_events"].as_object() {
+        for (turn_id, events) in turn_events {
+            if !inserted_turn_ids.contains(turn_id) {
+                tx.execute(
+                    r#"
+                    INSERT INTO turns (id, session_id, capability, status, error, created_at, updated_at, finished_at)
+                    VALUES (?1, ?2, '', 'running', '', ?3, ?3, NULL)
+                    "#,
+                    params![turn_id, session_id, now],
+                )
+                .map_err(|error| session_sqlite_error("insert implicit event turn", error))?;
+                inserted_turn_ids.insert(turn_id.clone());
+            }
+            let Some(events) = events.as_array() else {
+                continue;
+            };
+            for event in events {
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO turn_events (turn_id, seq, type, source, stage, content, metadata_json, timestamp, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#,
+                    params![
+                        turn_id,
+                        event["seq"].as_i64().unwrap_or_default(),
+                        text_value(event, "type", ""),
+                        text_value(event, "source", ""),
+                        text_value(event, "stage", ""),
+                        text_value(event, "content", ""),
+                        json_string_field(&event["metadata"], "{}"),
+                        number_value(event, "timestamp", now),
+                        now,
+                    ],
+                )
+                .map_err(|error| session_sqlite_error("insert turn event", error))?;
+            }
+        }
+    }
+
+    tx.commit()
+        .map_err(|error| session_sqlite_error("commit session", error))
+}
+
+fn delete_session_sqlite(state: &AppState, session_id: &str) -> Result<bool, ApiError> {
+    let mut conn = open_session_sqlite(state)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| session_sqlite_error("begin delete transaction", error))?;
+    tx.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete messages", error))?;
+    tx.execute(
+        "DELETE FROM turn_events WHERE turn_id IN (SELECT id FROM turns WHERE session_id = ?1)",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete turn events", error))?;
+    tx.execute(
+        "DELETE FROM turns WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|error| session_sqlite_error("delete turns", error))?;
+    let deleted = tx
+        .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+        .map_err(|error| session_sqlite_error("delete session", error))?;
+    tx.commit()
+        .map_err(|error| session_sqlite_error("commit delete", error))?;
+    Ok(deleted > 0)
+}
+
 fn ensure_chat_session_shell(
     state: &AppState,
     requested_session_id: Option<&str>,
@@ -31400,6 +32036,9 @@ fn ensure_chat_session_shell(
 }
 
 fn read_session(state: &AppState, session_id: &str) -> Result<Value, ApiError> {
+    if session_sqlite_enabled(state) {
+        return read_session_sqlite(state, session_id);
+    }
     let text = fs::read_to_string(session_path(state, session_id))
         .map_err(|_| api_error(StatusCode::NOT_FOUND, "Session not found"))?;
     serde_json::from_str(&text).map_err(|error| {
@@ -31411,6 +32050,9 @@ fn read_session(state: &AppState, session_id: &str) -> Result<Value, ApiError> {
 }
 
 fn write_session(state: &AppState, session_id: &str, session: &Value) -> Result<(), ApiError> {
+    if session_sqlite_enabled(state) {
+        return write_session_sqlite(state, session_id, session);
+    }
     fs::create_dir_all(&*state.session_root).map_err(|error| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -31438,6 +32080,10 @@ async fn read_turn_events(
 ) -> Result<Vec<Value>, ApiError> {
     if session_pocketbase_enabled(state) {
         return read_turn_events_pocketbase(state, turn_id, after_seq).await;
+    }
+    if session_sqlite_enabled(state) {
+        let conn = open_session_sqlite(state)?;
+        return sqlite_turn_events(&conn, turn_id, after_seq);
     }
     for session in session_records(state) {
         if let Some(events) = turn_events_from_session(&session, turn_id, after_seq) {
@@ -31523,6 +32169,19 @@ async fn latest_session_turn_events(
     if session_pocketbase_enabled(state) {
         return latest_session_turn_events_pocketbase(state, session_id, after_seq).await;
     }
+    if session_sqlite_enabled(state) {
+        let conn = open_session_sqlite(state)?;
+        let turn_id = conn
+            .query_row(
+                "SELECT id FROM turns WHERE session_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| session_sqlite_error("find latest turn", error))?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found"))?;
+        return sqlite_turn_events(&conn, &turn_id, after_seq);
+    }
     let session = read_session(state, session_id)?;
     let Some(turn_id) = latest_turn_id(&session) else {
         return Err(api_error(StatusCode::NOT_FOUND, "Turn not found"));
@@ -31560,6 +32219,9 @@ fn turn_events_from_session(session: &Value, turn_id: &str, after_seq: u64) -> O
 }
 
 fn session_summaries(state: &AppState) -> Vec<Value> {
+    if session_sqlite_enabled(state) {
+        return session_summaries_sqlite(state).unwrap_or_default();
+    }
     let mut summaries = Vec::new();
     if let Ok(entries) = fs::read_dir(&*state.session_root) {
         for entry in entries.filter_map(Result::ok) {
@@ -31661,6 +32323,9 @@ async fn session_summaries_pocketbase(state: &AppState) -> Result<Vec<Value>, Ap
 }
 
 fn session_records(state: &AppState) -> Vec<Value> {
+    if session_sqlite_enabled(state) {
+        return session_records_sqlite(state).unwrap_or_default();
+    }
     let mut records = Vec::new();
     if let Ok(entries) = fs::read_dir(&*state.session_root) {
         for entry in entries.filter_map(Result::ok) {

@@ -15,6 +15,7 @@ use axum::body::{Body, Bytes};
 use axum::http;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use socartes_backend::{
     app, app_with_knowledge_root, app_with_knowledge_root_and_auth,
@@ -36,6 +37,7 @@ static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SEARCH_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static BOOK_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static MATH_ANIMATOR_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static SESSION_SQLITE_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SEARCH_ENV_KEYS: &[&str] = &[
     "SEARCH_PROVIDER",
     "BRAVE_SEARCH_API_KEY",
@@ -61,6 +63,11 @@ struct BookCompileEnvGuard {
 
 struct MathAnimatorEnvGuard {
     saved_command: Option<String>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+struct SessionSqliteEnvGuard {
+    saved_db: Option<String>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -105,6 +112,36 @@ impl Drop for SearchEnvGuard {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
+            }
+        }
+    }
+}
+
+impl SessionSqliteEnvGuard {
+    async fn with_db(path: &Path) -> Self {
+        let guard = SESSION_SQLITE_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let saved_db = std::env::var("SOCARTES_SESSION_SQLITE_DB").ok();
+        // SAFETY: tests that mutate the shared session-db env var hold SESSION_SQLITE_ENV_MUTEX.
+        unsafe {
+            std::env::set_var("SOCARTES_SESSION_SQLITE_DB", path);
+        }
+        Self {
+            saved_db,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for SessionSqliteEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: SESSION_SQLITE_ENV_MUTEX is still held while this guard restores the env var.
+        unsafe {
+            match &self.saved_db {
+                Some(value) => std::env::set_var("SOCARTES_SESSION_SQLITE_DB", value),
+                None => std::env::remove_var("SOCARTES_SESSION_SQLITE_DB"),
             }
         }
     }
@@ -28318,6 +28355,358 @@ async fn settings_share_python_canonical_files_during_strangler_migration() {
     assert!(
         !settings_root.join("catalog.json").exists(),
         "Rust must not write a parallel model catalog while Python is the fallback backend"
+    );
+
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+fn seed_python_chat_history_db(db_path: &Path) {
+    let conn = Connection::open(db_path).expect("open python chat_history.db fixture");
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New conversation',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            compressed_summary TEXT DEFAULT '',
+            summary_up_to_msg_id INTEGER DEFAULT 0,
+            preferences_json TEXT DEFAULT '{}'
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            capability TEXT DEFAULT '',
+            events_json TEXT DEFAULT '',
+            attachments_json TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE turns (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            capability TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            finished_at REAL
+        );
+        CREATE TABLE turn_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            source TEXT DEFAULT '',
+            stage TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '',
+            timestamp REAL NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(turn_id, seq)
+        );
+        "#,
+    )
+    .expect("create python chat tables");
+    conn.execute(
+        "INSERT INTO sessions (id, title, created_at, updated_at, compressed_summary, summary_up_to_msg_id, preferences_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            "sqlite-session",
+            "Python SQLite Session",
+            10.0_f64,
+            20.0_f64,
+            "shared summary",
+            0_i64,
+            r#"{"language":"en","capability":"chat","knowledge_bases":["course-a"]}"#,
+        ],
+    )
+    .expect("insert session");
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, capability, events_json, attachments_json, metadata_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            1_i64,
+            "sqlite-session",
+            "user",
+            "SQLite question",
+            "chat",
+            "[]",
+            "[]",
+            r#"{"turn_id":"sqlite-turn-1"}"#,
+            11.0_f64,
+        ],
+    )
+    .expect("insert user message");
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, capability, events_json, attachments_json, metadata_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            2_i64,
+            "sqlite-session",
+            "assistant",
+            "SQLite answer",
+            "chat",
+            r#"[{"type":"content","content":"SQLite answer"}]"#,
+            "[]",
+            r#"{"turn_id":"sqlite-turn-1"}"#,
+            12.0_f64,
+        ],
+    )
+    .expect("insert assistant message");
+    conn.execute(
+        "INSERT INTO turns (id, session_id, capability, status, error, created_at, updated_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "sqlite-turn-1",
+            "sqlite-session",
+            "chat",
+            "completed",
+            "",
+            11.0_f64,
+            13.0_f64,
+            13.0_f64,
+        ],
+    )
+    .expect("insert turn");
+    conn.execute(
+        "INSERT INTO turn_events (turn_id, seq, type, source, stage, content, metadata_json, timestamp, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            "sqlite-turn-1",
+            1_i64,
+            "content",
+            "executor",
+            "executor",
+            "SQLite answer",
+            r#"{"status":"completed"}"#,
+            12.0_f64,
+            12.0_f64,
+        ],
+    )
+    .expect("insert turn event");
+}
+
+#[tokio::test]
+async fn sessions_use_python_sqlite_db_when_configured_for_strangler_state_sharing() {
+    let root = unique_test_knowledge_root();
+    let data_root = test_data_root(&root);
+    let db_path = data_root.join("user").join("chat_history.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    seed_python_chat_history_db(&db_path);
+    let _env = SessionSqliteEnvGuard::with_db(&db_path).await;
+    let app = app_with_knowledge_root(&root);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list_payload = json_response(list_response).await;
+    let listed = list_payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == "sqlite-session")
+        .expect("Rust should read Python SQLite sessions");
+    assert_eq!(listed["message_count"], 2);
+    assert_eq!(listed["last_message"], "SQLite answer");
+    assert_eq!(listed["status"], "completed");
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions/sqlite-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["title"], "Python SQLite Session");
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["turns"][0]["id"], "sqlite-turn-1");
+    assert_eq!(
+        detail["turn_events"]["sqlite-turn-1"][0]["content"],
+        "SQLite answer"
+    );
+
+    let rename_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/sessions/sqlite-session")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"title": "Renamed shared SQLite"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(rename_response).await["session"]["title"],
+        "Renamed shared SQLite"
+    );
+    let conn = Connection::open(&db_path).unwrap();
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM sessions WHERE id = ?1",
+            params!["sqlite-session"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "Renamed shared SQLite");
+
+    let delete_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/sessions/sqlite-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_response).await,
+        json!({"deleted": true, "session_id": "sqlite-session"})
+    );
+    let remaining_sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let remaining_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    let remaining_turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))
+        .unwrap();
+    let remaining_events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turn_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining_sessions, 0);
+    assert_eq!(remaining_messages, 0);
+    assert_eq!(remaining_turns, 0);
+    assert_eq!(remaining_events, 0);
+    assert!(
+        !data_root
+            .join("sessions")
+            .join("sqlite-session.json")
+            .exists(),
+        "shared SQLite mode must not create a parallel JSON session"
+    );
+
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[tokio::test]
+async fn native_chat_turn_writes_python_sqlite_db_when_configured_for_strangler_state_sharing() {
+    let root = unique_test_knowledge_root();
+    let data_root = test_data_root(&root);
+    let db_path = data_root.join("user").join("chat_history.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let _env = SessionSqliteEnvGuard::with_db(&db_path).await;
+    let app = app_with_knowledge_root(&root);
+
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": "sqlite-native-session",
+                        "content": "Persist this native turn in the shared Python SQLite store.",
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let turn_payload = json_response(turn_response).await;
+    let turn_id = turn_payload["turn_id"].as_str().unwrap();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let sessions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+            params!["sqlite-native-session"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let messages: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params!["sqlite-native-session"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let turns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND id = ?2 AND status = 'completed'",
+            params!["sqlite-native-session", turn_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn_events WHERE turn_id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sessions, 1);
+    assert_eq!(messages, 2);
+    assert_eq!(turns, 1);
+    assert!(events > 0);
+    assert!(
+        !data_root
+            .join("sessions")
+            .join("sqlite-native-session.json")
+            .exists(),
+        "native chat must not write a parallel JSON session when shared SQLite is configured"
+    );
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions/sqlite-native-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["session_id"], "sqlite-native-session");
+    assert_eq!(detail["status"], "completed");
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        detail["turn_events"][turn_id].as_array().unwrap().len() as i64,
+        events
     );
 
     let _ = std::fs::remove_dir_all(data_root);
