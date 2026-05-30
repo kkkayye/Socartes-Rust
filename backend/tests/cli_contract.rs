@@ -779,7 +779,11 @@ fn start_cleans_backend_and_state_when_backend_readiness_times_out() {
         ),
     )
     .expect("backend stub should be written");
-    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    fs::write(
+        &frontend_stub,
+        "#!/bin/sh\nexec >/dev/null 2>/dev/null\nsleep 30\n",
+    )
+    .expect("frontend stub should be written");
     make_executable(&backend_stub);
     make_executable(&frontend_stub);
 
@@ -833,7 +837,11 @@ fn start_cleans_stale_recorded_processes_before_launch_like_python_launcher() {
         ),
     )
     .expect("backend stub should be written");
-    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    fs::write(
+        &frontend_stub,
+        "#!/bin/sh\nexec >/dev/null 2>/dev/null\nsleep 30\n",
+    )
+    .expect("frontend stub should be written");
     make_executable(&backend_stub);
     make_executable(&frontend_stub);
 
@@ -928,12 +936,16 @@ fn start_reports_port_owner_before_spawning_like_python_launcher() {
     fs::write(
         &backend_stub,
         format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            "#!/bin/sh\nexec >/dev/null 2>/dev/null\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
             backend_pid.display()
         ),
     )
     .expect("backend stub should be written");
-    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    fs::write(
+        &frontend_stub,
+        "#!/bin/sh\nexec >/dev/null 2>/dev/null\nsleep 30\n",
+    )
+    .expect("frontend stub should be written");
     make_executable(&backend_stub);
     make_executable(&frontend_stub);
 
