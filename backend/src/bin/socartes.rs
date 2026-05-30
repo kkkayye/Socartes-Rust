@@ -63,7 +63,7 @@ enum Command {
     #[command(subcommand, about = "Manage provider authentication.")]
     Provider(ProviderCommand),
     #[command(about = "Initialize local Socartes runtime files.")]
-    Init(InitArgs),
+    Init(Box<InitArgs>),
 }
 
 static TOOL_RESULTS: LazyLock<Mutex<ToolResultBuffer>> =
@@ -322,6 +322,8 @@ struct InitArgs {
     cli: bool,
     #[arg(long)]
     home: Option<PathBuf>,
+    #[command(flatten)]
+    runtime: RuntimeInitOptions,
     #[command(subcommand)]
     command: Option<InitCommand>,
 }
@@ -334,6 +336,42 @@ struct InitWizardArgs {
     cli: bool,
     #[arg(long)]
     home: Option<PathBuf>,
+    #[command(flatten)]
+    runtime: RuntimeInitOptions,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct RuntimeInitOptions {
+    #[arg(long)]
+    llm_binding: Option<String>,
+    #[arg(long)]
+    llm_base_url: Option<String>,
+    #[arg(long)]
+    llm_api_key: Option<String>,
+    #[arg(long)]
+    llm_model: Option<String>,
+    #[arg(long)]
+    embedding_binding: Option<String>,
+    #[arg(long)]
+    embedding_base_url: Option<String>,
+    #[arg(long)]
+    embedding_api_key: Option<String>,
+    #[arg(long)]
+    embedding_model: Option<String>,
+    #[arg(long)]
+    embedding_dimension: Option<u32>,
+    #[arg(long)]
+    search_provider: Option<String>,
+    #[arg(long)]
+    search_base_url: Option<String>,
+    #[arg(long)]
+    search_api_key: Option<String>,
+    #[arg(long)]
+    backend_port: Option<u16>,
+    #[arg(long)]
+    frontend_port: Option<u16>,
+    #[arg(long, short = 'l')]
+    language: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -476,7 +514,7 @@ async fn dispatch_api_command(api: ApiClient, command: Command) -> CliResult {
         Command::Config(command) => config_command(&api, command).await,
         Command::Session(command) => session_command(&api, command).await,
         Command::Provider(command) => provider_command(&api, command).await,
-        Command::Init(args) => init_command(args).await,
+        Command::Init(args) => init_command(*args).await,
         Command::Serve(_) | Command::Start(_) => {
             unreachable!("serve/start handled before API dispatch")
         }
@@ -1670,17 +1708,85 @@ async fn init_command(args: InitArgs) -> CliResult {
     let mut yes = args.yes;
     let mut cli_only = args.cli;
     let mut home = args.home;
+    let mut runtime = args.runtime;
     if let Some(command) = args.command {
         let InitCommand::Wizard(wizard) = command;
         yes |= wizard.yes;
         cli_only |= wizard.cli;
         home = home.or(wizard.home);
+        runtime.merge(wizard.runtime);
     }
     run_init_wizard(InitWizardArgs {
         yes,
         cli: cli_only,
         home,
+        runtime,
     })
+}
+
+impl RuntimeInitOptions {
+    fn merge(&mut self, other: RuntimeInitOptions) {
+        if other.llm_binding.is_some() {
+            self.llm_binding = other.llm_binding;
+        }
+        if other.llm_base_url.is_some() {
+            self.llm_base_url = other.llm_base_url;
+        }
+        if other.llm_api_key.is_some() {
+            self.llm_api_key = other.llm_api_key;
+        }
+        if other.llm_model.is_some() {
+            self.llm_model = other.llm_model;
+        }
+        if other.embedding_binding.is_some() {
+            self.embedding_binding = other.embedding_binding;
+        }
+        if other.embedding_base_url.is_some() {
+            self.embedding_base_url = other.embedding_base_url;
+        }
+        if other.embedding_api_key.is_some() {
+            self.embedding_api_key = other.embedding_api_key;
+        }
+        if other.embedding_model.is_some() {
+            self.embedding_model = other.embedding_model;
+        }
+        if other.embedding_dimension.is_some() {
+            self.embedding_dimension = other.embedding_dimension;
+        }
+        if other.search_provider.is_some() {
+            self.search_provider = other.search_provider;
+        }
+        if other.search_base_url.is_some() {
+            self.search_base_url = other.search_base_url;
+        }
+        if other.search_api_key.is_some() {
+            self.search_api_key = other.search_api_key;
+        }
+        if other.backend_port.is_some() {
+            self.backend_port = other.backend_port;
+        }
+        if other.frontend_port.is_some() {
+            self.frontend_port = other.frontend_port;
+        }
+        if other.language.is_some() {
+            self.language = other.language;
+        }
+    }
+
+    fn has_catalog_options(&self) -> bool {
+        self.llm_binding.is_some()
+            || self.llm_base_url.is_some()
+            || self.llm_api_key.is_some()
+            || self.llm_model.is_some()
+            || self.embedding_binding.is_some()
+            || self.embedding_base_url.is_some()
+            || self.embedding_api_key.is_some()
+            || self.embedding_model.is_some()
+            || self.embedding_dimension.is_some()
+            || self.search_provider.is_some()
+            || self.search_base_url.is_some()
+            || self.search_api_key.is_some()
+    }
 }
 
 fn run_init_wizard(args: InitWizardArgs) -> CliResult {
@@ -1721,8 +1827,14 @@ fn run_init_wizard(args: InitWizardArgs) -> CliResult {
     }
 
     let settings_root = data_root.join("settings");
-    write_json_if_absent(&settings_root.join("catalog.json"), &default_cli_catalog())?;
-    write_json_if_absent(&settings_root.join("ui.json"), &default_cli_ui_settings())?;
+    write_json_if_absent(
+        &settings_root.join("catalog.json"),
+        &configured_cli_catalog(&args.runtime),
+    )?;
+    write_json_if_absent(
+        &settings_root.join("ui.json"),
+        &configured_cli_ui_settings(&args.runtime),
+    )?;
     write_json_if_absent(
         &data_root.join("knowledge").join("kb_config.json"),
         &json!({ "knowledge_bases": {} }),
@@ -1759,6 +1871,20 @@ fn default_cli_ui_settings() -> Value {
             "learnResearch": ["/question", "/solver", "/research", "/co_writer"]
         }
     })
+}
+
+fn configured_cli_ui_settings(options: &RuntimeInitOptions) -> Value {
+    let mut ui = default_cli_ui_settings();
+    if let Some(language) = &options.language {
+        ui["language"] = json!(language);
+    }
+    if options.backend_port.is_some() || options.frontend_port.is_some() {
+        ui["ports"] = json!({
+            "backend": options.backend_port.unwrap_or(8000),
+            "frontend": options.frontend_port.unwrap_or(3000)
+        });
+    }
+    ui
 }
 
 fn default_cli_catalog() -> Value {
@@ -1822,6 +1948,82 @@ fn default_cli_catalog() -> Value {
             }
         }
     })
+}
+
+fn configured_cli_catalog(options: &RuntimeInitOptions) -> Value {
+    if !options.has_catalog_options() {
+        return default_cli_catalog();
+    }
+    let llm_model = option_or_default(&options.llm_model, "socartes-llm");
+    let embedding_model = option_or_default(&options.embedding_model, "socartes-embedding");
+    let embedding_dimension = options.embedding_dimension.unwrap_or(3072);
+    json!({
+        "version": 1,
+        "services": {
+            "llm": {
+                "active_profile_id": "llm-main",
+                "active_model_id": llm_model,
+                "profiles": [{
+                    "id": "llm-main",
+                    "name": "Socartes LLM",
+                    "binding": option_or_default(&options.llm_binding, "openai"),
+                    "base_url": option_or_default(&options.llm_base_url, "http://127.0.0.1:8810/v1"),
+                    "api_key": option_or_default(&options.llm_api_key, ""),
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": llm_model,
+                        "name": llm_model,
+                        "model": llm_model,
+                        "context_window": "8192",
+                        "context_window_source": "cli-init"
+                    }]
+                }]
+            },
+            "embedding": {
+                "active_profile_id": "embedding-main",
+                "active_model_id": embedding_model,
+                "profiles": [{
+                    "id": "embedding-main",
+                    "name": "Socartes Embedding",
+                    "binding": option_or_default(&options.embedding_binding, "openai"),
+                    "base_url": option_or_default(&options.embedding_base_url, "http://127.0.0.1:8810/v1"),
+                    "api_key": option_or_default(&options.embedding_api_key, ""),
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": embedding_model,
+                        "name": embedding_model,
+                        "model": embedding_model,
+                        "dimension": embedding_dimension,
+                        "send_dimensions": true,
+                        "supported_dimensions": embedding_dimension.to_string()
+                    }]
+                }]
+            },
+            "search": {
+                "active_profile_id": "search-main",
+                "profiles": [{
+                    "id": "search-main",
+                    "name": "Socartes Search",
+                    "provider": option_or_default(&options.search_provider, "duckduckgo"),
+                    "base_url": option_or_default(&options.search_base_url, ""),
+                    "api_key": option_or_default(&options.search_api_key, ""),
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
+            }
+        }
+    })
+}
+
+fn option_or_default<'a>(value: &'a Option<String>, default: &'a str) -> &'a str {
+    value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default)
 }
 
 fn merged_config(raw_json: &Option<String>, items: &[String]) -> CliResult<Value> {

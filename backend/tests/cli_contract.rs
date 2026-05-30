@@ -442,6 +442,92 @@ fn config_show_reads_local_runtime_settings_without_api_like_python() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[test]
+fn init_accepts_non_interactive_runtime_settings_like_python_wizard() {
+    let home = unique_temp_dir("init-config");
+    let output = socartes_cmd()
+        .args(["init", "--yes", "--cli", "--home"])
+        .arg(&home)
+        .args([
+            "--llm-binding",
+            "anthropic",
+            "--llm-base-url",
+            "https://llm.example/v1",
+            "--llm-api-key",
+            "sk-llm",
+            "--llm-model",
+            "claude-test",
+            "--embedding-binding",
+            "openai",
+            "--embedding-base-url",
+            "https://embedding.example/v1",
+            "--embedding-api-key",
+            "sk-embedding",
+            "--embedding-model",
+            "text-embedding-test",
+            "--embedding-dimension",
+            "1024",
+            "--search-provider",
+            "brave",
+            "--search-base-url",
+            "https://search.example",
+            "--search-api-key",
+            "sk-search",
+            "--backend-port",
+            "8123",
+            "--frontend-port",
+            "3123",
+            "--language",
+            "ko",
+        ])
+        .output()
+        .expect("socartes init should execute");
+
+    assert!(
+        output.status.success(),
+        "configured init failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let catalog: Value = serde_json::from_str(
+        &fs::read_to_string(home.join("data/settings/catalog.json"))
+            .expect("catalog should be written"),
+    )
+    .unwrap();
+    assert_eq!(catalog["services"]["llm"]["active_profile_id"], "llm-main");
+    assert_eq!(catalog["services"]["llm"]["active_model_id"], "claude-test");
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["binding"],
+        "anthropic"
+    );
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["base_url"],
+        "https://llm.example/v1"
+    );
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["api_key"],
+        "sk-llm"
+    );
+    assert_eq!(
+        catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"],
+        1024
+    );
+    assert_eq!(
+        catalog["services"]["search"]["profiles"][0]["provider"],
+        "brave"
+    );
+
+    let ui: Value = serde_json::from_str(
+        &fs::read_to_string(home.join("data/settings/ui.json")).expect("ui should be written"),
+    )
+    .unwrap();
+    assert_eq!(ui["ports"]["backend"], 8123);
+    assert_eq!(ui["ports"]["frontend"], 3123);
+    assert_eq!(ui["language"], "ko");
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_json_posts_capability_stream_payload_and_prints_sse_payloads() {
     let captured = Arc::new(Mutex::new(None));
