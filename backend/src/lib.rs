@@ -22986,6 +22986,9 @@ async fn execute_plugin_capability_stream(
     if capability_name == "visualize" {
         return execute_visualize_capability_stream(&state, &payload, body).await;
     }
+    if capability_name == "deep_research" {
+        return execute_deep_research_capability_stream(&state, &payload, body).await;
+    }
 
     let request = json!({
         "type": "start_turn",
@@ -23227,6 +23230,134 @@ async fn execute_visualize_capability_stream(
             json!({ "status": "completed" }),
             ids,
             11,
+        ),
+    ];
+    let _ = persist_chat_turn(
+        state,
+        &persistence_payload,
+        &session_id,
+        &turn_id,
+        &trace,
+        &events,
+    );
+
+    for event in &events {
+        if event["type"] != "done" {
+            body.push_str(&sse("stream", event.clone()));
+        }
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "turn_id": turn_id,
+                "result": result
+            },
+            "elapsed_ms": 1
+        }),
+    ));
+
+    sse_response(body).into_response()
+}
+
+async fn execute_deep_research_capability_stream(
+    state: &AppState,
+    payload: &Value,
+    mut body: String,
+) -> axum::response::Response {
+    let content = payload["content"].as_str().unwrap_or_default();
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    let turn_id = format!("rust-turn-{}", unique_id());
+    let request = json!({
+        "type": "start_turn",
+        "session_id": session_id,
+        "content": content,
+        "tools": payload["tools"].clone(),
+        "knowledge_bases": payload["knowledge_bases"].clone(),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "capability": "deep_research",
+        "config": payload["config"].clone(),
+        "attachments": payload["attachments"].clone()
+    });
+    let (persistence_payload, effective_content) =
+        prepare_chat_turn_payload(state, &session_id, &request, content);
+    let normalized_config =
+        normalize_deep_research_config(&request["config"], &request["knowledge_bases"]);
+    let result = build_deep_research_outline_preview(&effective_content, &normalized_config);
+    let response = result["response"].as_str().unwrap_or_default().to_string();
+    let trace = deep_research_trace(&effective_content, &response, &result);
+    let ids = StreamIds::new(&session_id, &turn_id);
+    let events = vec![
+        stream_event(
+            "session",
+            "deep_research",
+            "",
+            "",
+            json!({ "session_id": session_id, "turn_id": turn_id }),
+            ids,
+            1,
+        ),
+        stream_event(
+            "stage_start",
+            "research_planner",
+            "decomposing",
+            "Generating an outline preview before running the full research pipeline.",
+            json!({
+                "capability": "deep_research",
+                "outline_preview": true,
+                "research_config": normalized_config
+            }),
+            ids,
+            2,
+        ),
+        stream_event(
+            "thinking",
+            "research_planner",
+            "decomposing",
+            "Prepared research subtopics from the requested mode, depth, and sources.",
+            json!({ "sub_topics": result["sub_topics"].clone() }),
+            ids,
+            3,
+        ),
+        stream_event(
+            "content",
+            "research_planner",
+            "decomposing",
+            &response,
+            json!({
+                "capability": "deep_research",
+                "outline_preview": true,
+                "sub_topics": result["sub_topics"].clone(),
+                "research_config": result["research_config"].clone()
+            }),
+            ids,
+            4,
+        ),
+        stream_event(
+            "stage_end",
+            "research_planner",
+            "decomposing",
+            "Outline preview is ready for confirmation.",
+            json!({
+                "outline_preview": true,
+                "sub_topics": result["sub_topics"].clone()
+            }),
+            ids,
+            5,
+        ),
+        stream_event(
+            "done",
+            "deep_research",
+            "",
+            "",
+            json!({ "status": "completed" }),
+            ids,
+            6,
         ),
     ];
     let _ = persist_chat_turn(
@@ -23522,6 +23653,250 @@ fn visualize_trace(effective_content: &str, response: &str, result: &Value) -> S
         message: format!(
             "Reviewed {} visualization output for renderability.",
             result["render_type"].as_str().unwrap_or("visualize")
+        ),
+    });
+    trace
+}
+
+fn normalize_deep_research_config(config: &Value, knowledge_bases: &Value) -> Value {
+    let mode = match config["mode"].as_str().unwrap_or("report") {
+        "notes" | "report" | "comparison" | "learning_path" => config["mode"].as_str().unwrap(),
+        _ => "report",
+    };
+    let depth = match config["depth"].as_str().unwrap_or("standard") {
+        "quick" | "standard" | "deep" | "manual" => config["depth"].as_str().unwrap(),
+        _ => "standard",
+    };
+    let has_selected_kb = knowledge_bases.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+    });
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(items) = config["sources"].as_array() {
+        for item in items {
+            let Some(source) = item.as_str() else {
+                continue;
+            };
+            let source = match source {
+                "kb" if has_selected_kb => "kb",
+                "kb" => continue,
+                "web" => "web",
+                "papers" => "papers",
+                _ => continue,
+            };
+            if seen.insert(source) {
+                sources.push(source.to_string());
+            }
+        }
+    }
+    if sources.is_empty() {
+        sources.push("web".to_string());
+    }
+
+    let mut object = Map::new();
+    object.insert("mode".to_string(), json!(mode));
+    object.insert("depth".to_string(), json!(depth));
+    object.insert("sources".to_string(), json!(sources));
+    if let Some(value) = config["manual_subtopics"].as_i64() {
+        object.insert("manual_subtopics".to_string(), json!(value.clamp(1, 10)));
+    }
+    if let Some(value) = config["manual_max_iterations"].as_i64() {
+        object.insert(
+            "manual_max_iterations".to_string(),
+            json!(value.clamp(1, 10)),
+        );
+    }
+    if let Some(outline) = normalized_confirmed_outline(&config["confirmed_outline"]) {
+        object.insert("confirmed_outline".to_string(), outline);
+    }
+    Value::Object(object)
+}
+
+fn normalized_confirmed_outline(value: &Value) -> Option<Value> {
+    let items = value.as_array()?;
+    let outline = items
+        .iter()
+        .filter_map(|item| {
+            let title = item["title"].as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "title": truncate_for_prompt(title, 160),
+                "overview": truncate_for_prompt(item["overview"].as_str().unwrap_or_default().trim(), 320)
+            }))
+        })
+        .collect::<Vec<_>>();
+    (!outline.is_empty()).then(|| Value::Array(outline))
+}
+
+fn build_deep_research_outline_preview(effective_content: &str, config: &Value) -> Value {
+    let topic = deep_research_topic(effective_content);
+    let sub_topics = deep_research_sub_topics(&topic, config);
+    let response = deep_research_outline_markdown(&topic, &sub_topics, config);
+    json!({
+        "response": response,
+        "content": response,
+        "outline_preview": true,
+        "sub_topics": sub_topics,
+        "topic": topic,
+        "research_config": config
+    })
+}
+
+fn deep_research_topic(effective_content: &str) -> String {
+    let topic = effective_content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty() && *line != "[Attached Documents]" && *line != "[User Question]"
+        })
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if topic.is_empty() {
+        "the requested research topic".to_string()
+    } else {
+        truncate_for_prompt(&topic, 220)
+    }
+}
+
+fn deep_research_sub_topics(topic: &str, config: &Value) -> Vec<Value> {
+    if let Some(outline) = config["confirmed_outline"].as_array()
+        && !outline.is_empty()
+    {
+        return outline.to_vec();
+    }
+    let count = config["manual_subtopics"]
+        .as_u64()
+        .map(|value| value.clamp(1, 10) as usize)
+        .unwrap_or_else(|| match config["depth"].as_str().unwrap_or("standard") {
+            "quick" => 2,
+            "deep" => 4,
+            "manual" => 3,
+            _ => 3,
+        });
+    let templates = match config["mode"].as_str().unwrap_or("report") {
+        "comparison" => vec![
+            (
+                "Conceptual frame",
+                "Define each side and establish the comparison criteria.",
+            ),
+            (
+                "Retrieval workflow",
+                "Compare how knowledge is selected, refined, and reused.",
+            ),
+            (
+                "Agent control loop",
+                "Identify where planning, tools, and reflection change the outcome.",
+            ),
+            (
+                "Evaluation risks",
+                "Assess citation quality, latency, cost, and failure modes.",
+            ),
+        ],
+        "learning_path" => vec![
+            (
+                "Prerequisites",
+                "Identify the learner's starting assumptions and vocabulary.",
+            ),
+            (
+                "Core sequence",
+                "Arrange the topic into teachable milestones.",
+            ),
+            (
+                "Practice loop",
+                "Define checks, exercises, and revision triggers.",
+            ),
+            (
+                "Mastery evidence",
+                "Specify artifacts that prove understanding.",
+            ),
+        ],
+        "notes" => vec![
+            ("Key ideas", "Extract the durable concepts and terms."),
+            ("Evidence map", "Attach supporting references and examples."),
+            ("Review prompts", "Turn findings into study questions."),
+            ("Open gaps", "List unclear points for follow-up."),
+        ],
+        _ => vec![
+            ("Background", "Establish context, terminology, and scope."),
+            ("Evidence", "Collect source-backed claims and examples."),
+            ("Synthesis", "Connect findings into a report structure."),
+            (
+                "Implications",
+                "Describe limitations, next steps, and risks.",
+            ),
+        ],
+    };
+    templates
+        .into_iter()
+        .take(count)
+        .map(|(title, overview)| {
+            json!({
+                "title": format!("{topic}: {title}"),
+                "overview": overview
+            })
+        })
+        .collect()
+}
+
+fn deep_research_outline_markdown(topic: &str, sub_topics: &[Value], config: &Value) -> String {
+    let sources = config["sources"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let mut lines = vec![
+        format!("# Research Outline Preview: {topic}"),
+        String::new(),
+        format!(
+            "Mode: {} | Depth: {} | Sources: {}",
+            config["mode"].as_str().unwrap_or("report"),
+            config["depth"].as_str().unwrap_or("standard"),
+            if sources.is_empty() { "web" } else { &sources }
+        ),
+        String::new(),
+    ];
+    for (index, item) in sub_topics.iter().enumerate() {
+        lines.push(format!(
+            "## {}. {}",
+            index + 1,
+            item["title"].as_str().unwrap_or("Research section")
+        ));
+        let overview = item["overview"].as_str().unwrap_or_default();
+        if !overview.is_empty() {
+            lines.push(overview.to_string());
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+fn deep_research_trace(effective_content: &str, response: &str, result: &Value) -> StudyTrace {
+    let mut trace =
+        SocartesOrchestrator::new().run_with_retrieved_context(effective_content, "", Vec::new());
+    trace.final_answer = response.to_string();
+    trace.draft.content = response.to_string();
+    trace.draft.open_gaps = Vec::new();
+    trace.review.status = "approved".to_string();
+    trace.review.approved = true;
+    trace.reflection_events.push(ReflectionEvent {
+        event_type: "self_correction".to_string(),
+        agent: "research_planner".to_string(),
+        message: format!(
+            "Generated {} deep_research outline preview sections.",
+            result["sub_topics"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default()
         ),
     });
     trace
@@ -24369,6 +24744,31 @@ fn plugin_capability_manifests() -> Value {
                     "sources": {
                         "items": { "enum": ["kb", "web", "papers"], "type": "string" },
                         "title": "Sources",
+                        "type": "array"
+                    },
+                    "manual_subtopics": {
+                        "maximum": 10,
+                        "minimum": 1,
+                        "title": "Manual Subtopics",
+                        "type": "integer"
+                    },
+                    "manual_max_iterations": {
+                        "maximum": 10,
+                        "minimum": 1,
+                        "title": "Manual Max Iterations",
+                        "type": "integer"
+                    },
+                    "confirmed_outline": {
+                        "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                                "title": { "title": "Title", "type": "string" },
+                                "overview": { "title": "Overview", "type": "string" }
+                            },
+                            "required": ["title"],
+                            "type": "object"
+                        },
+                        "title": "Confirmed Outline",
                         "type": "array"
                     }
                 },

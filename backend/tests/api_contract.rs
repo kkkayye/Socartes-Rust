@@ -12012,6 +12012,63 @@ async fn plugins_list_matches_playground_contract() {
 }
 
 #[tokio::test]
+async fn deep_research_manifest_schema_exposes_python_request_config() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/plugins/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    let capabilities = payload["capabilities"]
+        .as_array()
+        .expect("capabilities array");
+    let manifest = capabilities
+        .iter()
+        .find(|capability| capability["name"] == "deep_research")
+        .expect("deep_research manifest");
+    let schema = &manifest["request_schema"];
+    assert_eq!(schema["required"], json!(["mode", "depth", "sources"]));
+    let properties = &schema["properties"];
+    assert_eq!(
+        properties["mode"]["enum"],
+        json!(["notes", "report", "comparison", "learning_path"])
+    );
+    assert_eq!(
+        properties["depth"]["enum"],
+        json!(["quick", "standard", "deep", "manual"])
+    );
+    assert_eq!(
+        properties["sources"]["items"]["enum"],
+        json!(["kb", "web", "papers"])
+    );
+    assert_eq!(properties["manual_subtopics"]["type"], "integer");
+    assert_eq!(properties["manual_subtopics"]["minimum"], 1);
+    assert_eq!(properties["manual_subtopics"]["maximum"], 10);
+    assert_eq!(properties["manual_max_iterations"]["type"], "integer");
+    assert_eq!(properties["manual_max_iterations"]["minimum"], 1);
+    assert_eq!(properties["manual_max_iterations"]["maximum"], 10);
+    assert_eq!(properties["confirmed_outline"]["type"], "array");
+    assert_eq!(
+        properties["confirmed_outline"]["items"]["required"],
+        json!(["title"])
+    );
+    assert_eq!(
+        properties["confirmed_outline"]["items"]["properties"]["title"]["type"],
+        "string"
+    );
+    assert_eq!(
+        properties["confirmed_outline"]["items"]["properties"]["overview"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
 async fn plugins_tool_execute_and_stream_match_python_shapes() {
     let direct_response = app()
         .oneshot(
@@ -12106,6 +12163,88 @@ async fn plugins_capability_stream_matches_playground_contract() {
     assert!(stream.contains("\"success\":true"));
     assert!(stream.contains("\"data\""));
     assert!(stream.contains("\"elapsed_ms\""));
+}
+
+#[tokio::test]
+async fn deep_research_execute_stream_returns_outline_preview_contract() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_research/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Agentic RAG vs traditional RAG",
+                        "tools": ["rag", "web_search", "paper_search"],
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "language": "en",
+                        "config": {
+                            "mode": "comparison",
+                            "depth": "standard",
+                            "sources": ["kb", "web", "papers"]
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    assert!(stream.contains("event: process_log"));
+    assert!(stream.contains("event: stream"));
+    assert!(stream.contains("event: result"));
+
+    let events = parse_sse_data_events(&stream);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "session" && event["source"] == "deep_research"),
+        "deep_research should emit a session stream event: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "stage_start" && event["stage"] == "decomposing"),
+        "deep_research preview should enter decomposing stage: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "content"
+                && event["stage"] == "decomposing"
+                && event["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Agentic RAG"))
+        }),
+        "deep_research preview should emit outline markdown content: {events:?}"
+    );
+
+    let result = events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("deep_research result event");
+    let result_data = &result["data"]["result"];
+    assert_eq!(result_data["outline_preview"], true);
+    assert_eq!(result_data["topic"], "Agentic RAG vs traditional RAG");
+    assert!(
+        result_data["sub_topics"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert_eq!(result_data["research_config"]["mode"], "comparison");
+    assert_eq!(result_data["research_config"]["depth"], "standard");
+    assert_eq!(
+        result_data["research_config"]["sources"],
+        json!(["kb", "web", "papers"])
+    );
 }
 
 #[tokio::test]
