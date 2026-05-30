@@ -24202,10 +24202,7 @@ fn chat_provider_tool_params(
     fallback_query: &str,
 ) -> Value {
     let mut params = match &tool_call["function"]["arguments"] {
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({})),
+        Value::String(text) => parse_chat_provider_tool_arguments(text),
         Value::Object(_) => tool_call["function"]["arguments"].clone(),
         _ => json!({}),
     };
@@ -24227,6 +24224,14 @@ fn chat_provider_tool_params(
         }
     }
     params
+}
+
+fn parse_chat_provider_tool_arguments(text: &str) -> Value {
+    serde_json::from_str::<Value>(text)
+        .or_else(|_| json5::from_str::<Value>(text))
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
 }
 
 fn normalized_chat_tool_calls(tool_calls: &[Value]) -> Vec<Value> {

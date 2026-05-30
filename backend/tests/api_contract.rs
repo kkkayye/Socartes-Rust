@@ -20804,6 +20804,149 @@ The violet prism unlock phrase is silver delta, and this phrase appears only in 
 }
 
 #[tokio::test]
+async fn chat_selected_llm_repairs_malformed_tool_arguments_like_python_provider_core() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "chatcmpl-tool-repair",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_rag_repair",
+                        "type": "function",
+                        "function": {
+                            "name": "rag",
+                            "arguments": "{'query':'brass lens code',}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-tool-repair-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final selected LLM answer after repaired tool arguments."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "repair-course",
+        "brass-lens.md",
+        "The brass lens code is umber orbit.",
+    )
+    .await;
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "Please proceed.",
+        "language": "en",
+        "tools": ["rag"],
+        "knowledge_bases": ["repair-course"],
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_body = json_response(chat_response).await;
+    let session_id = chat_body["session_id"]
+        .as_str()
+        .expect("chat turn should return session id");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_rag_repair")
+        .expect("tool result message from repaired arguments");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("umber orbit")),
+        "malformed function.arguments should be repaired before executing RAG: {tool_message}"
+    );
+    drop(recorded);
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(
+        assistant["content"],
+        "Final selected LLM answer after repaired tool arguments."
+    );
+    assert_eq!(
+        assistant["metadata"]["tool_results"][0]["arguments"],
+        json!({
+            "query": "brass lens code",
+            "kb_name": "repair-course"
+        }),
+        "malformed function.arguments should be repaired into exact tool params instead of falling back to the user message"
+    );
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_selected_llm_tool_calls_are_normalized_truncated_and_bound_to_selected_course() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
