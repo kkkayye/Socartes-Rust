@@ -25182,6 +25182,183 @@ async fn book_regenerate_block_calls_selected_provider_and_preserves_source_anch
 }
 
 #[tokio::test]
+async fn book_regenerate_provider_failure_preserves_existing_block_state_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, llm_server) = spawn_status_request_recorder(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "error": {
+                "message": "provider outage while regenerating"
+            }
+        }),
+    )
+    .await;
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_regenerate-provider-failure-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "regenerate-provider-failure-book",
+            "title": "Provider Failure Book",
+            "description": "Failed regenerate should keep prior block content.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": ["tiny-course"],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "regenerate-provider-failure-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Distributed Systems",
+                "summary": "Regenerate failures should be inline block failures.",
+                "content_type": "theory",
+                "learning_objectives": ["Explain failure semantics"],
+                "source_anchors": [{
+                    "kind": "kb",
+                    "ref": "tiny-course:fallback-note",
+                    "snippet": "Existing anchors stay attached when generation fails."
+                }],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let stale_payload = json!({
+        "format": "section",
+        "intro": "Prior intro",
+        "subsections": [{
+            "heading": "Prior subsection",
+            "body": "Existing learner-visible content must not be erased by a provider outage."
+        }]
+    });
+    let stale_anchors = json!([{
+        "kind": "kb",
+        "ref": "tiny-course:existing-block-note",
+        "snippet": "The old block anchor stays when provider regeneration fails."
+    }]);
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "regenerate-provider-failure-book",
+            "chapter_id": "chapter-1",
+            "title": "Provider failure regenerate",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": ["Explain failure semantics"],
+            "blocks": [{
+                "id": "section-block",
+                "type": "section",
+                "title": "Failure-safe regenerate",
+                "status": "ready",
+                "payload": stale_payload,
+                "params": {
+                    "role": "explanation",
+                    "topic": "provider failure"
+                },
+                "metadata": {
+                    "custom": "keep-me",
+                    "generator": "rust_static_book_compiler"
+                },
+                "source_anchors": stale_anchors,
+                "error": "",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/regenerate-block")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "regenerate-provider-failure-book",
+                        "page_id": "page-1",
+                        "block_id": "section-block",
+                        "params_override": { "role": "critic-loop" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let block = json_response(response).await["block"].clone();
+
+    let captured = requests.lock().await.clone();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(block["id"], "section-block");
+    assert_eq!(block["status"], "error");
+    assert!(
+        block["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("HTTP 500"))
+    );
+    assert_eq!(block["payload"], stale_payload);
+    assert_eq!(block["source_anchors"], stale_anchors);
+    assert_eq!(block["params"]["role"], "critic-loop");
+    assert_eq!(block["metadata"]["custom"], "keep-me");
+    assert_eq!(block["metadata"]["generator"], "selected_llm_provider");
+    assert_eq!(block["metadata"]["regenerated"], true);
+    assert_eq!(block["metadata"]["failure"]["kind"], "provider_error");
+    assert_eq!(block["metadata"]["failure"]["source"], "SectionGenerator");
+
+    let saved_page: Value =
+        serde_json::from_slice(&fs::read(book_dir.join("pages").join("page-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved_page["blocks"][0], block);
+    assert_eq!(saved_page["status"], "error");
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_compile_aggregates_existing_block_failures_like_python() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

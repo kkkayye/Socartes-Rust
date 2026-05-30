@@ -9019,7 +9019,8 @@ fn provider_book_block_metadata(
     response: &ChatProviderResponse,
     started: Instant,
 ) -> Value {
-    let mut metadata = json!({
+    let mut metadata = block["metadata"].clone();
+    let provider_metadata = json!({
         "generator": "selected_llm_provider",
         "provider": selection.binding.as_str(),
         "profile_id": selection.profile_id.as_str(),
@@ -9033,12 +9034,11 @@ fn provider_book_block_metadata(
         "kb": as_string_array(&book["knowledge_bases"]),
         "generation_ms": started.elapsed().as_millis() as u64
     });
-    for key in ["transition_in", "deep_dive_page_id"] {
-        if !block["metadata"][key].is_null() {
-            metadata[key] = block["metadata"][key].clone();
-        }
-    }
+    merge_object_value(&mut metadata, &provider_metadata);
     merge_chat_provider_response_metadata(&mut metadata, response);
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.remove("failure");
+    }
     metadata
 }
 
@@ -9049,7 +9049,8 @@ fn provider_book_block_failure_metadata(
     started: Instant,
     error: &str,
 ) -> Value {
-    let mut metadata = json!({
+    let mut metadata = block["metadata"].clone();
+    let provider_metadata = json!({
         "generator": "selected_llm_provider",
         "provider": selection.binding.as_str(),
         "profile_id": selection.profile_id.as_str(),
@@ -9063,18 +9064,75 @@ fn provider_book_block_failure_metadata(
         "kb": as_string_array(&book["knowledge_bases"]),
         "generation_ms": started.elapsed().as_millis() as u64,
         "failure": {
-            "kind": "llm_provider",
+            "kind": book_generator_failure_kind(error),
             "message": error,
-            "retryable": true,
-            "source": "BookCompiler"
+            "retryable": book_generator_failure_retryable(error),
+            "source": book_generator_source_for_block(block)
         }
     });
-    for key in ["transition_in", "deep_dive_page_id"] {
-        if !block["metadata"][key].is_null() {
-            metadata[key] = block["metadata"][key].clone();
-        }
-    }
+    merge_object_value(&mut metadata, &provider_metadata);
     metadata
+}
+
+fn book_generator_failure_kind(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("json") || lower.contains("object found") || lower.contains("parse") {
+        "json_parse"
+    } else if lower.contains("empty")
+        || lower.contains("did not return")
+        || lower.contains("returned no")
+    {
+        "empty_response"
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("stalled")
+    {
+        "timeout"
+    } else if lower.contains("rate limit")
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == "429")
+    {
+        "rate_limit"
+    } else if lower.contains("<think")
+        || lower.contains("reasoning_content")
+        || lower.contains("prompt")
+    {
+        "prompt_leak"
+    } else if lower.contains("api") || lower.contains("llm") || lower.contains("provider") {
+        "provider_error"
+    } else {
+        "generator_error"
+    }
+}
+
+fn book_generator_failure_retryable(message: &str) -> bool {
+    matches!(
+        book_generator_failure_kind(message),
+        "json_parse"
+            | "empty_response"
+            | "timeout"
+            | "rate_limit"
+            | "provider_error"
+            | "generator_error"
+    )
+}
+
+fn book_generator_source_for_block(block: &Value) -> &'static str {
+    match block["type"].as_str().unwrap_or("text") {
+        "animation" => "AnimationGenerator",
+        "callout" => "CalloutGenerator",
+        "code" => "CodeGenerator",
+        "concept_graph" => "ConceptGraphGenerator",
+        "deep_dive" => "DeepDiveGenerator",
+        "figure" => "FigureGenerator",
+        "flash_cards" => "FlashCardsGenerator",
+        "interactive" => "InteractiveGenerator",
+        "quiz" => "QuizGenerator",
+        "section" => "SectionGenerator",
+        "text" => "TextGenerator",
+        "timeline" => "TimelineGenerator",
+        "user_note" => "UserNoteGenerator",
+        _ => "BlockGenerator",
+    }
 }
 
 fn book_chapter_for_page(spine: &Value, page: &Value, page_id: &str) -> Option<Value> {
