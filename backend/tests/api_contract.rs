@@ -14781,6 +14781,265 @@ async fn tutorbot_management_accepts_python_camel_case_config_aliases() {
 }
 
 #[tokio::test]
+async fn tutorbot_ws_registers_and_executes_mcp_streamable_http_tools_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, llm_requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "tutorbot-mcp-first",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_mcp_note",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_docs_fetch_note",
+                            "arguments": "{\"topic\":\"violet prism\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "tutorbot-mcp-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "TutorBot final answer from MCP evidence: obsidian hinge."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let mcp_requests = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let handler_mcp_requests = Arc::clone(&mcp_requests);
+    let mcp_app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
+            let mcp_requests = Arc::clone(&handler_mcp_requests);
+            async move {
+                mcp_requests.lock().await.push(payload.clone());
+                let id = payload.get("id").cloned().unwrap_or(Value::Null);
+                let result = match payload["method"].as_str().unwrap_or_default() {
+                    "initialize" => json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "0.1.0"}
+                    }),
+                    "tools/list" => json!({
+                        "tools": [{
+                            "name": "fetch_note",
+                            "description": "Fetch a course note from the Docs MCP server.",
+                            "inputSchema": {
+                                "type": "object",
+                                "required": ["topic"],
+                                "properties": {
+                                    "topic": {
+                                        "type": "string",
+                                        "description": "Topic to retrieve"
+                                    }
+                                }
+                            }
+                        }]
+                    }),
+                    "tools/call" => json!({
+                        "content": [{
+                            "type": "text",
+                            "text": "MCP note says the violet prism opens with obsidian hinge."
+                        }],
+                        "isError": false
+                    }),
+                    _ => json!({}),
+                };
+                axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result
+                }))
+            }
+        }),
+    );
+    let mcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp_addr = mcp_listener.local_addr().unwrap();
+    let mcp_server = tokio::spawn(async move {
+        axum::serve(mcp_listener, mcp_app).await.unwrap();
+    });
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "mcp-runtime-bot",
+                        "name": "MCP Runtime Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        },
+                        "tools": {
+                            "mcp_servers": {
+                                "docs": {
+                                    "type": "streamableHttp",
+                                    "url": format!("http://{mcp_addr}/mcp"),
+                                    "tool_timeout": 5,
+                                    "enabled_tools": ["fetch_note"]
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/mcp-runtime-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "content": "Use the Docs MCP note to answer the violet prism question.",
+                "chat_id": "web",
+                "tools": ["mcp_docs_fetch_note"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("TutorBot MCP turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let terminal = event["type"] == "done" || event["type"] == "error";
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !events.iter().any(|event| event["type"] == "error"),
+        "TutorBot MCP turn should not surface an error: {events:?}"
+    );
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "TutorBot final answer from MCP evidence: obsidian hinge."
+    );
+
+    let recorded = llm_requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let tools = recorded[0]["payload"]["tools"]
+        .as_array()
+        .expect("first TutorBot provider request should include tool schemas");
+    let mcp_tool = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "mcp_docs_fetch_note")
+        .expect("MCP tool schema should be registered from tools/list");
+    assert_eq!(mcp_tool["type"], "function");
+    assert_eq!(
+        mcp_tool["function"]["description"],
+        "Fetch a course note from the Docs MCP server."
+    );
+    assert_eq!(
+        mcp_tool["function"]["parameters"]["properties"]["topic"]["type"],
+        "string"
+    );
+
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_mcp_note")
+        .expect("MCP tool result should be sent back to the provider");
+    assert_eq!(tool_message["name"], "mcp_docs_fetch_note");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("obsidian hinge"))
+    );
+    drop(recorded);
+
+    let mcp_calls = mcp_requests.lock().await;
+    assert!(
+        mcp_calls
+            .iter()
+            .any(|request| request["method"] == "tools/list"),
+        "TutorBot should list MCP tools before exposing schemas: {mcp_calls:?}"
+    );
+    let tool_call = mcp_calls
+        .iter()
+        .find(|request| request["method"] == "tools/call")
+        .expect("TutorBot should execute the MCP tool through tools/call");
+    assert_eq!(tool_call["params"]["name"], "fetch_note");
+    assert_eq!(
+        tool_call["params"]["arguments"],
+        json!({"topic": "violet prism"})
+    );
+    drop(mcp_calls);
+
+    server.abort();
+    mcp_server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn tutorbot_ws_runs_selected_provider_tool_loop_and_persists_history() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![

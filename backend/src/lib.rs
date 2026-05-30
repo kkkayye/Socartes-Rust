@@ -18440,6 +18440,7 @@ async fn tutorbot_chat_response(
 
     let enabled_tools = requested_tutorbot_chat_tool_names(payload, config);
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
+    let mcp_tools = discover_tutorbot_mcp_tools(config, &enabled_tools).await;
     let mut metadata = json!({
         "profile_id": selection.profile_id.as_str(),
         "model_id": selection.model_id.as_str(),
@@ -18452,15 +18453,16 @@ async fn tutorbot_chat_response(
     let mut answer = None::<String>;
 
     for _ in 0..MAX_TUTORBOT_TOOL_ITERATIONS {
-        let body = tutorbot_chat_completion_body(
-            &selection,
+        let body = tutorbot_chat_completion_body(TutorbotChatCompletionRequest {
+            selection: &selection,
             state,
             bot_id,
             config,
             content,
-            &enabled_tools,
-            &additional_messages,
-        );
+            enabled_tools: &enabled_tools,
+            mcp_tools: &mcp_tools,
+            additional_messages: &additional_messages,
+        });
         let response = call_chat_completion_provider(&selection, body).await?;
         if response.tool_calls.is_empty() {
             merge_chat_provider_response_metadata(&mut metadata, &response);
@@ -18477,6 +18479,7 @@ async fn tutorbot_chat_response(
             &knowledge_bases,
             content,
             &tool_calls,
+            &mcp_tools,
             None,
         )
         .await;
@@ -18508,33 +18511,43 @@ async fn tutorbot_chat_response(
     })
 }
 
-fn tutorbot_chat_completion_body(
-    selection: &ChatRuntimeSelection,
-    state: &AppState,
-    bot_id: &str,
-    config: &Value,
-    content: &str,
-    enabled_tools: &[String],
-    additional_messages: &[Value],
-) -> Value {
+struct TutorbotChatCompletionRequest<'a> {
+    selection: &'a ChatRuntimeSelection,
+    state: &'a AppState,
+    bot_id: &'a str,
+    config: &'a Value,
+    content: &'a str,
+    enabled_tools: &'a [String],
+    mcp_tools: &'a [TutorbotMcpToolDefinition],
+    additional_messages: &'a [Value],
+}
+
+fn tutorbot_chat_completion_body(request: TutorbotChatCompletionRequest<'_>) -> Value {
     let mut messages = vec![json!({
         "role": "system",
-        "content": tutorbot_system_prompt(state, bot_id, config)
+        "content": tutorbot_system_prompt(request.state, request.bot_id, request.config)
     })];
     messages.extend(tutorbot_provider_history_messages(
-        state, bot_id, content, 12,
+        request.state,
+        request.bot_id,
+        request.content,
+        12,
     ));
     messages.push(json!({
         "role": "user",
-        "content": content
+        "content": request.content
     }));
-    messages.extend(additional_messages.iter().cloned());
+    messages.extend(request.additional_messages.iter().cloned());
     let mut body = json!({
-        "model": selection.model.as_str(),
+        "model": request.selection.model.as_str(),
         "messages": messages,
         "stream": false
     });
-    let tool_definitions = openai_chat_tool_definitions(selection, enabled_tools);
+    let tool_definitions = openai_chat_tool_definitions_with_mcp(
+        request.selection,
+        request.enabled_tools,
+        request.mcp_tools,
+    );
     if !tool_definitions.is_empty() {
         body["tools"] = Value::Array(tool_definitions);
         body["tool_choice"] = json!("auto");
@@ -24804,7 +24817,7 @@ fn configured_tutorbot_mcp_tool_names(config: &Value) -> HashSet<String> {
     };
     for (server_name, server_config) in servers {
         let wrapped_prefix = format!("mcp_{server_name}_");
-        for tool_name in as_string_array(&server_config["enabled_tools"]) {
+        for tool_name in tutorbot_mcp_enabled_tools(server_config) {
             if tool_name == "*" {
                 continue;
             }
@@ -24825,12 +24838,245 @@ fn tutorbot_mcp_allow_all_prefixes(config: &Value) -> Vec<String> {
     servers
         .iter()
         .filter(|(_, server_config)| {
-            as_string_array(&server_config["enabled_tools"])
+            tutorbot_mcp_enabled_tools(server_config)
                 .iter()
                 .any(|tool| tool == "*")
         })
         .map(|(server_name, _)| format!("mcp_{server_name}_"))
         .collect()
+}
+
+fn tutorbot_mcp_enabled_tools(server_config: &Value) -> Vec<String> {
+    if server_config.get("enabled_tools").is_none() || server_config["enabled_tools"].is_null() {
+        return vec!["*".to_string()];
+    }
+    as_string_array(&server_config["enabled_tools"])
+}
+
+#[derive(Debug, Clone)]
+struct TutorbotMcpToolDefinition {
+    server_name: String,
+    original_name: String,
+    wrapped_name: String,
+    description: String,
+    input_schema: Value,
+    server_config: Value,
+    tool_timeout: u64,
+}
+
+async fn discover_tutorbot_mcp_tools(
+    config: &Value,
+    enabled_tools: &[String],
+) -> Vec<TutorbotMcpToolDefinition> {
+    let Some(servers) = config["tools"]["mcp_servers"].as_object() else {
+        return Vec::new();
+    };
+    let requested = enabled_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut tools = Vec::new();
+    for (server_name, server_config) in servers {
+        let prefix = format!("mcp_{server_name}_");
+        if !requested.is_empty() && !requested.iter().any(|name| name.starts_with(&prefix)) {
+            continue;
+        }
+        let listed = match list_tutorbot_mcp_server_tools(server_name, server_config).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                eprintln!("MCP server '{server_name}': failed to list tools: {error}");
+                continue;
+            }
+        };
+        let configured = tutorbot_mcp_enabled_tools(server_config);
+        let allow_all = configured.iter().any(|name| name == "*");
+        let configured = configured.into_iter().collect::<HashSet<_>>();
+        for tool in listed {
+            let original_name = tool["name"].as_str().unwrap_or_default().trim();
+            if original_name.is_empty() {
+                continue;
+            }
+            let wrapped_name = format!("{prefix}{original_name}");
+            if !allow_all
+                && !configured.contains(original_name)
+                && !configured.contains(&wrapped_name)
+            {
+                continue;
+            }
+            if !requested.is_empty() && !requested.contains(wrapped_name.as_str()) {
+                continue;
+            }
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .filter(|value| value.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            tools.push(TutorbotMcpToolDefinition {
+                server_name: server_name.clone(),
+                original_name: original_name.to_string(),
+                wrapped_name,
+                description: tool["description"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(original_name)
+                    .to_string(),
+                input_schema,
+                server_config: server_config.clone(),
+                tool_timeout: tutorbot_mcp_tool_timeout(server_config),
+            });
+        }
+    }
+    tools
+}
+
+async fn list_tutorbot_mcp_server_tools(
+    server_name: &str,
+    server_config: &Value,
+) -> Result<Vec<Value>, String> {
+    let transport = tutorbot_mcp_transport_type(server_config);
+    match transport.as_deref() {
+        Some("streamableHttp") => {
+            let _ = tutorbot_mcp_json_rpc_request(
+                server_config,
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "socartes-rust",
+                        "version": VERSION
+                    }
+                }),
+            )
+            .await;
+            let result =
+                tutorbot_mcp_json_rpc_request(server_config, "tools/list", json!({})).await?;
+            Ok(result["tools"].as_array().cloned().unwrap_or_default())
+        }
+        Some(other) => {
+            eprintln!(
+                "MCP server '{server_name}': transport '{other}' is not implemented in the Rust runtime yet"
+            );
+            Ok(Vec::new())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn tutorbot_mcp_transport_type(server_config: &Value) -> Option<String> {
+    if let Some(value) = server_config["type"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    if server_config["command"]
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Some("stdio".to_string());
+    }
+    let url = server_config["url"].as_str()?.trim();
+    if url.is_empty() {
+        None
+    } else if url.trim_end_matches('/').ends_with("/sse") {
+        Some("sse".to_string())
+    } else {
+        Some("streamableHttp".to_string())
+    }
+}
+
+async fn tutorbot_mcp_json_rpc_request(
+    server_config: &Value,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let url = server_config["url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing MCP server url".to_string())?;
+    let timeout_secs = tutorbot_mcp_tool_timeout(server_config);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client
+        .post(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": format!("mcp_{}", uuid::Uuid::new_v4().simple()),
+            "method": method,
+            "params": params
+        }));
+    if let Some(headers) = server_config["headers"].as_object() {
+        for (key, value) in headers {
+            if let Some(value) = value.as_str() {
+                request = request.header(key, value);
+            }
+        }
+    }
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            format!("timeout after {timeout_secs}s")
+        } else {
+            error.to_string()
+        }
+    })?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status.as_u16(), text.trim()));
+    }
+    let payload = parse_mcp_response_payload(&text)?;
+    if let Some(error) = payload.get("error") {
+        return Err(format!("JSON-RPC error: {error}"));
+    }
+    Ok(payload.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+fn parse_mcp_response_payload(text: &str) -> Result<Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Ok(value);
+    }
+    for block in trimmed.split("\n\n") {
+        let data = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !data.trim().is_empty()
+            && let Ok(value) = serde_json::from_str::<Value>(&data)
+        {
+            return Ok(value);
+        }
+    }
+    Err(format!("Invalid MCP JSON response: {trimmed}"))
+}
+
+fn tutorbot_mcp_tool_timeout(server_config: &Value) -> u64 {
+    server_config["tool_timeout"]
+        .as_u64()
+        .or_else(|| {
+            server_config["tool_timeout"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or(30)
 }
 
 fn supports_native_chat_tools(selection: &ChatRuntimeSelection) -> bool {
@@ -24845,6 +25091,14 @@ fn openai_chat_tool_definitions(
     selection: &ChatRuntimeSelection,
     enabled_tools: &[String],
 ) -> Vec<Value> {
+    openai_chat_tool_definitions_with_mcp(selection, enabled_tools, &[])
+}
+
+fn openai_chat_tool_definitions_with_mcp(
+    selection: &ChatRuntimeSelection,
+    enabled_tools: &[String],
+    mcp_tools: &[TutorbotMcpToolDefinition],
+) -> Vec<Value> {
     if enabled_tools.is_empty() || !supports_native_chat_tools(selection) {
         return Vec::new();
     }
@@ -24852,7 +25106,7 @@ fn openai_chat_tool_definitions(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    plugin_tool_definitions()
+    let mut definitions = plugin_tool_definitions()
         .as_array()
         .into_iter()
         .flatten()
@@ -24900,7 +25154,21 @@ fn openai_chat_tool_definitions(
                 }
             }))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    definitions.extend(mcp_tools.iter().filter_map(|tool| {
+        if !enabled.contains(tool.wrapped_name.as_str()) {
+            return None;
+        }
+        Some(json!({
+            "type": "function",
+            "function": {
+                "name": tool.wrapped_name,
+                "description": tool.description,
+                "parameters": tool.input_schema
+            }
+        }))
+    }));
+    definitions
 }
 
 async fn execute_chat_provider_tool_calls(
@@ -24909,6 +25177,7 @@ async fn execute_chat_provider_tool_calls(
     knowledge_bases: &[String],
     fallback_query: &str,
     tool_calls: &[Value],
+    mcp_tools: &[TutorbotMcpToolDefinition],
     auth_payload: Option<&AuthTokenPayload>,
 ) -> (Vec<Value>, Vec<ToolResult>, Vec<Value>) {
     let enabled = enabled_tools
@@ -24932,6 +25201,7 @@ async fn execute_chat_provider_tool_calls(
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("call_{index}"));
         let params = chat_provider_tool_params(tool_call, name, knowledge_bases, fallback_query);
+        let mcp_tool = mcp_tools.iter().find(|tool| tool.wrapped_name == name);
         let result = if enabled.contains(name) && allowed.contains(&name) {
             match plugin_tool_result(state, name, params.clone(), auth_payload).await {
                 Ok(value) => value,
@@ -24947,6 +25217,20 @@ async fn execute_chat_provider_tool_calls(
                         }
                     })
                 }
+            }
+        } else if enabled.contains(name) {
+            if let Some(mcp_tool) = mcp_tool {
+                execute_tutorbot_mcp_tool(mcp_tool, params.clone()).await
+            } else {
+                json!({
+                    "success": false,
+                    "content": format!("Error: Tool '{name}' not found."),
+                    "sources": [],
+                    "metadata": {
+                        "error": "tool_not_found",
+                        "tool": name
+                    }
+                })
             }
         } else {
             json!({
@@ -24984,6 +25268,72 @@ async fn execute_chat_provider_tool_calls(
     }
 
     (tool_messages, trace_results, raw_results)
+}
+
+async fn execute_tutorbot_mcp_tool(tool: &TutorbotMcpToolDefinition, params: Value) -> Value {
+    match tutorbot_mcp_json_rpc_request(
+        &tool.server_config,
+        "tools/call",
+        json!({
+            "name": tool.original_name,
+            "arguments": params
+        }),
+    )
+    .await
+    {
+        Ok(result) => {
+            let content = tutorbot_mcp_result_content(&result);
+            json!({
+                "success": result["isError"].as_bool() != Some(true),
+                "content": content,
+                "sources": [],
+                "metadata": {
+                    "tool": tool.wrapped_name,
+                    "server": tool.server_name,
+                    "original_tool": tool.original_name
+                }
+            })
+        }
+        Err(error) => {
+            let content = if error.starts_with("timeout after ") {
+                format!("(MCP tool call timed out after {}s)", tool.tool_timeout)
+            } else {
+                "(MCP tool call failed: RuntimeError)".to_string()
+            };
+            json!({
+                "success": false,
+                "content": content,
+                "sources": [],
+                "metadata": {
+                    "tool": tool.wrapped_name,
+                    "server": tool.server_name,
+                    "original_tool": tool.original_name,
+                    "error": error
+                }
+            })
+        }
+    }
+}
+
+fn tutorbot_mcp_result_content(result: &Value) -> String {
+    let parts = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|block| {
+            if block["type"].as_str() == Some("text")
+                && let Some(text) = block["text"].as_str()
+            {
+                return text.to_string();
+            }
+            block.to_string()
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "(no output)".to_string()
+    } else {
+        parts.join("\n")
+    }
 }
 
 fn chat_provider_tool_params(
@@ -28256,6 +28606,7 @@ async fn build_chat_turn_with_identity(
                             &knowledge_bases,
                             &effective_content,
                             &tool_calls,
+                            &[],
                             auth_payload,
                         )
                         .await;
