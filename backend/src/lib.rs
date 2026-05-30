@@ -20,7 +20,7 @@ use axum::{
         Extension, Multipart, OriginalUri, Path, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -2037,17 +2037,24 @@ async fn migration_gate_middleware(
         return next.run(request).await;
     }
     let mode = state.migration.mode_for_path(request.uri().path());
-    if !mode.should_proxy() {
-        return next.run(request).await;
+    match mode {
+        migration::MigrationMode::Native => next.run(request).await,
+        migration::MigrationMode::Proxy => {
+            migration::proxy_to_python(state.migration.clone(), request).await
+        }
+        migration::MigrationMode::Shadow => {
+            let capability = migration::capability_for_path(request.uri().path())
+                .unwrap_or("fallback")
+                .to_string();
+            migration::shadow_to_python(
+                state.migration.clone(),
+                capability,
+                request,
+                move |native_request| async move { next.run(native_request).await },
+            )
+            .await
+        }
     }
-    let mut response = migration::proxy_to_python(state.migration.clone(), request).await;
-    if mode == migration::MigrationMode::Shadow {
-        response.headers_mut().insert(
-            header::HeaderName::from_static("x-socartes-migration-mode"),
-            HeaderValue::from_static("shadow"),
-        );
-    }
-    response
 }
 
 async fn migration_fallback(State(state): State<AppState>, request: Request) -> Response {

@@ -1,4 +1,12 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -12,9 +20,12 @@ use futures_util::{SinkExt, StreamExt, stream};
 use http_body_util::BodyExt;
 use socartes_backend::migration::{
     MigrationConfig, MigrationMode, MigrationRuntime, is_websocket_upgrade_request,
-    proxy_to_python, proxy_ws_to_python,
+    proxy_to_python, proxy_ws_to_python, shadow_to_python,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, oneshot},
+};
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 #[test]
@@ -131,6 +142,153 @@ async fn proxy_preserves_sse_headers_and_streams_chunks() {
         .expect("second SSE chunk should be ok");
     assert_eq!(&second[..], b"event: content\ndata: second\n\n");
     assert!(chunks.next().await.is_none());
+}
+
+#[tokio::test]
+async fn shadow_returns_python_stream_and_runs_native_copy_in_background() {
+    let upstream = Router::new().route("/api/v1/stream", any(delayed_sse));
+    let upstream_addr = spawn_app(upstream).await;
+
+    let config = MigrationConfig {
+        enabled: true,
+        python_base_url: format!("http://{upstream_addr}"),
+        python_ws_base_url: format!("ws://{upstream_addr}"),
+        fallback: MigrationMode::Proxy,
+        routes: Default::default(),
+    };
+    let runtime = Arc::new(MigrationRuntime::from_config_for_tests(config));
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let native_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let proxy = Router::new().fallback(any({
+        let runtime = runtime.clone();
+        let native_calls = native_calls.clone();
+        let native_bodies = native_bodies.clone();
+        move |request| {
+            let runtime = runtime.clone();
+            let native_calls = native_calls.clone();
+            let native_bodies = native_bodies.clone();
+            async move {
+                shadow_to_python(runtime, "chat", request, move |native_request| {
+                    let native_calls = native_calls.clone();
+                    let native_bodies = native_bodies.clone();
+                    async move {
+                        native_calls.fetch_add(1, Ordering::SeqCst);
+                        let bytes = native_request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("native request body should collect")
+                            .to_bytes();
+                        native_bodies
+                            .lock()
+                            .await
+                            .push(String::from_utf8_lossy(&bytes).to_string());
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from("event: content\ndata: native\n\n"),
+                        )
+                            .into_response()
+                    }
+                })
+                .await
+            }
+        }
+    }));
+    let proxy_addr = spawn_app(proxy).await;
+
+    let started = std::time::Instant::now();
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/api/v1/stream?topic=rag"))
+        .body("shadow payload")
+        .send()
+        .await
+        .expect("shadow request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-socartes-migration-mode")
+            .and_then(|value| value.to_str().ok()),
+        Some("shadow")
+    );
+
+    let mut chunks = response.bytes_stream();
+    let first = chunks
+        .next()
+        .await
+        .expect("first shadow chunk should arrive")
+        .expect("first shadow chunk should be ok");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "shadow must not buffer Python SSE before returning it"
+    );
+    assert_eq!(&first[..], b"event: thinking\ndata: first\n\n");
+    let second = chunks
+        .next()
+        .await
+        .expect("second shadow chunk should arrive")
+        .expect("second shadow chunk should be ok");
+    assert_eq!(&second[..], b"event: content\ndata: second\n\n");
+    assert!(chunks.next().await.is_none());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if native_calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native copy should run in the background");
+    assert_eq!(native_bodies.lock().await.as_slice(), ["shadow payload"]);
+}
+
+#[tokio::test]
+async fn shadow_native_copy_preserves_request_extensions() {
+    #[derive(Clone)]
+    struct ShadowMarker(&'static str);
+
+    let upstream = Router::new().route("/api/v1/stream", any(delayed_sse));
+    let upstream_addr = spawn_app(upstream).await;
+    let config = MigrationConfig {
+        enabled: true,
+        python_base_url: format!("http://{upstream_addr}"),
+        python_ws_base_url: format!("ws://{upstream_addr}"),
+        fallback: MigrationMode::Proxy,
+        routes: Default::default(),
+    };
+    let runtime = Arc::new(MigrationRuntime::from_config_for_tests(config));
+    let (marker_tx, marker_rx) = oneshot::channel();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/stream")
+        .extension(ShadowMarker("kept"))
+        .body(Body::from("shadow payload"))
+        .expect("shadow request should build");
+
+    let response = shadow_to_python(runtime, "chat", request, move |native_request| async move {
+        let marker = native_request
+            .extensions()
+            .get::<ShadowMarker>()
+            .map(|marker| marker.0.to_string());
+        let _ = marker_tx.send(marker);
+        StatusCode::OK.into_response()
+    })
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response
+        .into_body()
+        .collect()
+        .await
+        .expect("shadow Python stream should drain");
+
+    assert_eq!(
+        marker_rx
+            .await
+            .expect("native copy should report marker extension"),
+        Some("kept".to_string())
+    );
 }
 
 #[tokio::test]

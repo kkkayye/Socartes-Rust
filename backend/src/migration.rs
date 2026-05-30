@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs, io,
+    env, fs,
+    future::Future,
+    hash::{Hash, Hasher},
+    io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
 };
 
 use arc_swap::ArcSwap;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         Request,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -21,13 +25,17 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt, stream};
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::oneshot;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
+
+const SHADOW_OBSERVATION_BODY_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -259,6 +267,22 @@ pub async fn proxy_to_python(runtime: Arc<MigrationRuntime>, request: Request) -
     }
 }
 
+pub async fn shadow_to_python<F, Fut>(
+    runtime: Arc<MigrationRuntime>,
+    capability: impl Into<String>,
+    request: Request,
+    native: F,
+) -> Response
+where
+    F: FnOnce(Request) -> Fut + Send + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    match shadow_to_python_inner(runtime, capability.into(), request, native).await {
+        Ok(response) => response,
+        Err(error) => proxy_error(error),
+    }
+}
+
 pub async fn proxy_fallback_or_404(runtime: Arc<MigrationRuntime>, request: Request) -> Response {
     if runtime.fallback_should_proxy() {
         proxy_to_python(runtime, request).await
@@ -285,6 +309,76 @@ async fn proxy_to_python_inner(
     runtime: Arc<MigrationRuntime>,
     request: Request,
 ) -> Result<Response, ProxyError> {
+    let upstream = send_python_request(runtime, request).await?;
+    let status = upstream.status();
+    let mut headers = strip_hop_by_hop_headers(upstream.headers(), false);
+    if is_sse(&headers) {
+        headers
+            .entry(HeaderName::from_static("x-accel-buffering"))
+            .or_insert(HeaderValue::from_static("no"));
+        headers
+            .entry(CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static("no-cache"));
+    }
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+async fn shadow_to_python_inner<F, Fut>(
+    runtime: Arc<MigrationRuntime>,
+    capability: String,
+    request: Request,
+    native: F,
+) -> Result<Response, ProxyError>
+where
+    F: FnOnce(Request) -> Fut + Send + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    let (parts, body) = request.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|error| ProxyError::RequestBody(error.to_string()))?
+        .to_bytes();
+    let python_request = clone_request_from_parts(&parts, body_bytes.clone())?;
+    let native_request = clone_request_from_parts(&parts, body_bytes)?;
+    let upstream = send_python_request(runtime, python_request).await?;
+    let (python_observation_tx, python_observation_rx) = oneshot::channel();
+    let mut response = response_from_python_upstream(upstream, Some(python_observation_tx));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-socartes-migration-mode"),
+        HeaderValue::from_static("shadow"),
+    );
+
+    tokio::spawn(async move {
+        let native_observation = observe_response(native(native_request).await).await;
+        match python_observation_rx.await {
+            Ok(python_observation) => {
+                log_shadow_diff(&capability, &path, &python_observation, &native_observation);
+            }
+            Err(_) => {
+                eprintln!(
+                    "socartes migration shadow capability={capability} path={path} status=missing_python_observation rust_status={} rust_events={:?}",
+                    native_observation.status, native_observation.event_types
+                );
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+async fn send_python_request(
+    runtime: Arc<MigrationRuntime>,
+    request: Request,
+) -> Result<reqwest::Response, ProxyError> {
     let config = runtime.config();
     let uri = upstream_http_uri(&config.python_base_url, request.uri())?;
     let (parts, body) = request.into_parts();
@@ -300,7 +394,13 @@ async fn proxy_to_python_inner(
         upstream = upstream.header(name, value);
     }
 
-    let upstream = upstream.send().await.map_err(ProxyError::Upstream)?;
+    upstream.send().await.map_err(ProxyError::Upstream)
+}
+
+fn response_from_python_upstream(
+    upstream: reqwest::Response,
+    shadow_observation: Option<oneshot::Sender<ShadowHttpObservation>>,
+) -> Response {
     let status = upstream.status();
     let mut headers = strip_hop_by_hop_headers(upstream.headers(), false);
     if is_sse(&headers) {
@@ -311,10 +411,14 @@ async fn proxy_to_python_inner(
             .entry(CACHE_CONTROL)
             .or_insert(HeaderValue::from_static("no-cache"));
     }
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let body = match shadow_observation {
+        Some(sender) => Body::from_stream(observed_python_stream(upstream, sender)),
+        None => Body::from_stream(upstream.bytes_stream()),
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    Ok(response)
+    response
 }
 
 async fn proxy_ws_inner(
@@ -378,6 +482,227 @@ async fn proxy_ws_inner(
     }
 
     Ok(())
+}
+
+type PythonByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+fn observed_python_stream(
+    upstream: reqwest::Response,
+    sender: oneshot::Sender<ShadowHttpObservation>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+    let status = upstream.status().as_u16();
+    let content_type = content_type_string(upstream.headers());
+    let stream: PythonByteStream = Box::pin(upstream.bytes_stream());
+    stream::unfold(
+        (
+            stream,
+            Vec::new(),
+            false,
+            Some(sender),
+            status,
+            content_type,
+            false,
+        ),
+        |mut state| async move {
+            if state.6 {
+                return None;
+            }
+            match state.0.next().await {
+                Some(Ok(chunk)) => {
+                    append_shadow_observation_bytes(&mut state.1, &mut state.2, &chunk);
+                    Some((Ok(chunk), state))
+                }
+                Some(Err(error)) => {
+                    let detail = error.to_string();
+                    state.6 = true;
+                    send_shadow_observation(
+                        &mut state.3,
+                        state.4,
+                        state.5.clone(),
+                        &state.1,
+                        state.2,
+                        Some(detail),
+                    );
+                    Some((Err(error), state))
+                }
+                None => {
+                    send_shadow_observation(
+                        &mut state.3,
+                        state.4,
+                        state.5.clone(),
+                        &state.1,
+                        state.2,
+                        None,
+                    );
+                    None
+                }
+            }
+        },
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ShadowHttpObservation {
+    status: u16,
+    content_type: Option<String>,
+    body_len: usize,
+    body_hash: u64,
+    truncated: bool,
+    event_types: Vec<String>,
+    error: Option<String>,
+}
+
+async fn observe_response(response: Response) -> ShadowHttpObservation {
+    let status = response.status().as_u16();
+    let content_type = content_type_string(response.headers());
+    match response.into_body().collect().await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            let (body, truncated) = capped_shadow_body(&bytes);
+            shadow_observation_from_bytes(status, content_type, body, truncated, None)
+        }
+        Err(error) => {
+            shadow_observation_from_bytes(status, content_type, &[], false, Some(error.to_string()))
+        }
+    }
+}
+
+fn clone_request_from_parts(
+    parts: &axum::http::request::Parts,
+    body: Bytes,
+) -> Result<Request, ProxyError> {
+    let mut builder = Request::builder()
+        .method(parts.method.clone())
+        .uri(parts.uri.clone())
+        .version(parts.version);
+    *builder.headers_mut().ok_or_else(|| {
+        ProxyError::RequestBody("failed to clone shadow request headers".to_string())
+    })? = parts.headers.clone();
+    let mut request = builder
+        .body(Body::from(body))
+        .map_err(|error| ProxyError::RequestBody(error.to_string()))?;
+    *request.extensions_mut() = parts.extensions.clone();
+    Ok(request)
+}
+
+fn send_shadow_observation(
+    sender: &mut Option<oneshot::Sender<ShadowHttpObservation>>,
+    status: u16,
+    content_type: Option<String>,
+    buffer: &[u8],
+    truncated: bool,
+    error: Option<String>,
+) {
+    if let Some(sender) = sender.take() {
+        let _ = sender.send(shadow_observation_from_bytes(
+            status,
+            content_type,
+            buffer,
+            truncated,
+            error,
+        ));
+    }
+}
+
+fn shadow_observation_from_bytes(
+    status: u16,
+    content_type: Option<String>,
+    body: &[u8],
+    truncated: bool,
+    error: Option<String>,
+) -> ShadowHttpObservation {
+    ShadowHttpObservation {
+        status,
+        content_type,
+        body_len: body.len(),
+        body_hash: hash_shadow_body(body),
+        truncated,
+        event_types: parse_sse_event_types(body),
+        error,
+    }
+}
+
+fn append_shadow_observation_bytes(buffer: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
+    if *truncated {
+        return;
+    }
+    let remaining = SHADOW_OBSERVATION_BODY_LIMIT.saturating_sub(buffer.len());
+    if chunk.len() <= remaining {
+        buffer.extend_from_slice(chunk);
+    } else {
+        buffer.extend_from_slice(&chunk[..remaining]);
+        *truncated = true;
+    }
+}
+
+fn capped_shadow_body(bytes: &Bytes) -> (&[u8], bool) {
+    if bytes.len() <= SHADOW_OBSERVATION_BODY_LIMIT {
+        (bytes, false)
+    } else {
+        (&bytes[..SHADOW_OBSERVATION_BODY_LIMIT], true)
+    }
+}
+
+fn content_type_string(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
+fn hash_shadow_body(body: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn parse_sse_event_types(body: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .split("\n\n")
+        .filter_map(|frame| {
+            frame.lines().find_map(|line| {
+                line.strip_prefix("event:")
+                    .map(str::trim)
+                    .filter(|event| !event.is_empty())
+                    .map(ToString::to_string)
+            })
+        })
+        .collect()
+}
+
+fn log_shadow_diff(
+    capability: &str,
+    path: &str,
+    python: &ShadowHttpObservation,
+    native: &ShadowHttpObservation,
+) {
+    let event_sequence_matches = if python.event_types.is_empty() && native.event_types.is_empty() {
+        None
+    } else {
+        Some(python.event_types == native.event_types)
+    };
+    let body_matches = python.body_len == native.body_len && python.body_hash == native.body_hash;
+    let status_matches = python.status == native.status;
+    let content_type_matches = python.content_type == native.content_type;
+    let matched = status_matches
+        && content_type_matches
+        && event_sequence_matches.unwrap_or(body_matches)
+        && python.error.is_none()
+        && native.error.is_none();
+    eprintln!(
+        "socartes migration shadow capability={capability} path={path} status={} py_status={} rust_status={} py_events={:?} rust_events={:?} py_body_len={} rust_body_len={} py_truncated={} rust_truncated={} py_error={:?} rust_error={:?}",
+        if matched { "match" } else { "diff" },
+        python.status,
+        native.status,
+        python.event_types,
+        native.event_types,
+        python.body_len,
+        native.body_len,
+        python.truncated,
+        native.truncated,
+        python.error,
+        native.error
+    );
 }
 
 fn upstream_http_uri(base_url: &str, uri: &Uri) -> Result<String, ProxyError> {
@@ -524,6 +849,7 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<Message> {
 #[derive(Debug)]
 enum ProxyError {
     Upstream(reqwest::Error),
+    RequestBody(String),
     WebSocket(String),
 }
 
@@ -531,6 +857,7 @@ impl std::fmt::Display for ProxyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Upstream(error) => write!(formatter, "upstream request failed: {error}"),
+            Self::RequestBody(error) => write!(formatter, "request body clone failed: {error}"),
             Self::WebSocket(error) => write!(formatter, "websocket proxy failed: {error}"),
         }
     }
