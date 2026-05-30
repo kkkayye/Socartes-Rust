@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
@@ -61,9 +62,12 @@ enum Command {
     Session(SessionCommand),
     #[command(subcommand, about = "Manage provider authentication.")]
     Provider(ProviderCommand),
-    #[command(subcommand, about = "Initialize local Socartes runtime files.")]
-    Init(InitCommand),
+    #[command(about = "Initialize local Socartes runtime files.")]
+    Init(InitArgs),
 }
+
+static TOOL_RESULTS: LazyLock<Mutex<ToolResultBuffer>> =
+    LazyLock::new(|| Mutex::new(ToolResultBuffer::default()));
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -101,6 +105,8 @@ struct StartArgs {
     host: String,
     #[arg(long, default_value_t = 8000)]
     port: u16,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +117,8 @@ struct ServeArgs {
     port: u16,
     #[arg(long, action = ArgAction::SetTrue)]
     reload: bool,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -294,10 +302,30 @@ enum ProviderCommand {
 
 #[derive(Debug, Subcommand)]
 enum InitCommand {
-    Wizard {
-        #[arg(long, action = ArgAction::SetTrue)]
-        yes: bool,
-    },
+    #[command(about = "Run the interactive-compatible setup wizard.")]
+    Wizard(InitWizardArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, action = ArgAction::SetTrue)]
+    yes: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    cli: bool,
+    #[arg(long)]
+    home: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<InitCommand>,
+}
+
+#[derive(Debug, Args)]
+struct InitWizardArgs {
+    #[arg(long, action = ArgAction::SetTrue)]
+    yes: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    cli: bool,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -418,8 +446,8 @@ impl ApiClient {
 async fn main() -> CliResult {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve(args) => serve(args.host, args.port, args.reload).await,
-        Command::Start(args) => serve(args.host, args.port, false).await,
+        Command::Serve(args) => serve(args.host, args.port, args.reload, args.home).await,
+        Command::Start(args) => serve(args.host, args.port, false, args.home).await,
         command => {
             let api = ApiClient::new(&cli.api_url)?;
             dispatch_api_command(api, command).await
@@ -440,14 +468,14 @@ async fn dispatch_api_command(api: ApiClient, command: Command) -> CliResult {
         Command::Config(command) => config_command(&api, command).await,
         Command::Session(command) => session_command(&api, command).await,
         Command::Provider(command) => provider_command(&api, command).await,
-        Command::Init(command) => init_command(command).await,
+        Command::Init(args) => init_command(args).await,
         Command::Serve(_) | Command::Start(_) => {
             unreachable!("serve/start handled before API dispatch")
         }
     }
 }
 
-async fn serve(host: String, port: u16, reload: bool) -> CliResult {
+async fn serve(host: String, port: u16, reload: bool, home: Option<PathBuf>) -> CliResult {
     if reload {
         eprintln!(
             "--reload is accepted for Python CLI parity; the Rust binary runs without hot reload."
@@ -456,7 +484,13 @@ async fn serve(host: String, port: u16, reload: bool) -> CliResult {
     let address: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = TcpListener::bind(address).await?;
     eprintln!("Socartes Rust API listening on http://{address}");
-    axum::serve(listener, socartes_backend::app()).await?;
+    let app = match home {
+        Some(home) => {
+            socartes_backend::app_with_knowledge_root(home.join("data").join("knowledge"))
+        }
+        None => socartes_backend::app(),
+    };
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -569,6 +603,101 @@ fn parse_sse_events(text: &str) -> Vec<(Option<String>, Value)> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct ToolResultEntry {
+    index: usize,
+    label: String,
+    body: String,
+}
+
+#[derive(Debug)]
+struct ToolResultBuffer {
+    entries: Vec<ToolResultEntry>,
+    next_index: usize,
+    capacity: usize,
+}
+
+impl Default for ToolResultBuffer {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_index: 1,
+            capacity: 32,
+        }
+    }
+}
+
+impl ToolResultBuffer {
+    fn remember(&mut self, label: &str, body: &str) -> ToolResultEntry {
+        let entry = ToolResultEntry {
+            index: self.next_index,
+            label: if label.trim().is_empty() {
+                "tool".to_string()
+            } else {
+                label.to_string()
+            },
+            body: body.to_string(),
+        };
+        self.next_index += 1;
+        self.entries.push(entry.clone());
+        if self.entries.len() > self.capacity {
+            let overflow = self.entries.len() - self.capacity;
+            self.entries.drain(0..overflow);
+        }
+        entry
+    }
+
+    fn get(&self, selector: &str) -> Option<ToolResultEntry> {
+        let selector = selector.trim();
+        if selector.is_empty() || selector == "last" {
+            return self.entries.last().cloned();
+        }
+        if let Ok(index) = selector.parse::<usize>() {
+            return self
+                .entries
+                .iter()
+                .find(|entry| entry.index == index)
+                .cloned();
+        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.label == selector)
+            .cloned()
+    }
+
+    fn indexes(&self) -> Vec<usize> {
+        self.entries.iter().map(|entry| entry.index).collect()
+    }
+}
+
+fn truncate_tool_result(body: &str, head_lines: usize, line_hard_cap: usize) -> (String, usize) {
+    if head_lines == 0 {
+        return (String::new(), body.lines().count());
+    }
+    let lines = body.split('\n').collect::<Vec<_>>();
+    let hidden = lines.len().saturating_sub(head_lines);
+    let visible = lines
+        .iter()
+        .take(head_lines)
+        .map(|line| clip_line(line, line_hard_cap))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (visible, hidden)
+}
+
+fn clip_line(line: &str, line_hard_cap: usize) -> String {
+    if line_hard_cap == 0 || line.chars().count() <= line_hard_cap {
+        return line.to_string();
+    }
+    let mut clipped = line
+        .chars()
+        .take(line_hard_cap.saturating_sub(1))
+        .collect::<String>();
+    clipped.push_str("...");
+    clipped
+}
+
 fn render_stream_payload(event: Option<&str>, payload: &Value) {
     let payload_type = payload["type"].as_str().or(event).unwrap_or("event");
     match payload_type {
@@ -589,7 +718,10 @@ fn render_stream_payload(event: Option<&str>, payload: &Value) {
                 let _ = io::stdout().flush();
             }
         }
-        "tool_call" | "tool_result" | "sources" => {
+        "tool_result" => {
+            render_tool_result_preview(payload);
+        }
+        "tool_call" | "sources" => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(payload).unwrap_or_default()
@@ -615,6 +747,70 @@ fn render_stream_payload(event: Option<&str>, payload: &Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn render_tool_result_preview(payload: &Value) {
+    let body = payload["content"].as_str().unwrap_or("");
+    let label = payload["metadata"]["tool"].as_str().unwrap_or("tool");
+    let entry = match TOOL_RESULTS.lock() {
+        Ok(mut buffer) => buffer.remember(label, body),
+        Err(_) => ToolResultEntry {
+            index: 0,
+            label: label.to_string(),
+            body: body.to_string(),
+        },
+    };
+    let (head, hidden) = truncate_tool_result(body, 10, 240);
+    if !head.trim().is_empty() {
+        for line in head.lines() {
+            println!("  | {line}");
+        }
+    }
+    if hidden > 0 {
+        println!(
+            "  #{} {} - +{} more line{}; run /show {} or /show last to expand",
+            entry.index,
+            entry.label,
+            hidden,
+            if hidden == 1 { "" } else { "s" },
+            entry.index
+        );
+    } else if head.trim().is_empty() {
+        println!("  #{} {} -> (empty result)", entry.index, entry.label);
+    } else {
+        println!("  #{} {}", entry.index, entry.label);
+    }
+}
+
+fn render_tool_result_entry(selector: &str) {
+    let (entry, available) = match TOOL_RESULTS.lock() {
+        Ok(buffer) => (buffer.get(selector), buffer.indexes()),
+        Err(_) => (None, Vec::new()),
+    };
+    if let Some(entry) = entry {
+        println!("#{} {}", entry.index, entry.label);
+        if entry.body.is_empty() {
+            println!("(empty result)");
+        } else {
+            println!("{}", entry.body);
+        }
+    } else if selector.trim().is_empty() || selector.trim() == "last" {
+        println!("No tool result captured yet in this session.");
+    } else {
+        println!(
+            "No tool result matches {}. Available: {}.",
+            selector,
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
     }
 }
 
@@ -814,6 +1010,14 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
         }
         ["/notebook", "clear"] => {
             state.notebook_references.clear();
+            Ok(true)
+        }
+        ["/show"] => {
+            render_tool_result_entry("last");
+            Ok(true)
+        }
+        ["/show", selector] => {
+            render_tool_result_entry(selector);
             Ok(true)
         }
         ["/config", "show"] => {
@@ -1232,39 +1436,162 @@ async fn provider_command(api: &ApiClient, command: ProviderCommand) -> CliResul
     }
 }
 
-async fn init_command(command: InitCommand) -> CliResult {
-    match command {
-        InitCommand::Wizard { yes } => {
-            let root = env::var("SOCARTES_DATA_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("data"));
-            let dirs = [
-                root.join("knowledge_bases"),
-                root.join("sessions"),
-                root.join("notebooks"),
-                root.join("books"),
-                root.join("memory"),
-                root.join("outputs"),
-            ];
-            if !yes {
-                println!(
-                    "This will create local Socartes runtime directories under {}.",
-                    root.display()
-                );
-                if !confirm("Continue?")? {
-                    return Ok(());
-                }
-            }
-            for dir in &dirs {
-                fs::create_dir_all(dir)?;
-            }
-            print_json(&json!({
-                "initialized": true,
-                "data_dir": root,
-                "created": dirs
-            }))
+async fn init_command(args: InitArgs) -> CliResult {
+    let mut yes = args.yes;
+    let mut cli_only = args.cli;
+    let mut home = args.home;
+    if let Some(command) = args.command {
+        let InitCommand::Wizard(wizard) = command;
+        yes |= wizard.yes;
+        cli_only |= wizard.cli;
+        home = home.or(wizard.home);
+    }
+    run_init_wizard(InitWizardArgs {
+        yes,
+        cli: cli_only,
+        home,
+    })
+}
+
+fn run_init_wizard(args: InitWizardArgs) -> CliResult {
+    let data_root = match args.home {
+        Some(home) => home.join("data"),
+        None => env::var("SOCARTES_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data")),
+    };
+    if !args.yes {
+        println!(
+            "This will create local Socartes runtime directories under {}.",
+            data_root.display()
+        );
+        if !confirm("Continue?")? {
+            return Ok(());
         }
     }
+
+    let dirs = [
+        data_root.join("knowledge"),
+        data_root.join("sessions"),
+        data_root.join("user").join("workspace").join("book"),
+        data_root.join("user").join("workspace").join("notebook"),
+        data_root
+            .join("user")
+            .join("workspace")
+            .join("chat")
+            .join("attachments"),
+        data_root.join("memory"),
+        data_root.join("settings"),
+        data_root.join("auth").join("users"),
+        data_root.join("tutorbot"),
+        data_root.join("skills"),
+    ];
+    for dir in &dirs {
+        fs::create_dir_all(dir)?;
+    }
+
+    let settings_root = data_root.join("settings");
+    write_json_if_absent(&settings_root.join("catalog.json"), &default_cli_catalog())?;
+    write_json_if_absent(&settings_root.join("ui.json"), &default_cli_ui_settings())?;
+    write_json_if_absent(
+        &data_root.join("knowledge").join("kb_config.json"),
+        &json!({ "knowledge_bases": {} }),
+    )?;
+
+    print_json(&json!({
+        "initialized": true,
+        "cli_only": args.cli,
+        "data_dir": data_root,
+        "settings": settings_root,
+        "created": dirs
+    }))
+}
+
+fn write_json_if_absent(path: &Path, value: &Value) -> CliResult {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn default_cli_ui_settings() -> Value {
+    json!({
+        "theme": "light",
+        "language": "en",
+        "sidebar_description": "Data Intelligence Lab @ HKU",
+        "sidebar_nav_order": {
+            "start": ["/", "/history", "/knowledge", "/notebook"],
+            "learnResearch": ["/question", "/solver", "/research", "/co_writer"]
+        }
+    })
+}
+
+fn default_cli_catalog() -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "llm": {
+                "active_profile_id": "socartes-rust",
+                "active_model_id": "deterministic-agent-loop",
+                "profiles": [{
+                    "id": "socartes-rust",
+                    "name": "Socartes Rust",
+                    "binding": "openai",
+                    "base_url": "http://127.0.0.1:8810/v1",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-agent-loop",
+                        "name": "Deterministic Agent Loop",
+                        "model": "deterministic-agent-loop",
+                        "context_window": "8192",
+                        "context_window_source": "rust-default"
+                    }]
+                }]
+            },
+            "embedding": {
+                "active_profile_id": "socartes-rust-embedding",
+                "active_model_id": "deterministic-embedding",
+                "profiles": [{
+                    "id": "socartes-rust-embedding",
+                    "name": "Socartes Rust Embedding",
+                    "binding": "openai",
+                    "base_url": "http://127.0.0.1:8810/v1",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-embedding",
+                        "name": "Deterministic Embedding",
+                        "model": "deterministic-embedding",
+                        "dimension": "3072",
+                        "send_dimensions": true,
+                        "supported_dimensions": "1536,3072"
+                    }]
+                }]
+            },
+            "search": {
+                "active_profile_id": "duckduckgo-local",
+                "profiles": [{
+                    "id": "duckduckgo-local",
+                    "name": "DuckDuckGo Local",
+                    "provider": "duckduckgo",
+                    "base_url": "",
+                    "api_key": "",
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
+            }
+        }
+    })
 }
 
 fn merged_config(raw_json: &Option<String>, items: &[String]) -> CliResult<Value> {

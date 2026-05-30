@@ -6,7 +6,11 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{
+    fs,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{net::TcpListener, sync::Mutex};
 
 fn socartes_cmd() -> Command {
@@ -56,6 +60,25 @@ async fn capture_new_session_stream(
         [("content-type", "text/event-stream")],
         "event: stream\ndata: {\"type\":\"session\",\"session_id\":\"session-new\",\"turn_id\":\"turn-new\",\"metadata\":{\"session_id\":\"session-new\",\"turn_id\":\"turn-new\"}}\n\nevent: stream\ndata: {\"type\":\"content\",\"stage\":\"executor\",\"content\":\"first answer\"}\n\nevent: result\ndata: {\"success\":true,\"data\":{\"session_id\":\"session-new\",\"turn_id\":\"turn-new\",\"result\":{\"content\":\"first answer\"}},\"elapsed_ms\":1}\n\n",
     )
+}
+
+async fn capture_tool_result_stream(
+    State(captured): State<Arc<Mutex<Vec<Value>>>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    captured.lock().await.push(payload);
+    (
+        [("content-type", "text/event-stream")],
+        "event: stream\ndata: {\"type\":\"session\",\"session_id\":\"session-tools\",\"turn_id\":\"turn-tools\"}\n\nevent: stream\ndata: {\"type\":\"tool_result\",\"metadata\":{\"tool\":\"rag\"},\"content\":\"line 1\\nline 2\\nline 3\\nline 4\\nline 5\\nline 6\\nline 7\\nline 8\\nline 9\\nline 10\\nline 11\\nline 12\"}\n\nevent: result\ndata: {\"success\":true,\"data\":{\"session_id\":\"session-tools\",\"turn_id\":\"turn-tools\",\"result\":{\"content\":\"done\"}},\"elapsed_ms\":1}\n\n",
+    )
+}
+
+fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("socartes-cli-{label}-{suffix}"))
 }
 
 async fn existing_cli_session() -> Json<Value> {
@@ -164,7 +187,6 @@ fn grouped_help_exposes_python_subcommands() {
         ("config", vec!["show"]),
         ("provider", vec!["login"]),
         ("session", vec!["list", "show", "open", "delete", "rename"]),
-        ("init", vec!["wizard"]),
     ];
 
     for (group, subcommands) in groups {
@@ -172,6 +194,64 @@ fn grouped_help_exposes_python_subcommands() {
         assert_contains_all(&stdout, &[group]);
         assert_contains_all(&stdout, &subcommands);
     }
+
+    let init_help = stdout_for(&["init", "--help"]);
+    assert_contains_all(&init_help, &["--cli", "--home", "--yes", "wizard"]);
+}
+
+#[test]
+fn start_help_keeps_python_home_option() {
+    let stdout = stdout_for(&["start", "--help"]);
+    assert_contains_all(&stdout, &["--home", "--host", "--port"]);
+}
+
+#[test]
+fn init_top_level_wizard_creates_runtime_layout_and_settings() {
+    let home = unique_temp_dir("init");
+    let output = socartes_cmd()
+        .args(["init", "--yes", "--cli", "--home"])
+        .arg(&home)
+        .output()
+        .expect("socartes init should execute");
+
+    assert!(
+        output.status.success(),
+        "socartes init failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(&stdout, &["\"initialized\": true", "\"cli_only\": true"]);
+
+    for relative in [
+        "data/knowledge",
+        "data/sessions",
+        "data/user/workspace/book",
+        "data/user/workspace/notebook",
+        "data/user/workspace/chat/attachments",
+        "data/memory",
+        "data/settings",
+    ] {
+        assert!(
+            home.join(relative).is_dir(),
+            "expected init to create {}",
+            home.join(relative).display()
+        );
+    }
+
+    let catalog_text = fs::read_to_string(home.join("data/settings/catalog.json"))
+        .expect("catalog.json should be written");
+    let catalog: Value = serde_json::from_str(&catalog_text).unwrap();
+    assert_eq!(
+        catalog["services"]["llm"]["active_profile_id"],
+        "socartes-rust"
+    );
+    assert!(
+        home.join("data/settings/ui.json").is_file(),
+        "ui.json should be written"
+    );
+
+    let _ = fs::remove_dir_all(home);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -402,5 +482,42 @@ async fn chat_session_loads_python_repl_preferences_and_refs_command() {
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("Unknown chat command"),
         "/refs must be a first-class Python-compatible chat command"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_show_expands_recent_tool_result_like_python_repl() {
+    let captured_turns = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/plugins/capabilities/chat/execute-stream",
+            post(capture_tool_result_stream),
+        )
+        .with_state(captured_turns.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["chat"])
+        .write_stdin("use rag\n/show last\n/quit\n")
+        .output()
+        .expect("socartes chat should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "socartes chat failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(&stdout, &["#1 rag", "+2 more lines", "line 12"]);
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Unknown chat command"),
+        "/show must be a first-class Python-compatible chat command"
     );
 }
