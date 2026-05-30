@@ -41,6 +41,20 @@ PORT=8080 cargo run
 
 Open `http://127.0.0.1:8000/docs` for Swagger UI-compatible API documentation, or `http://127.0.0.1:8000/redoc` for ReDoc-compatible documentation.
 
+## Docker
+
+Build and run the Rust backend image from the repository root:
+
+```bash
+docker build -t socartes-rust:local .
+docker run --rm -p 8000:8000 -v "$PWD/runtime/data:/app/data" socartes-rust:local
+```
+
+The image contains the backend server binary plus CLI compatibility binaries:
+`socartes`, `socartes-cli`, `socartes_cli`, `deeptutor`, `deeptutor-cli`, and
+`deeptutor_cli`. Runtime data is stored under `/app/data` by default via
+`SOCARTES_DATA_DIR`.
+
 Example request:
 
 ```bash
@@ -151,9 +165,17 @@ mutation, `init wizard` filesystem side effects, provider login behavior, and
 ```bash
 cd backend
 cargo fmt --check
-cargo test
-cargo check --release
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --test cli_contract
+cargo test --locked --test api_contract
+cargo test --locked --test orchestrator_contract
+cargo check --release --locked
 ```
+
+GitHub Actions runs these Rust checks and a Docker image build on pushes and
+pull requests to `main`. Published GitHub releases build and push a GHCR image
+from `Dockerfile`.
 
 Optional HTTP smoke checks while the server is running:
 

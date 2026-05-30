@@ -3139,12 +3139,13 @@ impl RuntimeInitOptions {
 }
 
 fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliResult {
-    let data_root = match args.home {
+    let data_root = match args.home.as_deref() {
         Some(home) => home.join("data"),
         None => env::var("SOCARTES_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data")),
     };
+    let project_root = init_project_root(args.home.as_deref(), &data_root);
     if !args.yes {
         println!(
             "This will create local Socartes runtime directories under {}.",
@@ -3170,6 +3171,7 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
             .join("attachments"),
         data_root.join("memory"),
         data_root.join("settings"),
+        data_root.join("user").join("settings"),
         data_root.join("auth").join("users"),
         data_root.join("tutorbot"),
         data_root.join("skills"),
@@ -3187,6 +3189,14 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
         &settings_root.join("ui.json"),
         &configured_cli_ui_settings(&args.runtime),
     )?;
+    write_init_env_file(&project_root.join(".env"), &args.runtime)?;
+    write_interface_settings(
+        &data_root
+            .join("user")
+            .join("settings")
+            .join("interface.json"),
+        &args.runtime,
+    )?;
     write_json_if_absent(
         &data_root.join("knowledge").join("kb_config.json"),
         &json!({ "knowledge_bases": {} }),
@@ -3197,8 +3207,21 @@ fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliRes
         "cli_only": args.cli,
         "data_dir": data_root,
         "settings": settings_root,
+        "env_file": project_root.join(".env"),
+        "interface_settings": data_root.join("user").join("settings").join("interface.json"),
         "created": dirs
     }))
+}
+
+fn init_project_root(home: Option<&Path>, data_root: &Path) -> PathBuf {
+    match home {
+        Some(home) => home.to_path_buf(),
+        None => data_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
 }
 
 fn prompt_runtime_options(options: &mut RuntimeInitOptions) -> CliResult {
@@ -3270,6 +3293,173 @@ fn write_json_if_absent(path: &Path, value: &Value) -> CliResult {
     let bytes = serde_json::to_vec_pretty(value)?;
     fs::write(path, bytes)?;
     Ok(())
+}
+
+fn write_init_env_file(path: &Path, options: &RuntimeInitOptions) -> CliResult {
+    let mut current = read_env_file(path)?;
+    for (key, value) in configured_cli_env(options) {
+        current.insert(key.to_string(), value);
+    }
+    let key_order = [
+        "BACKEND_PORT",
+        "FRONTEND_PORT",
+        "LLM_BINDING",
+        "LLM_MODEL",
+        "LLM_API_KEY",
+        "LLM_HOST",
+        "LLM_API_VERSION",
+        "EMBEDDING_BINDING",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_HOST",
+        "EMBEDDING_DIMENSION",
+        "EMBEDDING_SEND_DIMENSIONS",
+        "EMBEDDING_API_VERSION",
+        "SEARCH_PROVIDER",
+        "SEARCH_API_KEY",
+        "SEARCH_BASE_URL",
+        "SEARCH_PROXY",
+    ];
+    let mut rendered = String::new();
+    for key in key_order {
+        if key == "SEARCH_BASE_URL"
+            && current
+                .get(key)
+                .map(|value| value.is_empty())
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        if key == "EMBEDDING_SEND_DIMENSIONS"
+            && current
+                .get(key)
+                .map(|value| value.is_empty())
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        rendered.push_str(key);
+        rendered.push('=');
+        rendered.push_str(current.get(key).map(String::as_str).unwrap_or(""));
+        rendered.push('\n');
+    }
+    for (key, value) in current {
+        if !key_order.contains(&key.as_str()) {
+            rendered.push_str(&key);
+            rendered.push('=');
+            rendered.push_str(&value);
+            rendered.push('\n');
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, rendered)?;
+    Ok(())
+}
+
+fn configured_cli_env(options: &RuntimeInitOptions) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "BACKEND_PORT",
+            options.backend_port.unwrap_or(8001).to_string(),
+        ),
+        (
+            "FRONTEND_PORT",
+            options.frontend_port.unwrap_or(3782).to_string(),
+        ),
+        (
+            "LLM_BINDING",
+            option_or_default(&options.llm_binding, "openai").to_string(),
+        ),
+        (
+            "LLM_MODEL",
+            option_or_default(&options.llm_model, "").to_string(),
+        ),
+        (
+            "LLM_API_KEY",
+            option_or_default(&options.llm_api_key, "").to_string(),
+        ),
+        (
+            "LLM_HOST",
+            option_or_default(&options.llm_base_url, "").to_string(),
+        ),
+        ("LLM_API_VERSION", String::new()),
+        (
+            "EMBEDDING_BINDING",
+            option_or_default(&options.embedding_binding, "openai").to_string(),
+        ),
+        (
+            "EMBEDDING_MODEL",
+            option_or_default(&options.embedding_model, "").to_string(),
+        ),
+        (
+            "EMBEDDING_API_KEY",
+            option_or_default(&options.embedding_api_key, "").to_string(),
+        ),
+        (
+            "EMBEDDING_HOST",
+            option_or_default(&options.embedding_base_url, "").to_string(),
+        ),
+        (
+            "EMBEDDING_DIMENSION",
+            options
+                .embedding_dimension
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        ("EMBEDDING_SEND_DIMENSIONS", String::new()),
+        ("EMBEDDING_API_VERSION", String::new()),
+        (
+            "SEARCH_PROVIDER",
+            option_or_default(&options.search_provider, "").to_string(),
+        ),
+        (
+            "SEARCH_API_KEY",
+            option_or_default(&options.search_api_key, "").to_string(),
+        ),
+        (
+            "SEARCH_BASE_URL",
+            option_or_default(&options.search_base_url, "").to_string(),
+        ),
+        ("SEARCH_PROXY", String::new()),
+    ]
+}
+
+fn write_interface_settings(path: &Path, options: &RuntimeInitOptions) -> CliResult {
+    let mut payload = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({})),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    if !payload.is_object() {
+        payload = json!({});
+    }
+    payload["theme"] = payload
+        .get("theme")
+        .cloned()
+        .filter(|value| value.is_string())
+        .unwrap_or_else(|| json!("light"));
+    payload["language"] = json!(
+        options
+            .language
+            .as_deref()
+            .map(normalize_init_language)
+            .unwrap_or("en")
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(())
+}
+
+fn normalize_init_language(language: &str) -> &str {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "zh" | "cn" | "chinese" => "zh",
+        "ko" | "kr" | "korean" => "ko",
+        _ => "en",
+    }
 }
 
 fn default_cli_ui_settings() -> Value {

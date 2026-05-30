@@ -1700,6 +1700,90 @@ fn init_accepts_non_interactive_runtime_settings_like_python_wizard() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[test]
+fn init_writes_env_and_interface_language_like_python_start_tour() {
+    let home = unique_temp_dir("init-python-start-tour");
+    let output = socartes_cmd()
+        .args(["init", "--yes", "--cli", "--home"])
+        .arg(&home)
+        .args([
+            "--llm-binding",
+            "anthropic",
+            "--llm-base-url",
+            "https://llm.example/v1",
+            "--llm-api-key",
+            "sk-llm",
+            "--llm-model",
+            "claude-test",
+            "--embedding-binding",
+            "openai",
+            "--embedding-base-url",
+            "https://embedding.example/v1",
+            "--embedding-api-key",
+            "sk-embedding",
+            "--embedding-model",
+            "text-embedding-test",
+            "--embedding-dimension",
+            "1024",
+            "--search-provider",
+            "brave",
+            "--search-base-url",
+            "https://search.example",
+            "--search-api-key",
+            "sk-search",
+            "--backend-port",
+            "8123",
+            "--frontend-port",
+            "3123",
+            "--language",
+            "zh",
+        ])
+        .output()
+        .expect("socartes init should execute");
+
+    assert!(
+        output.status.success(),
+        "configured init failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let env_text = fs::read_to_string(home.join(".env")).expect(".env should be written");
+    assert_contains_all(
+        &env_text,
+        &[
+            "BACKEND_PORT=8123",
+            "FRONTEND_PORT=3123",
+            "LLM_BINDING=anthropic",
+            "LLM_MODEL=claude-test",
+            "LLM_API_KEY=sk-llm",
+            "LLM_HOST=https://llm.example/v1",
+            "EMBEDDING_BINDING=openai",
+            "EMBEDDING_MODEL=text-embedding-test",
+            "EMBEDDING_API_KEY=sk-embedding",
+            "EMBEDDING_HOST=https://embedding.example/v1",
+            "EMBEDDING_DIMENSION=1024",
+            "SEARCH_PROVIDER=brave",
+            "SEARCH_API_KEY=sk-search",
+            "SEARCH_BASE_URL=https://search.example",
+        ],
+    );
+    assert!(
+        !env_text.contains("LLM_BASE_URL=") && !env_text.contains("EMBEDDING_BASE_URL="),
+        "Python start_tour writes LLM_HOST/EMBEDDING_HOST keys:\n{env_text}"
+    );
+
+    let interface: Value = serde_json::from_str(
+        &fs::read_to_string(home.join("data/user/settings/interface.json"))
+            .expect("interface.json should be written"),
+    )
+    .expect("interface.json should be valid JSON");
+    assert_eq!(interface["theme"], "light");
+    assert_eq!(interface["language"], "zh");
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_json_posts_capability_stream_payload_and_prints_sse_payloads() {
     let captured = Arc::new(Mutex::new(None));

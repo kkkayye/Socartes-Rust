@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+
+backend/target
+backend/data
+runtime
+
+**/.DS_Store
+**/*.rs.bk
+**/*.tmp
+**/*.log
+
+.env
+*.env
