@@ -796,6 +796,31 @@ async fn question_mimic_ws_shadow_mode_returns_python_frames_and_tees_to_native_
 }
 
 #[tokio::test]
+async fn vision_solve_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    assert_app_ws_shadow_route(
+        "vision",
+        "/api/v1/vision/solve",
+        "hello vision solve shadow",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_progress_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    assert_app_ws_shadow_route(
+        "knowledge",
+        "/api/v1/knowledge/test-kb/progress/ws",
+        "hello knowledge progress shadow",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_chat_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    assert_app_ws_shadow_route("chat", "/api/v1/chat", "hello legacy chat shadow").await;
+}
+
+#[tokio::test]
 async fn disabled_migration_fallback_returns_404_without_python() {
     let runtime = Arc::new(MigrationRuntime::from_config_for_tests(
         MigrationConfig::default(),
@@ -815,6 +840,14 @@ async fn disabled_migration_fallback_returns_404_without_python() {
 }
 
 async fn assert_quiz_ws_shadow_route(path: &'static str, payload: &'static str) {
+    assert_app_ws_shadow_route("quiz", path, payload).await;
+}
+
+async fn assert_app_ws_shadow_route(
+    capability: &'static str,
+    path: &'static str,
+    payload: &'static str,
+) {
     let upstream = Router::new().route(path, get(echo_ws));
     let upstream_addr = spawn_app(upstream).await;
 
@@ -850,7 +883,7 @@ python_ws_base_url = "ws://{upstream_addr}"
 fallback = "proxy"
 
 [routes]
-quiz = "shadow"
+{capability} = "shadow"
 "#
     );
     let env_guard = MigrationEnvGuard::with_config(&config, &format!("ws://{native_addr}")).await;
