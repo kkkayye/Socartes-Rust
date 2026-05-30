@@ -1267,7 +1267,8 @@ fn terminate_child_tree(child: &mut std::process::Child, grace: Duration) {
         return;
     }
     signal_child_tree(child, "KILL");
-    let _ = child.wait();
+    let _ = child.kill();
+    let _ = wait_child_until(child, Duration::from_secs(1));
 }
 
 fn wait_child_until(child: &mut std::process::Child, timeout: Duration) -> bool {
