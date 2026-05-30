@@ -4477,7 +4477,9 @@ async fn compile_book_page(
         return api_error(StatusCode::BAD_REQUEST, "page_id is required").into_response();
     };
     let force = request["force"].as_bool().unwrap_or(false);
-    match compile_book_page_with_claim(&state, book_id, page_id, force).await {
+    match compile_book_page_with_claim(&state, book_id, page_id, force, &request["llm_selection"])
+        .await
+    {
         Ok(page) => Json(json!({ "page": page })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -5921,7 +5923,15 @@ async fn handle_book_ws(state: AppState, mut socket: WebSocket) {
                         {
                             return;
                         }
-                        match compile_book_page_record(&state, book_id, page_id, force) {
+                        match compile_book_page_record(
+                            &state,
+                            book_id,
+                            page_id,
+                            force,
+                            &data["llm_selection"],
+                        )
+                        .await
+                        {
                             Ok(page) => {
                                 if !no_op
                                     && !send_book_ws_json(
@@ -8581,6 +8591,7 @@ async fn compile_book_page_with_claim(
     book_id: &str,
     page_id: &str,
     force: bool,
+    llm_selection: &Value,
 ) -> Result<Value, ApiError> {
     let claim_key = format!("{book_id}\u{0}{page_id}");
     let active_claim = {
@@ -8605,7 +8616,7 @@ async fn compile_book_page_with_claim(
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 
-    let result = compile_book_page_record(state, book_id, page_id, force);
+    let result = compile_book_page_record(state, book_id, page_id, force, llm_selection).await;
     if let Some(notify) = state
         .book_runtime
         .compiling_pages
@@ -8618,11 +8629,12 @@ async fn compile_book_page_with_claim(
     result
 }
 
-fn compile_book_page_record(
+async fn compile_book_page_record(
     state: &AppState,
     book_id: &str,
     page_id: &str,
     force: bool,
+    llm_selection: &Value,
 ) -> Result<Value, ApiError> {
     let book = load_book_manifest(state, book_id)?;
     let spine = load_book_json(state, book_id, "spine.json")?;
@@ -8642,7 +8654,13 @@ fn compile_book_page_record(
             "page_ids": [page_id]
         })
     });
-    let page = compile_book_page_value(&book, &spine, &chapter, page, force);
+    let mut page = compile_book_page_value(&book, &spine, &chapter, page, force);
+    if book_page_can_use_llm_provider(&chapter, &page)
+        && let Ok(Some(selection)) =
+            active_chat_selection(&load_settings_catalog(state), llm_selection)
+    {
+        page = generate_book_page_blocks_with_provider(&book, &chapter, page, &selection).await;
+    }
     write_book_page(state, book_id, &page)?;
     append_book_log(
         state,
@@ -8740,6 +8758,309 @@ fn compile_book_page_value(
     page["error"] = json!(compiled_book_page_error(&page, status));
     page["updated_at"] = json!(now_seconds());
     page
+}
+
+fn book_page_can_use_llm_provider(chapter: &Value, page: &Value) -> bool {
+    let content_type = page["content_type"]
+        .as_str()
+        .or_else(|| chapter["content_type"].as_str())
+        .unwrap_or("theory");
+    !is_book_overview_chapter(chapter) && content_type != "overview"
+}
+
+async fn generate_book_page_blocks_with_provider(
+    book: &Value,
+    chapter: &Value,
+    mut page: Value,
+    selection: &ChatRuntimeSelection,
+) -> Value {
+    let page_context = page.clone();
+    if let Some(blocks) = page["blocks"].as_array_mut() {
+        for block_slot in blocks.iter_mut() {
+            let block = block_slot.clone();
+            if block["type"].as_str() == Some("user_note") {
+                continue;
+            }
+            *block_slot =
+                generate_book_block_with_provider(book, chapter, &page_context, &block, selection)
+                    .await;
+        }
+    }
+    let status = compiled_book_page_status(&page);
+    page["status"] = json!(status);
+    page["error"] = json!(compiled_book_page_error(&page, status));
+    page["updated_at"] = json!(now_seconds());
+    page
+}
+
+async fn generate_book_block_with_provider(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    block: &Value,
+    selection: &ChatRuntimeSelection,
+) -> Value {
+    let started = Instant::now();
+    let prompt = book_provider_block_prompt(book, chapter, page, block);
+    let body = json!({
+        "model": selection.model.as_str(),
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are the Socartes BookCompiler. Generate one concise, evidence-grounded learning block for the requested page. Use the supplied source anchors when present and do not invent citations."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900,
+        "stream": false
+    });
+    match call_chat_completion_provider(selection, body).await {
+        Ok(response) => {
+            let content = response
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("The selected provider returned an empty Book block.")
+                .to_string();
+            let anchors = book_source_anchors_for_block(chapter, block);
+            let mut generated = block.clone();
+            generated["status"] = json!("ready");
+            generated["payload"] = provider_book_block_payload(block, &content);
+            generated["source_anchors"] = json!(anchors);
+            generated["metadata"] =
+                provider_book_block_metadata(book, block, selection, &response, started);
+            generated["error"] = json!("");
+            generated["updated_at"] = json!(now_seconds());
+            generated
+        }
+        Err(error) => {
+            let mut failed = block.clone();
+            failed["status"] = json!("error");
+            failed["error"] = json!(error);
+            failed["metadata"] = provider_book_block_failure_metadata(
+                book,
+                block,
+                selection,
+                started,
+                failed["error"].as_str().unwrap_or("provider error"),
+            );
+            failed["updated_at"] = json!(now_seconds());
+            failed
+        }
+    }
+}
+
+fn book_provider_block_prompt(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    block: &Value,
+) -> String {
+    let anchors = book_source_anchors_for_block(chapter, block);
+    let anchors_text = serde_json::to_string_pretty(&anchors).unwrap_or_else(|_| "[]".to_string());
+    let objectives = serde_json::to_string_pretty(&page["learning_objectives"])
+        .unwrap_or_else(|_| "[]".to_string());
+    let knowledge_bases = as_string_array(&book["knowledge_bases"]).join(", ");
+    format!(
+        "Book: {book_title}\nBook description: {book_description}\nChapter: {chapter_title}\nChapter summary: {chapter_summary}\nPage: {page_title}\nPage content type: {content_type}\nLearning objectives: {objectives}\nKnowledge bases: {knowledge_bases}\nBlock type: {block_type}\nBlock title: {block_title}\nBlock role: {role}\nSource anchors:\n{anchors_text}\n\nWrite the block body. Keep it factual, course-grounded, and directly useful to the learner.",
+        book_title = book["title"].as_str().unwrap_or("Untitled Book"),
+        book_description = book["description"].as_str().unwrap_or_default(),
+        chapter_title = chapter["title"].as_str().unwrap_or("Untitled Chapter"),
+        chapter_summary = chapter["summary"].as_str().unwrap_or_default(),
+        page_title = page["title"].as_str().unwrap_or("Untitled Page"),
+        content_type = page["content_type"].as_str().unwrap_or("theory"),
+        block_type = block["type"].as_str().unwrap_or("text"),
+        block_title = block["title"].as_str().unwrap_or("Book block"),
+        role = block["params"]["role"]
+            .as_str()
+            .or_else(|| block["metadata"]["role"].as_str())
+            .unwrap_or_default()
+    )
+}
+
+fn book_source_anchors_for_block(chapter: &Value, block: &Value) -> Vec<Value> {
+    let block_anchors = block["params"]["anchors"]
+        .as_array()
+        .filter(|anchors| !anchors.is_empty())
+        .cloned();
+    block_anchors
+        .or_else(|| {
+            block["source_anchors"]
+                .as_array()
+                .filter(|anchors| !anchors.is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            chapter["source_anchors"]
+                .as_array()
+                .filter(|anchors| !anchors.is_empty())
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+fn provider_book_block_payload(block: &Value, content: &str) -> Value {
+    let block_type = block["type"].as_str().unwrap_or("text");
+    let title = block["title"].as_str().unwrap_or("Book block");
+    let role = block["params"]["role"]
+        .as_str()
+        .or_else(|| block["metadata"]["role"].as_str())
+        .unwrap_or(block_type);
+    let topic = block["params"]["topic"].as_str().unwrap_or(title);
+    match block_type {
+        "section" => json!({
+            "format": "section",
+            "intro": format!("{title}: {topic}"),
+            "subsections": [{
+                "heading": title,
+                "role": role,
+                "focus": topic,
+                "body": content,
+                "target_words": 220
+            }],
+            "key_takeaway": truncate_for_prompt(content, 220),
+            "focus": topic,
+            "role": role
+        }),
+        "callout" => json!({
+            "variant": block["params"]["variant"].as_str().unwrap_or("info"),
+            "label": title,
+            "body": content
+        }),
+        "quiz" => json!({
+            "questions": [{
+                "question_id": "q-provider-1",
+                "question": format!("What is the key idea in {topic}?"),
+                "question_type": "short_answer",
+                "answer": content,
+                "explanation": content,
+                "difficulty": block["params"]["difficulty"].as_str().unwrap_or("medium"),
+                "concentration": topic
+            }],
+            "topic": topic
+        }),
+        "code" => json!({
+            "language": block["params"]["language"].as_str().unwrap_or("text"),
+            "code": content,
+            "explanation": format!("Provider-generated example for {topic}."),
+            "intent": role
+        }),
+        "timeline" => json!({
+            "events": [{
+                "date": "Key step",
+                "title": title,
+                "description": content
+            }]
+        }),
+        "flash_cards" => json!({
+            "cards": [{
+                "front": title,
+                "back": content,
+                "hint": topic
+            }],
+            "topic": topic
+        }),
+        "figure" | "interactive" => json!({
+            "render_type": if block_type == "interactive" { "html" } else { "mermaid" },
+            "code": {
+                "language": if block_type == "interactive" { "html" } else { "mermaid" },
+                "content": content
+            },
+            "description": format!("Provider-generated visual block for {topic}."),
+            "chart_type": block_type
+        }),
+        "animation" => json!({
+            "render_type": "video",
+            "artifacts": [],
+            "video_url": "",
+            "filename": "",
+            "summary": content,
+            "key_points": [content],
+            "description": format!("Provider-generated animation storyboard for {topic}.")
+        }),
+        "deep_dive" => json!({
+            "suggestions": [{
+                "title": title,
+                "description": content,
+                "reason": "Provider-generated extension"
+            }]
+        }),
+        _ => json!({
+            "format": "text",
+            "body": content,
+            "role": role
+        }),
+    }
+}
+
+fn provider_book_block_metadata(
+    book: &Value,
+    block: &Value,
+    selection: &ChatRuntimeSelection,
+    response: &ChatProviderResponse,
+    started: Instant,
+) -> Value {
+    let mut metadata = json!({
+        "generator": "selected_llm_provider",
+        "provider": selection.binding.as_str(),
+        "profile_id": selection.profile_id.as_str(),
+        "model_id": selection.model_id.as_str(),
+        "model": selection.model.as_str(),
+        "role": block["params"]["role"]
+            .as_str()
+            .or_else(|| block["metadata"]["role"].as_str())
+            .unwrap_or(block["type"].as_str().unwrap_or("text")),
+        "used_rag": block["params"]["anchors"].as_array().is_some_and(|anchors| !anchors.is_empty()),
+        "kb": as_string_array(&book["knowledge_bases"]),
+        "generation_ms": started.elapsed().as_millis() as u64
+    });
+    for key in ["transition_in", "deep_dive_page_id"] {
+        if !block["metadata"][key].is_null() {
+            metadata[key] = block["metadata"][key].clone();
+        }
+    }
+    merge_chat_provider_response_metadata(&mut metadata, response);
+    metadata
+}
+
+fn provider_book_block_failure_metadata(
+    book: &Value,
+    block: &Value,
+    selection: &ChatRuntimeSelection,
+    started: Instant,
+    error: &str,
+) -> Value {
+    let mut metadata = json!({
+        "generator": "selected_llm_provider",
+        "provider": selection.binding.as_str(),
+        "profile_id": selection.profile_id.as_str(),
+        "model_id": selection.model_id.as_str(),
+        "model": selection.model.as_str(),
+        "role": block["params"]["role"]
+            .as_str()
+            .or_else(|| block["metadata"]["role"].as_str())
+            .unwrap_or(block["type"].as_str().unwrap_or("text")),
+        "used_rag": block["params"]["anchors"].as_array().is_some_and(|anchors| !anchors.is_empty()),
+        "kb": as_string_array(&book["knowledge_bases"]),
+        "generation_ms": started.elapsed().as_millis() as u64,
+        "failure": {
+            "kind": "llm_provider",
+            "message": error,
+            "retryable": true,
+            "source": "BookCompiler"
+        }
+    });
+    for key in ["transition_in", "deep_dive_page_id"] {
+        if !block["metadata"][key].is_null() {
+            metadata[key] = block["metadata"][key].clone();
+        }
+    }
+    metadata
 }
 
 fn book_chapter_for_page(spine: &Value, page: &Value, page_id: &str) -> Option<Value> {

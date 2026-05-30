@@ -24678,6 +24678,194 @@ async fn book_compile_page_concurrent_force_requests_share_active_claim_like_pyt
 }
 
 #[tokio::test]
+async fn book_compile_page_calls_selected_provider_and_preserves_source_anchors_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, llm_server) =
+        spawn_sequential_request_recorder(vec![json!({
+            "id": "book-provider-response",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Provider-grounded explanation: quorum clocks keep replicas consistent by comparing version evidence from the retrieved course note."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 18,
+                "total_tokens": 60
+            }
+        })])
+        .await;
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_provider-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "provider-book",
+            "title": "Provider Book",
+            "description": "Compile should use the selected model instead of static Rust filler.",
+            "status": "spine_ready",
+            "proposal": {},
+            "knowledge_bases": ["tiny-course"],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "provider-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Distributed Systems",
+                "summary": "Explain replicated data with retrieved course evidence.",
+                "content_type": "theory",
+                "learning_objectives": ["Explain quorum clocks from evidence"],
+                "source_anchors": [{
+                    "kind": "kb",
+                    "ref": "tiny-course:replication-note",
+                    "snippet": "Quorum clocks compare version evidence before accepting a write."
+                }],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "provider-book",
+            "chapter_id": "chapter-1",
+            "title": "Quorum clocks",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": ["Explain quorum clocks from evidence"],
+            "blocks": [{
+                "id": "placeholder-block",
+                "type": "text",
+                "title": "Socartes learning trace",
+                "status": "ready",
+                "payload": {
+                    "body": "This Rust page is backed by file-backed Book data and can be edited through the Book API."
+                },
+                "params": {},
+                "metadata": {},
+                "source_anchors": [],
+                "error": "",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "provider-book",
+                        "page_id": "page-1",
+                        "force": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let page = json_response(response).await["page"].clone();
+    assert_eq!(page["id"], "page-1");
+    assert_eq!(page["book_id"], "provider-book");
+    assert_eq!(page["status"], "ready");
+
+    let captured = requests.lock().await.clone();
+    assert!(
+        !captured.is_empty(),
+        "non-overview Book compile should call the selected LLM provider"
+    );
+    let provider_request = captured[0]["payload"].to_string();
+    assert!(provider_request.contains("provider-chat-model"));
+    assert!(provider_request.contains("Provider Book"));
+    assert!(provider_request.contains("Quorum clocks"));
+    assert!(provider_request.contains("Distributed Systems"));
+    assert!(provider_request.contains("tiny-course:replication-note"));
+    assert!(provider_request.contains("Quorum clocks compare version evidence"));
+
+    let blocks = page["blocks"].as_array().expect("page blocks");
+    assert!(
+        blocks
+            .iter()
+            .filter(|block| block["type"].as_str() != Some("user_note"))
+            .all(|block| block["metadata"]["generator"] != "rust_static_book_compiler"),
+        "provider-backed compile must not leave generated blocks marked as static Rust filler: {blocks:?}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|block| block["metadata"]["generator"] == "selected_llm_provider"),
+        "at least one generated block should carry selected provider metadata: {blocks:?}"
+    );
+    assert!(
+        blocks.iter().any(|block| {
+            block["source_anchors"].as_array().is_some_and(|anchors| {
+                anchors.iter().any(|anchor| {
+                    anchor["kind"] == "kb"
+                        && anchor["ref"] == "tiny-course:replication-note"
+                        && anchor["snippet"]
+                            .as_str()
+                            .is_some_and(|value| value.contains("Quorum clocks compare"))
+                })
+            })
+        }),
+        "provider-backed Book blocks should preserve chapter/source anchors: {blocks:?}"
+    );
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_compile_aggregates_existing_block_failures_like_python() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
