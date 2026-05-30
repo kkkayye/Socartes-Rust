@@ -1424,16 +1424,69 @@ async fn session_command(api: &ApiClient, command: SessionCommand) -> CliResult 
     }
 }
 
-async fn provider_command(api: &ApiClient, command: ProviderCommand) -> CliResult {
+async fn provider_command(_api: &ApiClient, command: ProviderCommand) -> CliResult {
     match command {
-        ProviderCommand::Login { provider } => {
-            let settings = api.get_json("/api/v1/settings").await?;
-            println!(
-                "Provider `{provider}` login is handled by configured environment/OAuth tokens. Current settings:"
-            );
-            print_json(&settings)
-        }
+        ProviderCommand::Login { provider } => match normalize_provider_name(&provider).as_str() {
+            "openai_codex" => login_openai_codex(),
+            "github_copilot" => login_github_copilot().await,
+            _ => Err(format!(
+                "Unknown provider `{provider}`. Supported: openai-codex, github-copilot"
+            )
+            .into()),
+        },
     }
+}
+
+fn normalize_provider_name(provider: &str) -> String {
+    provider.trim().to_lowercase().replace('-', "_")
+}
+
+fn login_openai_codex() -> CliResult {
+    let token = env::var("SOCARTES_OPENAI_CODEX_ACCESS_TOKEN")
+        .or_else(|_| env::var("OPENAI_CODEX_ACCESS_TOKEN"))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if token.is_some() {
+        println!("OpenAI Codex OAuth authentication succeeded.");
+        return Ok(());
+    }
+    Err("OpenAI Codex OAuth authentication failed: no existing OAuth token was found. Set SOCARTES_OPENAI_CODEX_ACCESS_TOKEN or run the OpenAI Codex login flow.".into())
+}
+
+async fn login_github_copilot() -> CliResult {
+    let base_url = env::var("SOCARTES_GITHUB_COPILOT_BASE_URL")
+        .unwrap_or_else(|_| "https://api.githubcopilot.com".to_string());
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?
+        .post(url)
+        .bearer_auth("copilot")
+        .json(&json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1
+        }))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(format!("GitHub Copilot auth validation failed: {error}").into());
+        }
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub Copilot auth validation failed: HTTP {}: {}",
+            status.as_u16(),
+            body.trim()
+        )
+        .into());
+    }
+    println!("GitHub Copilot auth validation succeeded.");
+    Ok(())
 }
 
 async fn init_command(args: InitArgs) -> CliResult {

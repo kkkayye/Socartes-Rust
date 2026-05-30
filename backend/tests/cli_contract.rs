@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use axum::{
     Json, Router,
     extract::State,
+    http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -110,6 +111,28 @@ async fn capture_regenerate_stream(
     )
 }
 
+async fn capture_github_copilot_validation(
+    State(captured): State<Arc<Mutex<Option<Value>>>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    *captured.lock().await = Some(json!({
+        "authorization": auth,
+        "payload": payload
+    }));
+    Json(json!({
+        "id": "copilot-validation",
+        "choices": [{
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }]
+    }))
+}
+
 #[test]
 fn top_level_help_exposes_python_cli_command_surface() {
     let stdout = stdout_for(&["--help"]);
@@ -203,6 +226,77 @@ fn grouped_help_exposes_python_subcommands() {
 fn start_help_keeps_python_home_option() {
     let stdout = stdout_for(&["start", "--help"]);
     assert_contains_all(&stdout, &["--home", "--host", "--port"]);
+}
+
+#[test]
+fn provider_login_rejects_unknown_provider_like_python() {
+    let output = socartes_cmd()
+        .args(["provider", "login", "not-real"])
+        .output()
+        .expect("socartes provider login should execute");
+
+    assert!(
+        !output.status.success(),
+        "unknown provider should fail:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(
+        &stderr,
+        &[
+            "Unknown provider `not-real`",
+            "openai-codex",
+            "github-copilot",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_login_github_copilot_validates_existing_auth_without_socartes_api() {
+    let captured = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/chat/completions", post(capture_github_copilot_validation))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env(
+            "SOCARTES_GITHUB_COPILOT_BASE_URL",
+            format!("http://{address}"),
+        )
+        .args(["provider", "login", "github-copilot"])
+        .output()
+        .expect("socartes provider login should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "github copilot validation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(output.stdout).unwrap(),
+        &["GitHub Copilot auth validation succeeded."],
+    );
+
+    let request = captured
+        .lock()
+        .await
+        .clone()
+        .expect("mock Copilot endpoint should capture validation request");
+    assert_eq!(request["authorization"], "Bearer copilot");
+    assert_eq!(request["payload"]["model"], "gpt-4o");
+    assert_eq!(request["payload"]["max_tokens"], 1);
+    assert_eq!(
+        request["payload"]["messages"],
+        json!([{"role":"user","content":"ping"}])
+    );
 }
 
 #[test]
