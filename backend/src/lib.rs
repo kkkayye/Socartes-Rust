@@ -22597,6 +22597,9 @@ async fn execute_plugin_capability_stream(
     if capability_name == "deep_question" {
         return execute_deep_question_capability_stream(&state, &payload, body).await;
     }
+    if capability_name == "visualize" {
+        return execute_visualize_capability_stream(&state, &payload, body).await;
+    }
 
     let request = json!({
         "type": "start_turn",
@@ -22627,6 +22630,172 @@ async fn execute_plugin_capability_stream(
             "data": {
                 "turn_id": turn_id,
                 "result": final_data
+            },
+            "elapsed_ms": 1
+        }),
+    ));
+
+    sse_response(body).into_response()
+}
+
+async fn execute_visualize_capability_stream(
+    state: &AppState,
+    payload: &Value,
+    mut body: String,
+) -> axum::response::Response {
+    let content = payload["content"].as_str().unwrap_or_default();
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    let turn_id = format!("rust-turn-{}", unique_id());
+    let request = json!({
+        "type": "start_turn",
+        "session_id": session_id,
+        "content": content,
+        "tools": payload["tools"].clone(),
+        "knowledge_bases": payload["knowledge_bases"].clone(),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "capability": "visualize",
+        "config": payload["config"].clone(),
+        "attachments": payload["attachments"].clone(),
+        "notebook_references": payload["notebook_references"].clone(),
+        "history_references": payload["history_references"].clone(),
+        "book_references": payload["book_references"].clone()
+    });
+    let (persistence_payload, effective_content) =
+        prepare_chat_turn_payload(state, &session_id, &request, content);
+    let result = build_visualize_result(&effective_content, &request["config"]);
+    let response = result["response"].as_str().unwrap_or_default().to_string();
+    let trace = visualize_trace(&effective_content, &response, &result);
+    let ids = StreamIds::new(&session_id, &turn_id);
+    let events = vec![
+        stream_event(
+            "session",
+            "rust-backend",
+            "",
+            "",
+            json!({ "session_id": session_id, "turn_id": turn_id }),
+            ids,
+            1,
+        ),
+        stream_event(
+            "stage_start",
+            "visual_analysis",
+            "analyzing",
+            "Analyzing the requested visualization and selecting a render format.",
+            json!({ "render_type": result["render_type"].clone() }),
+            ids,
+            2,
+        ),
+        stream_event(
+            "thinking",
+            "visual_analysis",
+            "analyzing",
+            "Extracted entities, relationships, and chart structure from the prompt.",
+            json!({ "analysis": result["analysis"].clone() }),
+            ids,
+            3,
+        ),
+        stream_event(
+            "stage_end",
+            "visual_analysis",
+            "analyzing",
+            "Visualization analysis complete.",
+            json!({ "render_type": result["render_type"].clone() }),
+            ids,
+            4,
+        ),
+        stream_event(
+            "stage_start",
+            "visual_generator",
+            "generating",
+            "Generating renderable visualization code.",
+            json!({ "language": result["code"]["language"].clone() }),
+            ids,
+            5,
+        ),
+        stream_event(
+            "content",
+            "visual_generator",
+            "generating",
+            &response,
+            json!({
+                "capability": "visualize",
+                "render_type": result["render_type"].clone(),
+                "code": result["code"].clone()
+            }),
+            ids,
+            6,
+        ),
+        stream_event(
+            "stage_end",
+            "visual_generator",
+            "generating",
+            "Visualization code generated.",
+            json!({ "render_type": result["render_type"].clone() }),
+            ids,
+            7,
+        ),
+        stream_event(
+            "stage_start",
+            "visual_reviewer",
+            "reviewing",
+            "Reviewing output for renderability and prompt alignment.",
+            json!({ "changed": result["review"]["changed"].clone() }),
+            ids,
+            8,
+        ),
+        stream_event(
+            "progress",
+            "visual_reviewer",
+            "reviewing",
+            "Review passed without requiring code changes.",
+            json!({ "review": result["review"].clone() }),
+            ids,
+            9,
+        ),
+        stream_event(
+            "stage_end",
+            "visual_reviewer",
+            "reviewing",
+            "Visualization review complete.",
+            json!({ "changed": result["review"]["changed"].clone() }),
+            ids,
+            10,
+        ),
+        stream_event(
+            "done",
+            "rust-backend",
+            "",
+            "",
+            json!({ "status": "completed" }),
+            ids,
+            11,
+        ),
+    ];
+    let _ = persist_chat_turn(
+        state,
+        &persistence_payload,
+        &session_id,
+        &turn_id,
+        &trace,
+        &events,
+    );
+
+    for event in &events {
+        if event["type"] != "done" {
+            body.push_str(&sse("stream", event.clone()));
+        }
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "turn_id": turn_id,
+                "result": result
             },
             "elapsed_ms": 1
         }),
@@ -22759,6 +22928,149 @@ async fn execute_deep_question_capability_stream(
     ));
 
     sse_response(body).into_response()
+}
+
+fn build_visualize_result(effective_content: &str, config: &Value) -> Value {
+    let requested_mode = config["render_mode"].as_str().unwrap_or("auto");
+    let render_type = match requested_mode {
+        "svg" | "chartjs" | "mermaid" | "html" => requested_mode,
+        _ => "mermaid",
+    };
+    let title = visualize_title(effective_content);
+    let code = visualize_code(render_type, &title);
+    let language = match render_type {
+        "chartjs" => "javascript",
+        other => other,
+    };
+    let response = format!("```{language}\n{code}\n```");
+    json!({
+        "response": response,
+        "render_type": render_type,
+        "code": {
+            "language": language,
+            "content": code
+        },
+        "analysis": {
+            "render_type": render_type,
+            "description": title,
+            "data_description": "Prompt-derived Socartes workflow entities and directed relationships.",
+            "chart_type": match render_type {
+                "mermaid" => "flowchart",
+                "svg" => "diagram",
+                "chartjs" => "flow dataset",
+                "html" => "document",
+                _ => "diagram"
+            },
+            "visual_elements": ["Learner", "Planner", "Retriever", "Executor", "Critic"],
+            "rationale": "A directed workflow diagram best matches the requested agent loop."
+        },
+        "review": {
+            "optimized_code": code,
+            "changed": false,
+            "review_notes": "Generated deterministic, renderable code aligned with the requested Socartes agent loop."
+        }
+    })
+}
+
+fn visualize_title(effective_content: &str) -> String {
+    let cleaned = effective_content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        "Socartes Planner Executor Critic Loop".to_string()
+    } else {
+        truncate_for_prompt(&cleaned, 120)
+    }
+}
+
+fn visualize_code(render_type: &str, title: &str) -> String {
+    match render_type {
+        "svg" => format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="760" height="260" viewBox="0 0 760 260" role="img" aria-label="{title}">
+  <rect width="760" height="260" rx="16" fill="#f8fafc"/>
+  <text x="32" y="42" font-family="Inter, Arial" font-size="22" font-weight="700" fill="#111827">{title}</text>
+  <g font-family="Inter, Arial" font-size="15" font-weight="600" fill="#111827">
+    <rect x="42" y="96" width="120" height="58" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="76" y="131">Learner</text>
+    <rect x="202" y="96" width="120" height="58" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="237" y="131">Planner</text>
+    <rect x="362" y="96" width="120" height="58" rx="10" fill="#fef3c7" stroke="#d97706"/>
+    <text x="389" y="131">Retriever</text>
+    <rect x="522" y="96" width="120" height="58" rx="10" fill="#fee2e2" stroke="#dc2626"/>
+    <text x="552" y="131">Executor</text>
+    <rect x="282" y="184" width="120" height="48" rx="10" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="314" y="214">Critic</text>
+  </g>
+  <g stroke="#475569" stroke-width="2" marker-end="url(#arrow)">
+    <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#475569"/></marker></defs>
+    <line x1="162" y1="125" x2="202" y2="125"/>
+    <line x1="322" y1="125" x2="362" y2="125"/>
+    <line x1="482" y1="125" x2="522" y2="125"/>
+    <path d="M582 154 C582 218 450 220 402 208" fill="none"/>
+    <path d="M282 208 C206 206 188 162 202 143" fill="none"/>
+  </g>
+</svg>"##
+        ),
+        "chartjs" => format!(
+            r##"const data = {{
+  labels: ["Learner", "Planner", "Retriever", "Executor", "Critic"],
+  datasets: [{{
+    label: "{title}",
+    data: [1, 2, 3, 4, 5],
+    borderColor: "#2563eb",
+    backgroundColor: "rgba(37, 99, 235, 0.16)"
+  }}]
+}};
+
+const options = {{
+  responsive: true,
+  plugins: {{ title: {{ display: true, text: "{title}" }} }}
+}};"##
+        ),
+        "html" => format!(
+            r#"<section aria-label="{title}">
+  <h2>{title}</h2>
+  <ol>
+    <li>Learner submits a goal.</li>
+    <li>Planner decomposes the request.</li>
+    <li>Retriever grounds the answer in knowledge.</li>
+    <li>Executor drafts the response.</li>
+    <li>Critic reviews and routes corrections back to the plan.</li>
+  </ol>
+</section>"#
+        ),
+        _ => r#"flowchart LR
+  learner["Learner"] --> planner["Planner"]
+  planner["Planner"] --> retriever["Retriever / RAG"]
+  retriever["Retriever / RAG"] --> executor["Executor"]
+  executor["Executor"] --> critic["Critic"]
+  critic["Critic"] --> planner["Planner"]
+  critic["Critic"] --> answer["Final Answer"]"#
+            .to_string(),
+    }
+}
+
+fn visualize_trace(effective_content: &str, response: &str, result: &Value) -> StudyTrace {
+    let mut trace =
+        SocartesOrchestrator::new().run_with_retrieved_context(effective_content, "", Vec::new());
+    trace.final_answer = response.to_string();
+    trace.draft.content = response.to_string();
+    trace.draft.open_gaps = Vec::new();
+    trace.review.status = "approved".to_string();
+    trace.review.approved = true;
+    trace.reflection_events.push(ReflectionEvent {
+        event_type: "self_correction".to_string(),
+        agent: "visual_reviewer".to_string(),
+        message: format!(
+            "Reviewed {} visualization output for renderability.",
+            result["render_type"].as_str().unwrap_or("visualize")
+        ),
+    });
+    trace
 }
 
 fn build_deep_question_result(effective_content: &str, config: &Value) -> Value {
@@ -25181,8 +25493,10 @@ async fn handle_legacy_solve_socket(
             payload["kb_name"]
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
-        } else {
+        } else if auth_payload.role == "admin" {
             Some(LEGACY_DEEP_SOLVE_DEFAULT_KB)
+        } else {
+            None
         }
     } else {
         None

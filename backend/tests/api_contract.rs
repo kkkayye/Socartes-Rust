@@ -12209,6 +12209,78 @@ async fn deep_question_execute_stream_honors_followup_and_answer_now_runtime_con
 }
 
 #[tokio::test]
+async fn visualize_execute_stream_returns_structured_visualization_result() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/visualize/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Create a Mermaid flowchart for Socartes planner executor critic loop.",
+                        "tools": [],
+                        "knowledge_bases": [],
+                        "language": "en",
+                        "config": {
+                            "render_mode": "mermaid"
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    let events = parse_sse_data_events(&stream);
+    for stage in ["analyzing", "generating", "reviewing"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "stage_start" && event["stage"] == stage),
+            "visualize should emit Python-style {stage} stage_start events: {events:?}"
+        );
+    }
+
+    let result = events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("visualize result event");
+    let result_data = &result["data"]["result"];
+    assert_eq!(result_data["render_type"], "mermaid");
+    assert_eq!(result_data["code"]["language"], "mermaid");
+    assert!(
+        result_data["code"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("flowchart") && content.contains("Planner")),
+        "visualize should return renderable Mermaid code"
+    );
+    assert_eq!(result_data["analysis"]["render_type"], "mermaid");
+    assert_eq!(result_data["review"]["changed"], false);
+    assert!(
+        result_data["response"]
+            .as_str()
+            .is_some_and(|response| response.starts_with("```mermaid")),
+        "visualize response should be a fenced code block"
+    );
+    assert!(
+        !result_data["response"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Socartes answers the goal"),
+        "visualize should not use generic chat fallback content"
+    );
+}
+
+#[tokio::test]
 async fn question_generate_websocket_matches_python_contract() {
     let root = unique_test_knowledge_root();
     let server_root = root.clone();

@@ -11,11 +11,16 @@ path = "src/lib.rs"
 name = "socartes-backend"
 path = "src/main.rs"
 
+[[bin]]
+name = "socartes"
+path = "src/bin/socartes.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 bcrypt = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
 encoding_rs = "0.8.35"
 futures-util = "0.3"
 jsonwebtoken = "9"
@@ -26,12 +31,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 scraper = "0.27"
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+assert_cmd = "2"
 http-body-util = "0.1"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
