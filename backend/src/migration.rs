@@ -29,13 +29,14 @@ use futures_util::{SinkExt, Stream, StreamExt, stream};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 
 const SHADOW_OBSERVATION_BODY_LIMIT: usize = 1024 * 1024;
+const SHADOW_NATIVE_WS_HEADER: &str = "x-socartes-migration-shadow-native";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -260,6 +261,13 @@ pub fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
     })
 }
 
+pub fn is_shadow_native_ws_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(SHADOW_NATIVE_WS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"))
+}
+
 pub async fn proxy_to_python(runtime: Arc<MigrationRuntime>, request: Request) -> Response {
     match proxy_to_python_inner(runtime, request).await {
         Ok(response) => response,
@@ -300,6 +308,32 @@ pub fn proxy_ws_to_python(
     ws.on_upgrade(move |socket| async move {
         if let Err(error) = proxy_ws_inner(runtime, path_and_query, headers, socket).await {
             eprintln!("socartes migration websocket proxy failed: {error}");
+        }
+    })
+    .into_response()
+}
+
+pub fn shadow_ws_to_python(
+    runtime: Arc<MigrationRuntime>,
+    capability: impl Into<String>,
+    path_and_query: String,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    native_ws_base_url: String,
+) -> Response {
+    let capability = capability.into();
+    ws.on_upgrade(move |socket| async move {
+        if let Err(error) = shadow_ws_inner(
+            runtime,
+            capability,
+            path_and_query,
+            headers,
+            socket,
+            native_ws_base_url,
+        )
+        .await
+        {
+            eprintln!("socartes migration websocket shadow failed: {error}");
         }
     })
     .into_response()
@@ -484,6 +518,150 @@ async fn proxy_ws_inner(
     Ok(())
 }
 
+async fn shadow_ws_inner(
+    runtime: Arc<MigrationRuntime>,
+    capability: String,
+    path_and_query: String,
+    headers: HeaderMap,
+    client_socket: WebSocket,
+    native_ws_base_url: String,
+) -> Result<(), ProxyError> {
+    let config = runtime.config();
+    let python_request =
+        upstream_ws_request(&config.python_ws_base_url, &path_and_query, &headers, false)?;
+    let native_request = upstream_ws_request(&native_ws_base_url, &path_and_query, &headers, true)?;
+
+    let (python_socket, _) = connect_async(python_request)
+        .await
+        .map_err(|error| ProxyError::WebSocket(error.to_string()))?;
+    let native_connection = connect_async(native_request).await;
+
+    let python_observation = Arc::new(Mutex::new(ShadowWsObservation::default()));
+    let native_observation = Arc::new(Mutex::new(ShadowWsObservation::default()));
+
+    let native_socket = match native_connection {
+        Ok((socket, _)) => Some(socket),
+        Err(error) => {
+            record_shadow_ws_error(&native_observation, error.to_string()).await;
+            None
+        }
+    };
+
+    let (mut client_sender, mut client_receiver) = client_socket.split();
+    let (mut python_sender, mut python_receiver) = python_socket.split();
+    let (mut native_sender, native_receiver) = match native_socket {
+        Some(socket) => {
+            let (sender, receiver) = socket.split();
+            (Some(sender), Some(receiver))
+        }
+        None => (None, None),
+    };
+
+    let client_to_upstreams = {
+        let python_observation = python_observation.clone();
+        let native_observation = native_observation.clone();
+        async move {
+            while let Some(message) = client_receiver.next().await {
+                let Ok(message) = message else {
+                    record_shadow_ws_error(
+                        &python_observation,
+                        "failed to read client websocket message".to_string(),
+                    )
+                    .await;
+                    break;
+                };
+                let Some(message) = axum_to_tungstenite(message) else {
+                    break;
+                };
+                record_shadow_ws_client_event(&python_observation, &message).await;
+                record_shadow_ws_client_event(&native_observation, &message).await;
+                if python_sender.send(message.clone()).await.is_err() {
+                    record_shadow_ws_error(
+                        &python_observation,
+                        "failed to forward client websocket message to Python".to_string(),
+                    )
+                    .await;
+                    break;
+                }
+                if let Some(sender) = native_sender.as_mut()
+                    && sender.send(message).await.is_err()
+                {
+                    record_shadow_ws_error(
+                        &native_observation,
+                        "failed to forward client websocket message to Rust native".to_string(),
+                    )
+                    .await;
+                    native_sender = None;
+                }
+            }
+        }
+    };
+
+    let python_to_client = {
+        let python_observation = python_observation.clone();
+        async move {
+            while let Some(message) = python_receiver.next().await {
+                let Ok(message) = message else {
+                    record_shadow_ws_error(
+                        &python_observation,
+                        "failed to read Python websocket message".to_string(),
+                    )
+                    .await;
+                    break;
+                };
+                record_shadow_ws_server_event(&python_observation, &message).await;
+                let Some(message) = tungstenite_to_axum(message) else {
+                    break;
+                };
+                if client_sender.send(message).await.is_err() {
+                    record_shadow_ws_error(
+                        &python_observation,
+                        "failed to forward Python websocket message to client".to_string(),
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    };
+
+    let native_to_observer = {
+        let native_observation = native_observation.clone();
+        async move {
+            let Some(mut native_receiver) = native_receiver else {
+                return;
+            };
+            while let Some(message) = native_receiver.next().await {
+                let Ok(message) = message else {
+                    record_shadow_ws_error(
+                        &native_observation,
+                        "failed to read Rust native websocket message".to_string(),
+                    )
+                    .await;
+                    break;
+                };
+                record_shadow_ws_server_event(&native_observation, &message).await;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = client_to_upstreams => {}
+        _ = python_to_client => {}
+        _ = native_to_observer => {}
+    }
+
+    let python_observation = python_observation.lock().await;
+    let native_observation = native_observation.lock().await;
+    log_shadow_ws_diff(
+        &capability,
+        &path_and_query,
+        &python_observation,
+        &native_observation,
+    );
+    Ok(())
+}
+
 type PythonByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
 fn observed_python_stream(
@@ -549,6 +727,13 @@ struct ShadowHttpObservation {
     body_hash: u64,
     truncated: bool,
     event_types: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ShadowWsObservation {
+    client_events: Vec<String>,
+    server_events: Vec<String>,
     error: Option<String>,
 }
 
@@ -705,6 +890,93 @@ fn log_shadow_diff(
     );
 }
 
+async fn record_shadow_ws_client_event(
+    observation: &Arc<Mutex<ShadowWsObservation>>,
+    message: &TungsteniteMessage,
+) {
+    if let Some(event) = shadow_ws_event_summary(message) {
+        observation.lock().await.client_events.push(event);
+    }
+}
+
+async fn record_shadow_ws_server_event(
+    observation: &Arc<Mutex<ShadowWsObservation>>,
+    message: &TungsteniteMessage,
+) {
+    if let Some(event) = shadow_ws_event_summary(message) {
+        observation.lock().await.server_events.push(event);
+    }
+}
+
+async fn record_shadow_ws_error(observation: &Arc<Mutex<ShadowWsObservation>>, error: String) {
+    let mut observation = observation.lock().await;
+    if observation.error.is_none() {
+        observation.error = Some(error);
+    }
+}
+
+fn shadow_ws_event_summary(message: &TungsteniteMessage) -> Option<String> {
+    match message {
+        TungsteniteMessage::Text(text) => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                let event_type = value
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("json");
+                let stage = value.get("stage").and_then(|value| value.as_str());
+                let source = value.get("source").and_then(|value| value.as_str());
+                return Some(
+                    [Some(event_type), stage, source]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                );
+            }
+            Some(format!("text:{}", truncate_shadow_ws_text(text, 160)))
+        }
+        TungsteniteMessage::Binary(bytes) => Some(format!("binary:{}", bytes.len())),
+        TungsteniteMessage::Ping(_) => Some("ping".to_string()),
+        TungsteniteMessage::Pong(_) => Some("pong".to_string()),
+        TungsteniteMessage::Close(_) => Some("close".to_string()),
+        TungsteniteMessage::Frame(_) => None,
+    }
+}
+
+fn truncate_shadow_ws_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn log_shadow_ws_diff(
+    capability: &str,
+    path: &str,
+    python: &ShadowWsObservation,
+    native: &ShadowWsObservation,
+) {
+    let matched = python.client_events == native.client_events
+        && python.server_events == native.server_events
+        && python.error.is_none()
+        && native.error.is_none();
+    eprintln!(
+        "socartes migration websocket shadow capability={capability} path={path} status={} py_client_events={:?} rust_client_events={:?} py_server_events={:?} rust_server_events={:?} py_error={:?} rust_error={:?}",
+        if matched { "match" } else { "diff" },
+        python.client_events,
+        native.client_events,
+        python.server_events,
+        native.server_events,
+        python.error,
+        native.error
+    );
+}
+
 fn upstream_http_uri(base_url: &str, uri: &Uri) -> Result<String, ProxyError> {
     let path_and_query = uri
         .path_and_query()
@@ -724,6 +996,34 @@ fn upstream_ws_url(base_url: &str, path_and_query: &str) -> Result<String, Proxy
         format!("/{path_and_query}")
     };
     Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
+}
+
+fn upstream_ws_request(
+    base_url: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    shadow_native: bool,
+) -> Result<axum::http::Request<()>, ProxyError> {
+    let url = upstream_ws_url(base_url, path_and_query)?;
+    let mut upstream_request = url
+        .into_client_request()
+        .map_err(|error| ProxyError::WebSocket(error.to_string()))?;
+    let forwarded_headers = strip_hop_by_hop_headers(headers, true);
+    for (name, value) in &forwarded_headers {
+        if is_websocket_handshake_header(name) || name.as_str() == SHADOW_NATIVE_WS_HEADER {
+            continue;
+        }
+        upstream_request
+            .headers_mut()
+            .append(name.clone(), value.clone());
+    }
+    if shadow_native {
+        upstream_request.headers_mut().insert(
+            HeaderName::from_static(SHADOW_NATIVE_WS_HEADER),
+            HeaderValue::from_static("1"),
+        );
+    }
+    Ok(upstream_request)
 }
 
 fn strip_hop_by_hop_headers(headers: &HeaderMap, strip_host: bool) -> HeaderMap {

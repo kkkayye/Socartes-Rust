@@ -2089,6 +2089,19 @@ fn path_and_query(uri: &axum::http::Uri) -> String {
         .unwrap_or_else(|| uri.path().to_string())
 }
 
+fn native_ws_base_url() -> String {
+    env::var("SOCARTES_NATIVE_WS_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let port = env::var("PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(8000);
+            format!("ws://127.0.0.1:{port}")
+        })
+}
+
 async fn auth_guard_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -29164,13 +29177,28 @@ async fn chat_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state.migration.mode_for_path(uri.path()).should_proxy() {
-        return migration::proxy_ws_to_python(
-            state.migration.clone(),
-            path_and_query(&uri),
-            headers,
-            ws,
-        );
+    if !migration::is_shadow_native_ws_request(&headers) {
+        match state.migration.mode_for_path(uri.path()) {
+            migration::MigrationMode::Native => {}
+            migration::MigrationMode::Proxy => {
+                return migration::proxy_ws_to_python(
+                    state.migration.clone(),
+                    path_and_query(&uri),
+                    headers,
+                    ws,
+                );
+            }
+            migration::MigrationMode::Shadow => {
+                return migration::shadow_ws_to_python(
+                    state.migration.clone(),
+                    "chat",
+                    path_and_query(&uri),
+                    headers,
+                    ws,
+                    native_ws_base_url(),
+                );
+            }
+        }
     }
     let auth_payload = if state.auth_enabled {
         let token = extract_unified_ws_token(&headers, &query);

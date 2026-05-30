@@ -75,10 +75,12 @@ curl -X POST http://127.0.0.1:8000/api/v1/admin/migration/reload
 HTTP and SSE responses are streamed byte-for-byte from Python. WebSocket
 endpoints such as `/api/v1/ws`, `/api/v1/book/ws`,
 `/api/v1/knowledge/{name}/progress/ws`, tutorbot, quiz, and vision routes use a
-bidirectional splice. WebSocket routes in `shadow` mode currently keep the
-Python splice as the user-visible transport; native WebSocket double-run/diff is
-tracked as the next migration step because Axum's upgraded `WebSocket` cannot be
-shared by the Python splice and the native handler at the same time.
+bidirectional splice. Unified chat WebSocket shadowing on `/api/v1/ws` returns
+Python frames to the client while teeing client frames into Rust's native
+WebSocket path through an internal bypass header and logging normalized
+Python/Rust frame sequences. Other WebSocket routes still keep the Python splice
+as the user-visible transport in `shadow` mode until their native handlers are
+given the same observable I/O boundary.
 
 During migration, Rust and Python must read the same state. For a systemd
 deployment, load the Python `.env` first so auth, PocketBase, model, and search
