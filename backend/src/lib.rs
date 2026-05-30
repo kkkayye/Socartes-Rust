@@ -878,8 +878,22 @@ struct KnowledgeTaskEvent {
 
 #[derive(Debug)]
 struct TutorbotRuntimeState {
+    bots: Mutex<HashMap<String, TutorbotRuntimeInstance>>,
     notifications: Mutex<HashMap<String, broadcast::Sender<Value>>>,
     btw_tasks: Mutex<HashMap<String, HashMap<String, Arc<AtomicBool>>>>,
+}
+
+#[derive(Debug)]
+struct TutorbotRuntimeInstance {
+    config: Value,
+    started_at: String,
+    cancel_requested: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct TutorbotRuntimeSnapshot {
+    config: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -1180,6 +1194,55 @@ impl KnowledgeTaskEvent {
 }
 
 impl TutorbotRuntimeState {
+    async fn start_bot(&self, bot_id: &str, mut config: Value) -> TutorbotRuntimeSnapshot {
+        let mut bots = self.bots.lock().await;
+        if let Some(instance) = bots.get(bot_id)
+            && !instance.cancel_requested.load(Ordering::SeqCst)
+            && instance.tasks.iter().any(|task| !task.is_finished())
+        {
+            return instance.snapshot();
+        }
+
+        config["running"] = json!(true);
+        config["started_at"] = json!(now_rfc3339());
+        config["last_reload_error"] = Value::Null;
+        let started_at = config["started_at"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let runtime_cancel = cancel_requested.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if runtime_cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let instance = TutorbotRuntimeInstance {
+            config: config.clone(),
+            started_at: started_at.clone(),
+            cancel_requested,
+            tasks: vec![task],
+        };
+        let snapshot = instance.snapshot();
+        bots.insert(bot_id.to_string(), instance);
+        snapshot
+    }
+
+    async fn stop_bot(&self, bot_id: &str) -> bool {
+        let instance = self.bots.lock().await.remove(bot_id);
+        let Some(instance) = instance else {
+            return false;
+        };
+        instance.cancel_requested.store(true, Ordering::SeqCst);
+        for task in instance.tasks {
+            task.abort();
+        }
+        true
+    }
+
     async fn register_btw_task(&self, bot_id: &str, task_id: &str) -> Arc<AtomicBool> {
         let cancel_requested = Arc::new(AtomicBool::new(false));
         self.btw_tasks
@@ -1237,6 +1300,15 @@ impl TutorbotRuntimeState {
                 .clone()
         };
         let _ = sender.send(event);
+    }
+}
+
+impl TutorbotRuntimeInstance {
+    fn snapshot(&self) -> TutorbotRuntimeSnapshot {
+        let mut config = self.config.clone();
+        config["running"] = json!(true);
+        config["started_at"] = json!(self.started_at.clone());
+        TutorbotRuntimeSnapshot { config }
     }
 }
 
@@ -1325,6 +1397,7 @@ impl AppState {
             }),
             book_runtime: Arc::new(BookRuntimeState::default()),
             tutorbot_runtime: Arc::new(TutorbotRuntimeState {
+                bots: Mutex::new(HashMap::new()),
                 notifications: Mutex::new(HashMap::new()),
                 btw_tasks: Mutex::new(HashMap::new()),
             }),
@@ -1960,6 +2033,9 @@ async fn migration_gate_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    if migration::is_websocket_upgrade_request(request.headers()) {
+        return next.run(request).await;
+    }
     let mode = state.migration.mode_for_path(request.uri().path());
     if !mode.should_proxy() {
         return next.run(request).await;
@@ -19106,11 +19182,9 @@ async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: 
         return;
     };
 
-    if !config["running"].as_bool().unwrap_or(false) {
-        config["running"] = json!(true);
-        config["started_at"] = json!(now_rfc3339());
-        let _ = write_tutorbot_config(&state, &bot_id, &config);
-    }
+    let snapshot = state.tutorbot_runtime.start_bot(&bot_id, config).await;
+    config = snapshot.config;
+    let _ = write_tutorbot_config(&state, &bot_id, &config);
 
     let mut notification_rx = state.tutorbot_runtime.subscribe(&bot_id).await;
     loop {
@@ -22946,13 +23020,12 @@ async fn start_tutorbot(
         read_tutorbot_config(&state, &bot_id).unwrap_or_else(|| default_tutorbot_config(&bot_id));
     apply_tutorbot_payload(&mut config, &payload, false);
     config = normalize_tutorbot_config(&bot_id, config);
-    config["running"] = json!(true);
-    config["started_at"] = json!(now_rfc3339());
-    config["last_reload_error"] = Value::Null;
 
     if let Err(error) = ensure_tutorbot_workspace(&state, &bot_id, &config) {
         return error.into_response();
     }
+    let snapshot = state.tutorbot_runtime.start_bot(&bot_id, config).await;
+    let config = snapshot.config;
     match write_tutorbot_config(&state, &bot_id, &config) {
         Ok(()) => Json(tutorbot_detail(&bot_id, &config, true)).into_response(),
         Err(error) => error.into_response(),
@@ -23157,6 +23230,9 @@ async fn stop_tutorbot(
     if !config["running"].as_bool().unwrap_or(false) {
         return api_error(StatusCode::NOT_FOUND, "Bot not found or not running").into_response();
     }
+    if !state.tutorbot_runtime.stop_bot(&bot_id).await {
+        return api_error(StatusCode::NOT_FOUND, "Bot not found or not running").into_response();
+    }
     config["running"] = json!(false);
     config["started_at"] = Value::Null;
     match write_tutorbot_config(&state, &bot_id, &config) {
@@ -23176,6 +23252,7 @@ async fn destroy_tutorbot(
     if !path.exists() {
         return api_error(StatusCode::NOT_FOUND, "Bot not found").into_response();
     }
+    let _ = state.tutorbot_runtime.stop_bot(&bot_id).await;
     match fs::remove_dir_all(path) {
         Ok(()) => Json(json!({ "bot_id": bot_id, "destroyed": true })).into_response(),
         Err(error) => api_error(

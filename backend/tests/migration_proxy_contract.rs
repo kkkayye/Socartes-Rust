@@ -11,7 +11,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt, stream};
 use http_body_util::BodyExt;
 use socartes_backend::migration::{
-    MigrationConfig, MigrationMode, MigrationRuntime, proxy_to_python, proxy_ws_to_python,
+    MigrationConfig, MigrationMode, MigrationRuntime, is_websocket_upgrade_request,
+    proxy_to_python, proxy_ws_to_python,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -49,8 +50,25 @@ knowledge = "proxy"
     );
     assert_eq!(
         config.mode_for_path("/api/v1/not-yet-mapped"),
+        MigrationMode::Proxy
+    );
+    assert_eq!(
+        config.mode_for_path("/api/v1/admin/migration/reload"),
         MigrationMode::Native
     );
+}
+
+#[test]
+fn websocket_upgrade_requests_bypass_http_proxy_gate() {
+    let headers = HeaderMap::from_iter([
+        (header::CONNECTION, "keep-alive, Upgrade".parse().unwrap()),
+        (header::UPGRADE, "websocket".parse().unwrap()),
+    ]);
+
+    assert!(is_websocket_upgrade_request(&headers));
+
+    let plain_headers = HeaderMap::from_iter([(header::CONNECTION, "keep-alive".parse().unwrap())]);
+    assert!(!is_websocket_upgrade_request(&plain_headers));
 }
 
 #[tokio::test]

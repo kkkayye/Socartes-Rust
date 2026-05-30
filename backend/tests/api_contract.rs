@@ -14859,6 +14859,99 @@ async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
 }
 
 #[tokio::test]
+async fn tutorbot_start_reuses_live_runtime_until_stop_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let first_start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "runtime-bot",
+                        "name": "Runtime Bot",
+                        "persona": "# Soul\n\nKeep a live runtime."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_start_response.status(), http::StatusCode::OK);
+    let first_start = json_response(first_start_response).await;
+    assert_eq!(first_start["running"], true);
+    let first_started_at = first_start["started_at"]
+        .as_str()
+        .expect("first started_at")
+        .to_string();
+
+    sleep(Duration::from_secs(1)).await;
+    let second_start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "runtime-bot",
+                        "name": "Runtime Bot Renamed While Running"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_start_response.status(), http::StatusCode::OK);
+    let second_start = json_response(second_start_response).await;
+    assert_eq!(second_start["running"], true);
+    assert_eq!(
+        second_start["started_at"], first_started_at,
+        "Python TutorBotManager.start_bot returns the existing live instance instead of refreshing started_at"
+    );
+
+    let stop_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/tutorbot/runtime-bot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(stop_response).await["stopped"], true);
+
+    sleep(Duration::from_secs(1)).await;
+    let restart_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"bot_id": "runtime-bot"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restart_response.status(), http::StatusCode::OK);
+    let restart = json_response(restart_response).await;
+    assert_eq!(restart["running"], true);
+    assert_ne!(restart["started_at"], first_started_at);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn tutorbot_management_accepts_python_style_mcp_server_config() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);

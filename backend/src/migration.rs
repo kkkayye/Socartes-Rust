@@ -99,13 +99,19 @@ impl MigrationConfig {
         self.routes
             .get(&capability.to_ascii_lowercase())
             .copied()
-            .unwrap_or(MigrationMode::Native)
+            .unwrap_or(self.fallback)
     }
 
     pub fn mode_for_path(&self, path: &str) -> MigrationMode {
+        if path == "/api/v1/admin/migration/reload" {
+            return MigrationMode::Native;
+        }
+        if !self.enabled {
+            return MigrationMode::Native;
+        }
         capability_for_path(path)
             .map(|capability| self.mode_for_capability(capability))
-            .unwrap_or(MigrationMode::Native)
+            .unwrap_or(self.fallback)
     }
 
     pub fn fallback_should_proxy(&self) -> bool {
@@ -227,6 +233,23 @@ pub fn capability_for_path(path: &str) -> Option<&'static str> {
         _ if path.starts_with("/api/v1/co_writer") => Some("co_writer"),
         _ => None,
     }
+}
+
+pub fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
+    let has_websocket_upgrade = headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if !has_websocket_upgrade {
+        return false;
+    }
+    headers.get_all(CONNECTION).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+    })
 }
 
 pub async fn proxy_to_python(runtime: Arc<MigrationRuntime>, request: Request) -> Response {
