@@ -33,6 +33,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SEARCH_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static BOOK_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SEARCH_ENV_KEYS: &[&str] = &[
     "SEARCH_PROVIDER",
     "BRAVE_SEARCH_API_KEY",
@@ -48,6 +49,11 @@ const INVALID_EMBEDDING_RESPONSE_DETAIL: &str =
 
 struct SearchEnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+struct BookCompileEnvGuard {
+    saved_delay: Option<String>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -92,6 +98,36 @@ impl Drop for SearchEnvGuard {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
+            }
+        }
+    }
+}
+
+impl BookCompileEnvGuard {
+    async fn with_delay(delay_ms: u64) -> Self {
+        let guard = BOOK_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let saved_delay = std::env::var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS").ok();
+        // SAFETY: this test-only guard serializes writers for this env var and restores it on drop.
+        unsafe {
+            std::env::set_var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS", delay_ms.to_string());
+        }
+        Self {
+            saved_delay,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for BookCompileEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: BOOK_ENV_MUTEX is still held while this guard restores the variable.
+        unsafe {
+            match &self.saved_delay {
+                Some(value) => std::env::set_var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS", value),
+                None => std::env::remove_var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS"),
             }
         }
     }
@@ -1052,6 +1088,63 @@ async fn spawn_sse_request_recorder(
                 }));
                 axum::response::Response::builder()
                     .header(http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_sequential_raw_request_recorder(
+    responses: Vec<(String, String)>,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let responses = Arc::new(responses);
+    let response_index = Arc::new(AtomicU64::new(0));
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let responses = Arc::clone(&responses);
+            let response_index = Arc::clone(&response_index);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                let index = response_index.fetch_add(1, Ordering::Relaxed) as usize;
+                let (content_type, body) = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        (
+                            "application/json".to_string(),
+                            json!({"choices": []}).to_string(),
+                        )
+                    });
+                axum::response::Response::builder()
+                    .header(http::header::CONTENT_TYPE, content_type)
                     .body(Body::from(body))
                     .unwrap()
             }
@@ -19574,6 +19667,141 @@ async fn chat_ws_start_turn_streams_selected_llm_chat_completion_chunks() {
 }
 
 #[tokio::test]
+async fn chat_ws_start_turn_streams_final_chunks_after_selected_llm_tool_call() {
+    let root = unique_test_knowledge_root();
+    let tool_call_response = json!({
+        "id": "chatcmpl-tool-before-stream",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_rag_stream",
+                    "type": "function",
+                    "function": {
+                        "name": "rag",
+                        "arguments": "{\"query\":\"What phrase unlocks the copper prism?\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let final_stream = [
+        r#"data: {"id":"chatcmpl-stream-tool-final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl-stream-tool-final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Final streamed "},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl-stream-tool-final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"answer: copper prism unlocks with obsidian key."},"finish_reason":"stop"}],"usage":{"prompt_tokens":31,"completion_tokens":9,"total_tokens":40}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let (llm_base_url, requests, llm_server) = spawn_sequential_raw_request_recorder(vec![
+        (
+            "application/json".to_string(),
+            tool_call_response.to_string(),
+        ),
+        ("text/event-stream".to_string(), final_stream),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    create_markdown_knowledge_base(
+        app.clone(),
+        "stream-tool-course",
+        "copper-prism.md",
+        "The copper prism unlock phrase is obsidian key, and it appears only in this uploaded course.",
+    )
+    .await;
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Use the selected provider and course evidence to answer: What phrase unlocks the copper prism?",
+                "language": "en",
+                "tools": ["rag"],
+                "knowledge_bases": ["stream-tool-course"],
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content_chunks = events
+        .iter()
+        .filter(|event| event["type"] == "content")
+        .filter_map(|event| event["content"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        content_chunks,
+        vec![
+            "Final streamed ",
+            "answer: copper prism unlocks with obsidian key."
+        ]
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["payload"]["stream"], false);
+    assert_eq!(recorded[0]["payload"]["tool_choice"], "auto");
+    assert_eq!(recorded[1]["payload"]["stream"], true);
+    assert!(
+        recorded[1]["payload"]["stream_options"]["include_usage"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_rag_stream")
+        .expect("streamed RAG tool result message");
+    assert_eq!(tool_message["name"], "rag");
+    assert!(tool_message["content"].as_str().is_some_and(|content| {
+        content.contains("stream-tool-course/copper-prism.md") && content.contains("obsidian key")
+    }));
+    drop(recorded);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_start_turn_uses_responses_api_for_gpt5_reasoning_selection() {
     let root = unique_test_knowledge_root();
     let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
@@ -23255,6 +23483,127 @@ async fn book_ws_compile_ready_page_without_force_is_idempotent_like_python() {
     );
 
     server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_compile_page_concurrent_force_requests_share_active_claim_like_python() {
+    let _guard = BookCompileEnvGuard::with_delay(75).await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_claim-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "claim-book",
+            "title": "Claim Book",
+            "description": "Concurrent compile calls should share an active page claim.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "claim-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Claim chapter",
+                "summary": "Already compiled.",
+                "content_type": "theory",
+                "learning_objectives": ["Share compile claims"],
+                "source_anchors": [],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "claim-book",
+            "chapter_id": "chapter-1",
+            "title": "Claim chapter",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": ["Share compile claims"],
+            "blocks": [{
+                "id": "block-1",
+                "type": "section",
+                "title": "Stable section",
+                "status": "ready",
+                "payload": {
+                    "body": "This page was already compiled."
+                },
+                "params": {},
+                "metadata": {},
+                "source_anchors": [],
+                "error": "",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(book_dir.join("log.md"), "# Existing log\n").unwrap();
+
+    let responses = futures_util::future::join_all((0..8).map(|_| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/book/books/compile-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "book_id": "claim-book",
+                            "page_id": "page-1",
+                            "force": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    for response in responses {
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let payload = json_response(response).await;
+        assert_eq!(payload["page"]["status"], "ready");
+    }
+
+    let log = fs::read_to_string(book_dir.join("log.md")).unwrap();
+    assert_eq!(
+        log.matches("compile_page").count(),
+        1,
+        "concurrent force compiles should wait on the active claim instead of recompiling:\n{log}"
+    );
+
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 

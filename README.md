@@ -105,6 +105,11 @@ Compatibility binary names:
 
 `chat --session` reloads saved session preferences before entering the REPL, matching the Python CLI behavior for capability, tools, knowledge bases, language, notebook references, and history references.
 
+`memory show|clear` can use the API when it is available, and falls back to
+local `SOCARTES_MEMORY_ROOT` or `SOCARTES_DATA_DIR/memory` files when the API
+is offline, matching the Python CLI's local memory workflow for `SUMMARY.md`
+and `PROFILE.md`.
+
 Selected OpenAI-compatible chat providers now stream visible `/api/v1/ws`
 assistant content chunks when no native tool call is pending. Provider
 reasoning chunks remain hidden from visible content and are persisted in

@@ -35,7 +35,7 @@ use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -643,6 +643,7 @@ struct AppState {
     auth_pb_token_cache: Arc<std::sync::Mutex<HashMap<String, CachedPocketBaseToken>>>,
     chat_runtime: Arc<ChatRuntimeState>,
     knowledge_tasks: Arc<KnowledgeTaskRuntimeState>,
+    book_runtime: Arc<BookRuntimeState>,
     tutorbot_runtime: Arc<TutorbotRuntimeState>,
 }
 
@@ -661,6 +662,11 @@ struct AuthRuntimeConfig {
 struct CachedPocketBaseToken {
     payload: AuthTokenPayload,
     expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BookRuntimeState {
+    compiling_pages: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl AuthRuntimeConfig {
@@ -1312,6 +1318,7 @@ impl AppState {
             knowledge_tasks: Arc::new(KnowledgeTaskRuntimeState {
                 tasks: Mutex::new(HashMap::new()),
             }),
+            book_runtime: Arc::new(BookRuntimeState::default()),
             tutorbot_runtime: Arc::new(TutorbotRuntimeState {
                 notifications: Mutex::new(HashMap::new()),
                 btw_tasks: Mutex::new(HashMap::new()),
@@ -4469,7 +4476,7 @@ async fn compile_book_page(
         return api_error(StatusCode::BAD_REQUEST, "page_id is required").into_response();
     };
     let force = request["force"].as_bool().unwrap_or(false);
-    match compile_book_page_record(&state, book_id, page_id, force) {
+    match compile_book_page_with_claim(&state, book_id, page_id, force).await {
         Ok(page) => Json(json!({ "page": page })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -8566,6 +8573,48 @@ fn compile_pages_from_spine(
     }
     refresh_book_counts(state, book_id)?;
     Ok(pages)
+}
+
+async fn compile_book_page_with_claim(
+    state: &AppState,
+    book_id: &str,
+    page_id: &str,
+    force: bool,
+) -> Result<Value, ApiError> {
+    let claim_key = format!("{book_id}\u{0}{page_id}");
+    let active_claim = {
+        let mut compiling_pages = state.book_runtime.compiling_pages.lock().await;
+        if let Some(notify) = compiling_pages.get(&claim_key) {
+            Some(Arc::clone(notify))
+        } else {
+            compiling_pages.insert(claim_key.clone(), Arc::new(Notify::new()));
+            None
+        }
+    };
+    if let Some(notify) = active_claim {
+        notify.notified().await;
+        return load_book_page(state, book_id, page_id);
+    }
+
+    if let Some(delay_ms) = env::var("SOCARTES_BOOK_COMPILE_DEBUG_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+
+    let result = compile_book_page_record(state, book_id, page_id, force);
+    if let Some(notify) = state
+        .book_runtime
+        .compiling_pages
+        .lock()
+        .await
+        .remove(&claim_key)
+    {
+        notify.notify_waiters();
+    }
+    result
 }
 
 fn compile_book_page_record(

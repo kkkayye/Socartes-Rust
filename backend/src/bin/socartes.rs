@@ -1996,15 +1996,12 @@ async fn notebook_command(api: &ApiClient, command: NotebookCommand) -> CliResul
 async fn memory_command(api: &ApiClient, command: MemoryCommand) -> CliResult {
     match command {
         MemoryCommand::Show { file, format } => {
-            let value = api.get_json("/api/v1/memory").await?;
-            if matches!(format, OutputFormat::Json) || file == "all" {
-                return print_value(&value, format);
-            }
-            if let Some(content) = value.get(&file) {
-                print_value(content, format)
-            } else {
-                Err(format!("Unknown memory file: {file}. Use summary, profile, or all.").into())
-            }
+            let value = match api.get_json("/api/v1/memory").await {
+                Ok(value) => value,
+                Err(error) if should_use_local_memory(error.as_ref()) => local_memory_snapshot()?,
+                Err(error) => return Err(error),
+            };
+            print_memory_value(&value, &file, format)
         }
         MemoryCommand::Clear { file, force } => {
             if !force {
@@ -2022,9 +2019,89 @@ async fn memory_command(api: &ApiClient, command: MemoryCommand) -> CliResult {
             } else {
                 json!({ "file": file })
             };
-            print_json(&api.post_json("/api/v1/memory/clear", &body).await?)
+            let value = match api.post_json("/api/v1/memory/clear", &body).await {
+                Ok(value) => value,
+                Err(error) if should_use_local_memory(error.as_ref()) => {
+                    clear_local_memory(&file)?;
+                    let mut snapshot = local_memory_snapshot()?;
+                    snapshot["cleared"] = json!(true);
+                    snapshot
+                }
+                Err(error) => return Err(error),
+            };
+            print_json(&value)
         }
     }
+}
+
+fn print_memory_value(value: &Value, file: &str, format: OutputFormat) -> CliResult {
+    if matches!(format, OutputFormat::Json) || file == "all" {
+        return print_value(value, format);
+    }
+    if let Some(content) = value.get(file) {
+        print_value(content, format)
+    } else {
+        Err(format!("Unknown memory file: {file}. Use summary, profile, or all.").into())
+    }
+}
+
+fn should_use_local_memory(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>()
+            && (reqwest_error.is_connect() || reqwest_error.is_timeout())
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn local_memory_snapshot() -> CliResult<Value> {
+    let root = local_memory_root();
+    Ok(json!({
+        "summary": read_local_memory_file(&root, "SUMMARY.md")?,
+        "profile": read_local_memory_file(&root, "PROFILE.md")?,
+        "summary_updated_at": Value::Null,
+        "profile_updated_at": Value::Null
+    }))
+}
+
+fn local_memory_root() -> PathBuf {
+    env::var_os("SOCARTES_MEMORY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_root_from_home(None).join("memory"))
+}
+
+fn read_local_memory_file(root: &Path, filename: &str) -> CliResult<String> {
+    let path = root.join(filename);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(path)?.trim().to_string())
+}
+
+fn clear_local_memory(file: &str) -> CliResult {
+    match file {
+        "all" => {
+            clear_local_memory_file("SUMMARY.md")?;
+            clear_local_memory_file("PROFILE.md")
+        }
+        "summary" => clear_local_memory_file("SUMMARY.md"),
+        "profile" => clear_local_memory_file("PROFILE.md"),
+        _ => Err(format!("Unknown file: {file}. Use summary, profile, or all.").into()),
+    }
+}
+
+fn clear_local_memory_file(filename: &str) -> CliResult {
+    let root = local_memory_root();
+    fs::create_dir_all(&root)?;
+    let path = root.join(filename);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 async fn plugin_command(api: &ApiClient, command: PluginCommand) -> CliResult {
@@ -2035,7 +2112,7 @@ async fn plugin_command(api: &ApiClient, command: PluginCommand) -> CliResult {
         }
         PluginCommand::Info { name } => {
             let value = api.get_json("/api/v1/plugins/list").await?;
-            for section in ["tools", "capabilities"] {
+            for section in ["plugins", "tools", "capabilities"] {
                 if let Some(found) = value[section]
                     .as_array()
                     .into_iter()

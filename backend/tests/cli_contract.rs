@@ -283,6 +283,13 @@ fn free_tcp_port() -> u16 {
 
 async fn plugins_list_response() -> Json<Value> {
     Json(json!({
+        "plugins": [{
+            "name": "deep_research",
+            "version": "0.1.0",
+            "type": "playground",
+            "description": "Multi-agent research and reporting",
+            "stages": ["plan", "research", "write"]
+        }],
         "tools": [{
             "name": "rag",
             "description": "Retrieval-Augmented Generation",
@@ -2100,6 +2107,11 @@ async fn plugin_info_reads_tool_and_capability_entries_like_python_cli() {
         .args(["plugin", "info", "deep_solve"])
         .output()
         .expect("socartes plugin info deep_solve should execute");
+    let plugin_output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["plugin", "info", "deep_research"])
+        .output()
+        .expect("socartes plugin info deep_research should execute");
     server.abort();
 
     assert!(
@@ -2126,6 +2138,75 @@ async fn plugin_info_reads_tool_and_capability_entries_like_python_cli() {
             "planner",
         ],
     );
+    assert!(
+        plugin_output.status.success(),
+        "plugin info deep_research failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plugin_output.stdout),
+        String::from_utf8_lossy(&plugin_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(plugin_output.stdout).unwrap(),
+        &[
+            "\"name\": \"deep_research\"",
+            "Multi-agent research",
+            "playground",
+        ],
+    );
+}
+
+#[test]
+fn memory_cli_falls_back_to_local_files_when_api_is_unavailable_like_python_cli() {
+    let home = unique_temp_dir("memory-local-fallback");
+    let data_root = home.join("data");
+    let memory_root = data_root.join("memory");
+    fs::create_dir_all(&memory_root).expect("memory root should be created");
+    fs::write(memory_root.join("SUMMARY.md"), "Local CLI summary.")
+        .expect("summary memory should be written");
+    fs::write(memory_root.join("PROFILE.md"), "Local CLI profile.")
+        .expect("profile memory should be written");
+    let unavailable_api = format!("http://127.0.0.1:{}", free_tcp_port());
+
+    let show_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &unavailable_api)
+        .env("SOCARTES_DATA_DIR", &data_root)
+        .args(["memory", "show", "summary"])
+        .output()
+        .expect("socartes memory show should execute");
+
+    assert!(
+        show_output.status.success(),
+        "memory show should fall back to local files when API is unavailable:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&show_output.stdout),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(show_output.stdout).unwrap(),
+        &["Local CLI summary."],
+    );
+
+    let clear_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &unavailable_api)
+        .env("SOCARTES_DATA_DIR", &data_root)
+        .args(["memory", "clear", "profile", "--force"])
+        .output()
+        .expect("socartes memory clear should execute");
+
+    assert!(
+        clear_output.status.success(),
+        "memory clear should fall back to local files when API is unavailable:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clear_output.stdout),
+        String::from_utf8_lossy(&clear_output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(memory_root.join("PROFILE.md")).unwrap_or_default(),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(memory_root.join("SUMMARY.md")).unwrap(),
+        "Local CLI summary."
+    );
+
+    let _ = fs::remove_dir_all(home);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
