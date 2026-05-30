@@ -5032,13 +5032,28 @@ async fn book_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state.migration.mode_for_path(uri.path()).should_proxy() {
-        return migration::proxy_ws_to_python(
-            state.migration.clone(),
-            path_and_query(&uri),
-            headers,
-            ws,
-        );
+    if !state.migration.is_shadow_native_ws_request(&headers) {
+        match state.migration.mode_for_path(uri.path()) {
+            migration::MigrationMode::Native => {}
+            migration::MigrationMode::Proxy => {
+                return migration::proxy_ws_to_python(
+                    state.migration.clone(),
+                    path_and_query(&uri),
+                    headers,
+                    ws,
+                );
+            }
+            migration::MigrationMode::Shadow => {
+                return migration::shadow_ws_to_python(
+                    state.migration.clone(),
+                    "book",
+                    path_and_query(&uri),
+                    headers,
+                    ws,
+                    native_ws_base_url(),
+                );
+            }
+        }
     }
     if let Err(response) = require_ws_auth_response(&state, &headers) {
         return *response;

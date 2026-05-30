@@ -1,11 +1,13 @@
 use std::{
     convert::Infallible,
+    fs,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -18,6 +20,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use http_body_util::BodyExt;
+use socartes_backend::app_with_knowledge_root_and_auth;
 use socartes_backend::migration::{
     MigrationConfig, MigrationMode, MigrationRuntime, is_shadow_native_ws_request,
     is_websocket_upgrade_request, proxy_to_python, proxy_ws_to_python, shadow_to_python,
@@ -28,6 +31,68 @@ use tokio::{
     sync::{Mutex, oneshot},
 };
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+static MIGRATION_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+struct MigrationEnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+    root: PathBuf,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl MigrationEnvGuard {
+    async fn with_config(config: &str, native_ws_base_url: &str) -> Self {
+        let guard = MIGRATION_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = unique_temp_dir("socartes-migration-test");
+        fs::create_dir_all(&root).expect("create migration test root");
+        let config_path = root.join("migration.toml");
+        fs::write(&config_path, config).expect("write migration config");
+        let saved = [
+            "SOCARTES_MIGRATION_CONFIG",
+            "SOCARTES_NATIVE_WS_BASE_URL",
+            "SOCARTES_SHADOW_NATIVE_WS_TOKEN",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var(key).ok()))
+        .collect::<Vec<_>>();
+        // SAFETY: this guard serializes mutation of migration-related env vars in this test binary.
+        unsafe {
+            std::env::set_var("SOCARTES_MIGRATION_CONFIG", &config_path);
+            std::env::set_var("SOCARTES_NATIVE_WS_BASE_URL", native_ws_base_url);
+            std::env::set_var(
+                "SOCARTES_SHADOW_NATIVE_WS_TOKEN",
+                "socartes-test-shadow-token",
+            );
+        }
+        Self {
+            saved,
+            root,
+            _guard: guard,
+        }
+    }
+
+    fn data_root(&self) -> PathBuf {
+        self.root.join("data")
+    }
+}
+
+impl Drop for MigrationEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: MIGRATION_ENV_MUTEX is still held while this guard restores variables.
+        unsafe {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 #[test]
 fn migration_toml_maps_capabilities_to_modes() {
@@ -470,6 +535,88 @@ async fn shadow_ws_returns_python_frames_and_tees_client_frames_to_native_ws() {
 }
 
 #[tokio::test]
+async fn book_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    let upstream = Router::new().route("/api/v1/book/ws", get(echo_ws));
+    let upstream_addr = spawn_app(upstream).await;
+
+    let native_messages = Arc::new(Mutex::new(Vec::<String>::new()));
+    let native_header_seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let native = Router::new().route(
+        "/api/v1/book/ws",
+        get({
+            let native_messages = native_messages.clone();
+            let native_header_seen = native_header_seen.clone();
+            move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                let native_messages = native_messages.clone();
+                let native_header_seen = native_header_seen.clone();
+                async move {
+                    native_header_seen
+                        .lock()
+                        .await
+                        .push(is_shadow_native_ws_request(
+                            &headers,
+                            "socartes-test-shadow-token",
+                        ));
+                    observed_native_ws(ws, native_messages).await
+                }
+            }
+        }),
+    );
+    let native_addr = spawn_app(native).await;
+    let config = format!(
+        r#"
+enabled = true
+python_base_url = "http://{upstream_addr}"
+python_ws_base_url = "ws://{upstream_addr}"
+fallback = "proxy"
+
+[routes]
+book = "shadow"
+"#
+    );
+    let env_guard = MigrationEnvGuard::with_config(&config, &format!("ws://{native_addr}")).await;
+    let app =
+        app_with_knowledge_root_and_auth(env_guard.data_root().join("knowledge_bases"), false);
+    let app_addr = spawn_app(app).await;
+
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{app_addr}/api/v1/book/ws?turn=1"))
+            .await
+            .expect("book websocket should connect through app router");
+    socket
+        .send(TungsteniteMessage::Text("hello book shadow".into()))
+        .await
+        .expect("client message should send");
+    let echoed = socket
+        .next()
+        .await
+        .expect("python echo should arrive")
+        .expect("python echo should be ok");
+    assert_eq!(
+        echoed,
+        TungsteniteMessage::Text("python:hello book shadow".into())
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "native shadow frames must not be forwarded to the client"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if native_messages.lock().await.as_slice() == ["hello book shadow"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native websocket should receive the client frame");
+    assert_eq!(native_header_seen.lock().await.as_slice(), [true]);
+}
+
+#[tokio::test]
 async fn disabled_migration_fallback_returns_404_without_python() {
     let runtime = Arc::new(MigrationRuntime::from_config_for_tests(
         MigrationConfig::default(),
@@ -564,4 +711,12 @@ async fn spawn_app(app: Router) -> SocketAddr {
         axum::serve(listener, app).await.unwrap();
     });
     addr
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
