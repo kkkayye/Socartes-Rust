@@ -2139,18 +2139,60 @@ async fn config_command(api: &ApiClient, command: ConfigCommand) -> CliResult {
 }
 
 fn local_config_summary(home: Option<PathBuf>) -> CliResult<Value> {
-    let data_root = data_root_from_home(home);
-    let settings_root = data_root.join("settings");
-    let catalog = read_json_or_default(&settings_root.join("catalog.json"), default_cli_catalog())?;
-    let ui = read_json_or_default(&settings_root.join("ui.json"), default_cli_ui_settings())?;
+    let paths = local_config_paths(home.as_deref())?;
+    let env_values = read_env_file(&paths.env_file)?;
+    let catalog = read_first_json_or_default(
+        &[
+            paths.user_settings_root.join("model_catalog.json"),
+            paths.settings_root.join("model_catalog.json"),
+            paths.settings_root.join("catalog.json"),
+        ],
+        default_cli_catalog(),
+    )?;
+    let ui = read_json_or_default(
+        &paths.settings_root.join("ui.json"),
+        default_cli_ui_settings(),
+    )?;
+    let main_yaml = read_main_yaml_summary(&[
+        paths.user_settings_root.join("main.yaml"),
+        paths.settings_root.join("main.yaml"),
+    ])?;
     Ok(json!({
-        "ports": local_ports_summary(&ui),
-        "llm": local_llm_summary(&catalog),
-        "embedding": local_embedding_summary(&catalog),
-        "search": local_search_summary(&catalog),
-        "language": ui["language"].as_str().unwrap_or("en"),
-        "tools": local_tools_summary(&ui)
+        "ports": local_ports_summary(&ui, &env_values),
+        "llm": local_llm_summary(&catalog, &env_values),
+        "embedding": local_embedding_summary(&catalog, &env_values),
+        "search": local_search_summary(&catalog, &env_values),
+        "language": local_language_summary(&ui, main_yaml.as_ref()),
+        "tools": local_tools_summary(&ui, main_yaml.as_ref())
     }))
+}
+
+struct LocalConfigPaths {
+    env_file: PathBuf,
+    settings_root: PathBuf,
+    user_settings_root: PathBuf,
+}
+
+fn local_config_paths(home: Option<&Path>) -> CliResult<LocalConfigPaths> {
+    let data_root = match home {
+        Some(home) => home.join("data"),
+        None => env::var("SOCARTES_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data")),
+    };
+    let project_root = match home {
+        Some(home) => home.to_path_buf(),
+        None => data_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    Ok(LocalConfigPaths {
+        env_file: project_root.join(".env"),
+        settings_root: data_root.join("settings"),
+        user_settings_root: data_root.join("user").join("settings"),
+    })
 }
 
 fn data_root_from_home(home: Option<PathBuf>) -> PathBuf {
@@ -2162,6 +2204,17 @@ fn data_root_from_home(home: Option<PathBuf>) -> PathBuf {
     }
 }
 
+fn read_first_json_or_default(paths: &[PathBuf], default: Value) -> CliResult<Value> {
+    for path in paths {
+        match fs::read_to_string(path) {
+            Ok(text) => return Ok(serde_json::from_str(&text)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(default)
+}
+
 fn read_json_or_default(path: &Path, default: Value) -> CliResult<Value> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(serde_json::from_str(&text)?),
@@ -2170,80 +2223,226 @@ fn read_json_or_default(path: &Path, default: Value) -> CliResult<Value> {
     }
 }
 
-fn local_ports_summary(ui: &Value) -> Value {
+#[derive(Debug, Default)]
+struct MainYamlSummary {
+    language: Option<String>,
+    tools: Option<Vec<String>>,
+}
+
+fn read_main_yaml_summary(paths: &[PathBuf]) -> CliResult<Option<MainYamlSummary>> {
+    for path in paths {
+        match fs::read_to_string(path) {
+            Ok(text) => return Ok(Some(parse_main_yaml_summary(&text))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn parse_main_yaml_summary(text: &str) -> MainYamlSummary {
+    let mut summary = MainYamlSummary::default();
+    let mut in_tools = false;
+    let mut tools = Vec::new();
+    for raw_line in text.lines() {
+        let without_comment = raw_line.split_once('#').map_or(raw_line, |(head, _)| head);
+        let trimmed = without_comment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = without_comment
+            .chars()
+            .take_while(|value| value.is_whitespace())
+            .count();
+        if indent == 0 && trimmed == "tools:" {
+            in_tools = true;
+            summary.tools = Some(Vec::new());
+            continue;
+        }
+        if indent == 0 {
+            in_tools = false;
+        }
+        if let Some(value) = trimmed.strip_prefix("language:") {
+            let language = clean_yaml_scalar(value);
+            if !language.is_empty() {
+                summary.language = Some(language);
+            }
+            continue;
+        }
+        if in_tools
+            && indent > 0
+            && let Some((key, _)) = trimmed.split_once(':')
+        {
+            let key = clean_yaml_scalar(key);
+            if !key.is_empty() {
+                tools.push(key);
+            }
+            summary.tools = Some(tools.clone());
+        }
+    }
+    summary
+}
+
+fn clean_yaml_scalar(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+fn local_ports_summary(ui: &Value, env_values: &BTreeMap<String, String>) -> Value {
     json!({
-        "backend": ui.pointer("/ports/backend")
-            .or_else(|| ui.get("backend_port"))
-            .cloned()
+        "backend": env_u16_from_config(env_values, "BACKEND_PORT")
+            .map(Value::from)
+            .or_else(|| ui.pointer("/ports/backend").cloned())
+            .or_else(|| ui.get("backend_port").cloned())
             .unwrap_or_else(|| json!(8001)),
-        "frontend": ui.pointer("/ports/frontend")
-            .or_else(|| ui.get("frontend_port"))
-            .cloned()
+        "frontend": env_u16_from_config(env_values, "FRONTEND_PORT")
+            .map(Value::from)
+            .or_else(|| ui.pointer("/ports/frontend").cloned())
+            .or_else(|| ui.get("frontend_port").cloned())
             .unwrap_or_else(|| json!(3782))
     })
 }
 
-fn local_llm_summary(catalog: &Value) -> Value {
+fn env_config_value(env_values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    if let Some(value) = env_values.get(key) {
+        return Some(value.trim().to_string());
+    }
+    env::var(key).ok().map(|value| value.trim().to_string())
+}
+
+fn env_non_empty(env_values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    env_config_value(env_values, key).filter(|value| !value.is_empty())
+}
+
+fn env_u16_from_config(env_values: &BTreeMap<String, String>, key: &str) -> Option<u16> {
+    env_config_value(env_values, key).and_then(|value| value.parse::<u16>().ok())
+}
+
+fn local_llm_summary(catalog: &Value, env_values: &BTreeMap<String, String>) -> Value {
     let service = &catalog["services"]["llm"];
     let profile = active_service_profile(catalog, "llm");
     let model = active_service_model(service, profile);
-    let binding = profile_string(profile, "binding");
+    let binding = profile_string_option(profile, "binding")
+        .or_else(|| env_config_value(env_values, "LLM_BINDING"))
+        .map(|value| canonical_provider_name(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "openai".to_string());
+    let model_name = model_string(model, "model")
+        .or_else(|| model_string(model, "id"))
+        .or_else(|| env_non_empty(env_values, "LLM_MODEL"))
+        .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let api_key = profile_string_option(profile, "api_key")
+        .or_else(|| env_config_value(env_values, "LLM_API_KEY"))
+        .unwrap_or_default();
+    let configured_base_url = profile_string_option(profile, "base_url")
+        .or_else(|| env_non_empty(env_values, "LLM_HOST"))
+        .or_else(|| env_non_empty(env_values, "LLM_BASE_URL"));
+    let provider = resolve_llm_provider(
+        &binding,
+        &model_name,
+        &api_key,
+        configured_base_url.as_deref(),
+    );
+    let base_url = configured_base_url
+        .or_else(|| default_llm_base_url(&provider).map(str::to_string))
+        .unwrap_or_default();
     json!({
         "binding_hint": binding,
-        "provider": binding,
-        "provider_mode": local_provider_mode(&binding),
-        "model": model_string(model, "model")
-            .or_else(|| model_string(model, "id"))
-            .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+        "provider": provider,
+        "provider_mode": local_provider_mode(&provider),
+        "model": model_name,
+        "base_url": base_url,
+        "api_version": profile_string_option(profile, "api_version")
+            .or_else(|| env_non_empty(env_values, "LLM_API_VERSION"))
             .unwrap_or_default(),
-        "base_url": profile_string(profile, "base_url"),
-        "api_version": profile_string(profile, "api_version"),
         "extra_headers": profile
             .and_then(|value| value.get("extra_headers"))
             .cloned()
             .unwrap_or_else(|| json!({})),
-        "api_key": masked_secret(profile_string(profile, "api_key"))
+        "api_key": masked_secret(api_key)
     })
 }
 
-fn local_embedding_summary(catalog: &Value) -> Value {
+fn local_embedding_summary(catalog: &Value, env_values: &BTreeMap<String, String>) -> Value {
     let service = &catalog["services"]["embedding"];
     let profile = active_service_profile(catalog, "embedding");
     let model = active_service_model(service, profile);
-    let binding = profile_string(profile, "binding");
+    let binding = profile_string_option(profile, "binding")
+        .or_else(|| env_config_value(env_values, "EMBEDDING_BINDING"))
+        .map(|value| canonical_provider_name(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "openai".to_string());
+    let model_name = model_string(model, "model")
+        .or_else(|| model_string(model, "id"))
+        .or_else(|| env_non_empty(env_values, "EMBEDDING_MODEL"))
+        .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let api_key = profile_string_option(profile, "api_key")
+        .or_else(|| env_config_value(env_values, "EMBEDDING_API_KEY"))
+        .unwrap_or_default();
+    let base_url = profile_string_option(profile, "base_url")
+        .or_else(|| env_non_empty(env_values, "EMBEDDING_HOST"))
+        .or_else(|| env_non_empty(env_values, "EMBEDDING_BASE_URL"))
+        .unwrap_or_default();
+    let dimension = model
+        .and_then(|value| value.get("dimension"))
+        .and_then(json_i64)
+        .or_else(|| {
+            env_config_value(env_values, "EMBEDDING_DIMENSION").and_then(|value| value.parse().ok())
+        })
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let provider = resolve_embedding_provider(&binding, &model_name, &base_url);
     json!({
         "binding_hint": binding,
-        "provider": binding,
-        "provider_mode": local_provider_mode(&binding),
-        "model": model_string(model, "model")
-            .or_else(|| model_string(model, "id"))
-            .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+        "provider": provider,
+        "provider_mode": local_provider_mode(&provider),
+        "model": model_name,
+        "base_url": base_url,
+        "api_version": profile_string_option(profile, "api_version")
+            .or_else(|| env_non_empty(env_values, "EMBEDDING_API_VERSION"))
             .unwrap_or_default(),
-        "base_url": profile_string(profile, "base_url"),
-        "api_version": profile_string(profile, "api_version"),
         "extra_headers": profile
             .and_then(|value| value.get("extra_headers"))
             .cloned()
             .unwrap_or_else(|| json!({})),
-        "api_key": masked_secret(profile_string(profile, "api_key")),
-        "dimension": model
-            .and_then(|value| value.get("dimension"))
-            .cloned()
-            .unwrap_or(Value::Null)
+        "api_key": masked_secret(api_key),
+        "dimension": dimension
     })
 }
 
-fn local_search_summary(catalog: &Value) -> Value {
+fn local_search_summary(catalog: &Value, env_values: &BTreeMap<String, String>) -> Value {
     let profile = active_service_profile(catalog, "search");
-    let provider = profile_string(profile, "provider");
+    let requested_provider = profile_string_option(profile, "provider")
+        .or_else(|| env_config_value(env_values, "SEARCH_PROVIDER"))
+        .map(|value| canonical_provider_name(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "brave".to_string());
+    let api_key = profile_string_option(profile, "api_key")
+        .or_else(|| env_config_value(env_values, "SEARCH_API_KEY"))
+        .or_else(|| search_provider_env_key(&requested_provider))
+        .unwrap_or_default();
+    let base_url = profile_string_option(profile, "base_url")
+        .or_else(|| env_non_empty(env_values, "SEARCH_BASE_URL"))
+        .unwrap_or_default();
+    let proxy = profile_string_option(profile, "proxy")
+        .or_else(|| env_non_empty(env_values, "SEARCH_PROXY"))
+        .unwrap_or_default();
+    let (provider, status, fallback_reason) =
+        resolve_search_provider(&requested_provider, &api_key, &base_url);
     json!({
-        "provider": if provider.is_empty() { "(optional)" } else { provider.as_str() },
-        "requested_provider": if provider.is_empty() { "(optional)" } else { provider.as_str() },
-        "status": if provider.is_empty() { "optional" } else { "configured" },
-        "fallback_reason": Value::Null,
-        "base_url": profile_string(profile, "base_url"),
-        "proxy": profile_string(profile, "proxy"),
-        "api_key": masked_secret(profile_string(profile, "api_key"))
+        "provider": provider,
+        "requested_provider": requested_provider,
+        "status": status,
+        "fallback_reason": fallback_reason.map(Value::from).unwrap_or(Value::Null),
+        "base_url": base_url,
+        "proxy": proxy,
+        "api_key": masked_secret(api_key)
     })
 }
 
@@ -2266,25 +2465,179 @@ fn active_service_model<'a>(service: &'a Value, profile: Option<&'a Value>) -> O
         .or_else(|| models.first())
 }
 
+fn canonical_provider_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "openai_compatible" | "openai_compat" => "openai".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn resolve_llm_provider(
+    binding: &str,
+    model: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> String {
+    let base_url = base_url.unwrap_or("").to_ascii_lowercase();
+    if binding == "openrouter"
+        || api_key.starts_with("sk-or-")
+        || base_url.contains("openrouter.ai")
+    {
+        return "openrouter".to_string();
+    }
+    let model_lower = model.to_ascii_lowercase();
+    if binding == "openai" && model_lower.starts_with("claude") {
+        return "anthropic".to_string();
+    }
+    if binding == "openai" && _is_local_url(&base_url) {
+        return if base_url.contains("11434") {
+            "ollama".to_string()
+        } else {
+            "vllm".to_string()
+        };
+    }
+    binding.to_string()
+}
+
+fn default_llm_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "anthropic" => Some("https://api.anthropic.com"),
+        _ => None,
+    }
+}
+
+fn resolve_embedding_provider(binding: &str, model: &str, base_url: &str) -> String {
+    let model = model.to_ascii_lowercase();
+    let base_url = base_url.to_ascii_lowercase();
+    if binding != "openai" {
+        return binding.to_string();
+    }
+    if model.contains("gemini") {
+        return "gemini".to_string();
+    }
+    if model.contains("cohere") || model.contains("embed-v4") {
+        return "cohere".to_string();
+    }
+    if model.contains("jina") {
+        return "jina".to_string();
+    }
+    if _is_local_url(&base_url) {
+        return if base_url.contains("11434") {
+            "ollama".to_string()
+        } else {
+            "vllm".to_string()
+        };
+    }
+    "openai".to_string()
+}
+
+fn _is_local_url(value: &str) -> bool {
+    value.contains("localhost")
+        || value.contains("127.0.0.1")
+        || value.contains("::1")
+        || value.contains(".local")
+}
+
+fn search_provider_env_key(provider: &str) -> Option<String> {
+    let key = match provider {
+        "brave" => "BRAVE_API_KEY",
+        "tavily" => "TAVILY_API_KEY",
+        "jina" => "JINA_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        "serper" => "SERPER_API_KEY",
+        _ => return None,
+    };
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_search_provider(
+    requested_provider: &str,
+    api_key: &str,
+    base_url: &str,
+) -> (String, String, Option<String>) {
+    if matches!(requested_provider, "exa" | "baidu" | "openrouter") {
+        return (
+            requested_provider.to_string(),
+            "unsupported".to_string(),
+            Some(format!(
+                "{requested_provider} is deprecated/unsupported. Switch to brave/tavily/jina/searxng/duckduckgo/perplexity/serper."
+            )),
+        );
+    }
+    if !matches!(
+        requested_provider,
+        "brave" | "tavily" | "jina" | "searxng" | "duckduckgo" | "perplexity" | "serper"
+    ) {
+        return (
+            requested_provider.to_string(),
+            "unsupported".to_string(),
+            Some(format!("Unsupported search provider: {requested_provider}")),
+        );
+    }
+    if matches!(requested_provider, "brave" | "tavily" | "jina") && api_key.is_empty() {
+        return (
+            "duckduckgo".to_string(),
+            "fallback".to_string(),
+            Some(format!(
+                "{requested_provider} requires api_key, falling back to duckduckgo"
+            )),
+        );
+    }
+    if requested_provider == "searxng" && base_url.is_empty() {
+        return (
+            "duckduckgo".to_string(),
+            "fallback".to_string(),
+            Some("searxng requires base_url, falling back to duckduckgo".to_string()),
+        );
+    }
+    if matches!(requested_provider, "perplexity" | "serper") && api_key.is_empty() {
+        return (
+            requested_provider.to_string(),
+            "not_configured".to_string(),
+            Some(format!("{requested_provider} requires api_key")),
+        );
+    }
+    (
+        requested_provider.to_string(),
+        "configured".to_string(),
+        None,
+    )
+}
+
 fn local_provider_mode(binding: &str) -> &str {
     match binding {
         "" => "",
+        "openrouter" => "gateway",
         "openai" | "openai-compatible" => "openai-compatible",
         "anthropic" => "anthropic",
-        "local" => "local",
+        "local" | "ollama" | "vllm" => "local",
         _ => "custom",
     }
 }
 
-fn profile_string(profile: Option<&Value>, key: &str) -> String {
+fn profile_string_option(profile: Option<&Value>, key: &str) -> Option<String> {
     profile
         .and_then(|value| value[key].as_str())
-        .unwrap_or("")
-        .to_string()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn model_string(model: Option<&Value>, key: &str) -> Option<String> {
-    model.and_then(|value| value[key].as_str().map(str::to_string))
+    model
+        .and_then(|value| value[key].as_str().map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
 }
 
 fn masked_secret(secret: String) -> &'static str {
@@ -2295,7 +2648,17 @@ fn masked_secret(secret: String) -> &'static str {
     }
 }
 
-fn local_tools_summary(ui: &Value) -> Value {
+fn local_language_summary(ui: &Value, main_yaml: Option<&MainYamlSummary>) -> String {
+    main_yaml
+        .and_then(|summary| summary.language.clone())
+        .or_else(|| ui["language"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "en".to_string())
+}
+
+fn local_tools_summary(ui: &Value, main_yaml: Option<&MainYamlSummary>) -> Value {
+    if let Some(tools) = main_yaml.and_then(|summary| summary.tools.as_ref()) {
+        return Value::Array(tools.iter().map(|key| json!(key)).collect());
+    }
     match ui.get("tools").and_then(Value::as_object) {
         Some(tools) => Value::Array(tools.keys().map(|key| json!(key)).collect()),
         None => json!([]),
@@ -2491,19 +2854,24 @@ async fn init_command(args: InitArgs) -> CliResult {
     let mut cli_only = args.cli;
     let mut home = args.home;
     let mut runtime = args.runtime;
+    let mut prompt_for_runtime = false;
     if let Some(command) = args.command {
         let InitCommand::Wizard(wizard) = command;
         yes |= wizard.yes;
         cli_only |= wizard.cli;
         home = home.or(wizard.home);
         runtime.merge(wizard.runtime);
+        prompt_for_runtime = !yes;
     }
-    run_init_wizard(InitWizardArgs {
-        yes,
-        cli: cli_only,
-        home,
-        runtime,
-    })
+    run_init_wizard(
+        InitWizardArgs {
+            yes,
+            cli: cli_only,
+            home,
+            runtime,
+        },
+        prompt_for_runtime,
+    )
 }
 
 impl RuntimeInitOptions {
@@ -2571,7 +2939,7 @@ impl RuntimeInitOptions {
     }
 }
 
-fn run_init_wizard(args: InitWizardArgs) -> CliResult {
+fn run_init_wizard(mut args: InitWizardArgs, prompt_for_runtime: bool) -> CliResult {
     let data_root = match args.home {
         Some(home) => home.join("data"),
         None => env::var("SOCARTES_DATA_DIR")
@@ -2586,6 +2954,9 @@ fn run_init_wizard(args: InitWizardArgs) -> CliResult {
         if !confirm("Continue?")? {
             return Ok(());
         }
+    }
+    if prompt_for_runtime {
+        prompt_runtime_options(&mut args.runtime)?;
     }
 
     let dirs = [
@@ -2629,6 +3000,65 @@ fn run_init_wizard(args: InitWizardArgs) -> CliResult {
         "settings": settings_root,
         "created": dirs
     }))
+}
+
+fn prompt_runtime_options(options: &mut RuntimeInitOptions) -> CliResult {
+    println!("Configure Socartes runtime. Press Enter to keep defaults.");
+    prompt_option("LLM binding", &mut options.llm_binding)?;
+    prompt_option("LLM base URL", &mut options.llm_base_url)?;
+    prompt_option("LLM API key", &mut options.llm_api_key)?;
+    prompt_option("LLM model", &mut options.llm_model)?;
+    prompt_option("Embedding binding", &mut options.embedding_binding)?;
+    prompt_option("Embedding base URL", &mut options.embedding_base_url)?;
+    prompt_option("Embedding API key", &mut options.embedding_api_key)?;
+    prompt_option("Embedding model", &mut options.embedding_model)?;
+    options.embedding_dimension =
+        prompt_parse_option("Embedding dimension", options.embedding_dimension)?;
+    prompt_option("Search provider", &mut options.search_provider)?;
+    prompt_option("Search base URL", &mut options.search_base_url)?;
+    prompt_option("Search API key", &mut options.search_api_key)?;
+    options.backend_port = prompt_parse_option("Backend port", options.backend_port)?;
+    options.frontend_port = prompt_parse_option("Frontend port", options.frontend_port)?;
+    prompt_option("Language", &mut options.language)?;
+    Ok(())
+}
+
+fn prompt_option(label: &str, value: &mut Option<String>) -> CliResult {
+    if let Some(answer) = prompt_text(label, value.as_deref())? {
+        *value = Some(answer);
+    }
+    Ok(())
+}
+
+fn prompt_parse_option<T>(label: &str, value: Option<T>) -> CliResult<Option<T>>
+where
+    T: std::str::FromStr + Copy + std::fmt::Display,
+    T::Err: std::fmt::Display,
+{
+    let default = value.as_ref().map(ToString::to_string);
+    match prompt_text(label, default.as_deref())? {
+        Some(answer) => answer
+            .parse::<T>()
+            .map(Some)
+            .map_err(|error| format!("Invalid {label}: {error}").into()),
+        None => Ok(value),
+    }
+}
+
+fn prompt_text(label: &str, default: Option<&str>) -> CliResult<Option<String>> {
+    match default.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(default) => print!("{label} [{default}]: "),
+        None => print!("{label}: "),
+    }
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(answer))
+    }
 }
 
 fn write_json_if_absent(path: &Path, value: &Value) -> CliResult {

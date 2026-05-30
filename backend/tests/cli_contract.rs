@@ -1121,6 +1121,95 @@ fn init_wizard_subcommand_creates_same_runtime_layout() {
 }
 
 #[test]
+fn init_wizard_prompts_for_runtime_settings_when_not_preseeded() {
+    let home = unique_temp_dir("init-wizard-interactive");
+    let output = socartes_cmd()
+        .args(["init", "wizard", "--home"])
+        .arg(&home)
+        .write_stdin(
+            "y\n\
+             anthropic\n\
+             https://llm.example/v1\n\
+             sk-llm-interactive\n\
+             claude-interactive\n\
+             openai\n\
+             https://embedding.example/v1\n\
+             sk-embedding-interactive\n\
+             text-embedding-interactive\n\
+             1024\n\
+             brave\n\
+             https://search.example\n\
+             sk-search-interactive\n\
+             8129\n\
+             3130\n\
+             zh\n",
+        )
+        .output()
+        .expect("socartes init wizard should execute");
+
+    assert!(
+        output.status.success(),
+        "interactive init wizard failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(
+        &stdout,
+        &[
+            "LLM binding",
+            "Embedding model",
+            "Search provider",
+            "\"initialized\": true",
+        ],
+    );
+
+    let catalog: Value = serde_json::from_str(
+        &fs::read_to_string(home.join("data/settings/catalog.json"))
+            .expect("catalog should be written"),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["binding"],
+        "anthropic"
+    );
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["base_url"],
+        "https://llm.example/v1"
+    );
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["api_key"],
+        "sk-llm-interactive"
+    );
+    assert_eq!(
+        catalog["services"]["llm"]["profiles"][0]["models"][0]["model"],
+        "claude-interactive"
+    );
+    assert_eq!(
+        catalog["services"]["embedding"]["profiles"][0]["models"][0]["model"],
+        "text-embedding-interactive"
+    );
+    assert_eq!(
+        catalog["services"]["embedding"]["profiles"][0]["models"][0]["dimension"],
+        1024
+    );
+    assert_eq!(
+        catalog["services"]["search"]["profiles"][0]["provider"],
+        "brave"
+    );
+
+    let ui: Value = serde_json::from_str(
+        &fs::read_to_string(home.join("data/settings/ui.json")).expect("ui should be written"),
+    )
+    .unwrap();
+    assert_eq!(ui["ports"]["backend"], 8129);
+    assert_eq!(ui["ports"]["frontend"], 3130);
+    assert_eq!(ui["language"], "zh");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn config_show_reads_local_runtime_settings_without_api_like_python() {
     let home = unique_temp_dir("config");
     let settings_root = home.join("data/settings");
@@ -1212,6 +1301,100 @@ fn config_show_reads_local_runtime_settings_without_api_like_python() {
     assert_eq!(value["tools"], json!(["rag", "web_search"]));
 
     let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn config_show_merges_env_model_catalog_and_main_yaml_like_python_cli() {
+    let home = unique_temp_dir("config-python-sources");
+    let user_settings = home.join("data/user/settings");
+    fs::create_dir_all(&user_settings).expect("user settings directory should be created");
+    fs::write(
+        home.join(".env"),
+        "BACKEND_PORT=9001\n\
+         FRONTEND_PORT=4001\n\
+         LLM_BINDING=openai\n\
+         LLM_MODEL=gemini-2.5-pro\n\
+         LLM_API_KEY=sk-or-test\n\
+         SEARCH_PROVIDER=brave\n\
+         SEARCH_API_KEY=\n\
+         EMBEDDING_BINDING=openai\n\
+         EMBEDDING_MODEL=text-embedding-3-large\n\
+         EMBEDDING_API_KEY=sk-embed\n\
+         EMBEDDING_DIMENSION=3072\n",
+    )
+    .expect(".env should be written");
+    fs::write(
+        user_settings.join("model_catalog.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "services": {
+                "llm": {"active_profile_id": null, "active_model_id": null, "profiles": []},
+                "embedding": {"active_profile_id": null, "active_model_id": null, "profiles": []},
+                "search": {"active_profile_id": null, "profiles": []}
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("model catalog should be written");
+    fs::write(
+        user_settings.join("main.yaml"),
+        "system:\n  language: zh\ntools:\n  rag: {}\n  web_search: {}\n",
+    )
+    .expect("main.yaml should be written");
+    fs::write(
+        user_settings.join("agents.yaml"),
+        "chat:\n  temperature: 0.99\n  max_tokens: 17\n",
+    )
+    .expect("agents.yaml should be written");
+
+    let output = socartes_cmd()
+        .env_clear()
+        .env("HOME", &home)
+        .args(["config", "show", "--home"])
+        .arg(&home)
+        .output()
+        .expect("socartes config show should execute");
+
+    let _ = fs::remove_dir_all(home);
+
+    assert!(
+        output.status.success(),
+        "config show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("sk-or-test") && !stdout.contains("sk-embed"),
+        "config output should mask secrets:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("0.99") && !stdout.contains("max_tokens"),
+        "config show should not read agents.yaml:\n{stdout}"
+    );
+    let value: Value = serde_json::from_str(&stdout).expect("config output should be JSON");
+    assert_eq!(value["ports"]["backend"], 9001);
+    assert_eq!(value["ports"]["frontend"], 4001);
+    assert_eq!(value["language"], "zh");
+    assert_eq!(value["tools"], json!(["rag", "web_search"]));
+    assert_eq!(value["llm"]["binding_hint"], "openai");
+    assert_eq!(value["llm"]["provider"], "openrouter");
+    assert_eq!(value["llm"]["provider_mode"], "gateway");
+    assert_eq!(value["llm"]["model"], "gemini-2.5-pro");
+    assert_eq!(value["llm"]["base_url"], "https://openrouter.ai/api/v1");
+    assert_eq!(value["llm"]["api_key"], "***");
+    assert_eq!(value["embedding"]["binding_hint"], "openai");
+    assert_eq!(value["embedding"]["provider"], "openai");
+    assert_eq!(value["embedding"]["model"], "text-embedding-3-large");
+    assert_eq!(value["embedding"]["dimension"], 3072);
+    assert_eq!(value["embedding"]["api_key"], "***");
+    assert_eq!(value["search"]["requested_provider"], "brave");
+    assert_eq!(value["search"]["provider"], "duckduckgo");
+    assert_eq!(value["search"]["status"], "fallback");
+    assert_eq!(
+        value["search"]["fallback_reason"],
+        "brave requires api_key, falling back to duckduckgo"
+    );
 }
 
 #[test]
