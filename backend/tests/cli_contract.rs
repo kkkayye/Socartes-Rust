@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use axum::{
     Json, Router,
+    body::to_bytes,
     extract::State,
     http::HeaderMap,
     response::IntoResponse,
@@ -9,6 +10,7 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +18,18 @@ use tokio::{net::TcpListener, sync::Mutex};
 
 fn socartes_cmd() -> Command {
     Command::cargo_bin("socartes").expect("socartes binary should build")
+}
+
+fn socartes_cli_cmd() -> Command {
+    Command::cargo_bin("socartes-cli").expect("socartes-cli binary alias should build")
+}
+
+fn deeptutor_cmd() -> Command {
+    Command::cargo_bin("deeptutor").expect("deeptutor compatibility binary should build")
+}
+
+fn deeptutor_cli_cmd() -> Command {
+    Command::cargo_bin("deeptutor-cli").expect("deeptutor-cli compatibility binary should build")
 }
 
 fn stdout_for(args: &[&str]) -> String {
@@ -133,6 +147,149 @@ async fn capture_github_copilot_validation(
     }))
 }
 
+async fn capture_session_list_uri(
+    State(captured): State<Arc<Mutex<Option<String>>>>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    *captured.lock().await = Some(
+        request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| request.uri().path().to_string()),
+    );
+    let _ = to_bytes(request.into_body(), usize::MAX).await;
+    Json(json!({
+        "sessions": [
+            {"id": "s1", "title": "First"},
+            {"id": "s2", "title": "Second"}
+        ]
+    }))
+}
+
+async fn capture_json_request(
+    State(captured): State<Arc<Mutex<Vec<Value>>>>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    let method = request.method().as_str().to_string();
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+    let payload = if body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).expect("request body should be JSON")
+    };
+    captured.lock().await.push(json!({
+        "method": method,
+        "uri": uri,
+        "body": payload
+    }));
+    Json(json!({
+        "ok": true,
+        "received": payload
+    }))
+}
+
+async fn capture_multipart_request(
+    State(captured): State<Arc<Mutex<Vec<Value>>>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    let method = request.method().as_str().to_string();
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+    let filenames = body_text
+        .split("filename=\"")
+        .skip(1)
+        .filter_map(|tail| tail.split('"').next())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    captured.lock().await.push(json!({
+        "method": method,
+        "uri": uri,
+        "content_type": content_type,
+        "filenames": filenames,
+        "body": body_text.to_string()
+    }));
+    Json(json!({
+        "ok": true,
+        "task_id": "kb_init_20260530_120000_cli"
+    }))
+}
+
+fn make_executable(path: &std::path::Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn read_pid(path: &std::path::Path) -> u32 {
+    fs::read_to_string(path)
+        .expect("pid file should exist")
+        .trim()
+        .parse()
+        .expect("pid file should contain a pid")
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn assert_process_stopped(pid: u32) {
+    for _ in 0..20 {
+        if !process_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!process_is_alive(pid), "process {pid} should be stopped");
+}
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("should bind an ephemeral port")
+        .local_addr()
+        .expect("listener should have local addr")
+        .port()
+}
+
+async fn plugins_list_response() -> Json<Value> {
+    Json(json!({
+        "tools": [{
+            "name": "rag",
+            "description": "Retrieval-Augmented Generation",
+            "schema": {"type": "object"}
+        }],
+        "capabilities": [{
+            "name": "deep_solve",
+            "description": "Multi-step reasoning",
+            "stages": ["planner", "executor", "critic"],
+            "tools_used": ["rag"],
+            "config_defaults": {}
+        }]
+    }))
+}
+
 #[test]
 fn top_level_help_exposes_python_cli_command_surface() {
     let stdout = stdout_for(&["--help"]);
@@ -156,6 +313,80 @@ fn top_level_help_exposes_python_cli_command_surface() {
             "init",
         ],
     );
+}
+
+#[test]
+fn socartes_cli_binary_alias_exposes_same_python_cli_surface() {
+    let output = socartes_cli_cmd()
+        .arg("--help")
+        .output()
+        .expect("socartes-cli alias should run");
+
+    assert!(
+        output.status.success(),
+        "socartes-cli --help failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert_contains_all(
+        &stdout,
+        &[
+            "Socartes CLI",
+            "run",
+            "start",
+            "serve",
+            "chat",
+            "book",
+            "bot",
+            "kb",
+            "notebook",
+            "memory",
+            "plugin",
+            "config",
+            "session",
+            "provider",
+            "init",
+        ],
+    );
+}
+
+#[test]
+fn deeptutor_compatibility_aliases_expose_same_cli_surface() {
+    for mut command in [deeptutor_cmd(), deeptutor_cli_cmd()] {
+        let output = command
+            .arg("--help")
+            .output()
+            .expect("deeptutor compatibility alias should run");
+
+        assert!(
+            output.status.success(),
+            "deeptutor compatibility alias --help failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+        assert_contains_all(
+            &stdout,
+            &[
+                "Socartes CLI",
+                "run",
+                "start",
+                "serve",
+                "chat",
+                "book",
+                "bot",
+                "kb",
+                "notebook",
+                "memory",
+                "plugin",
+                "config",
+                "session",
+                "provider",
+                "init",
+            ],
+        );
+    }
 }
 
 #[test]
@@ -225,7 +456,324 @@ fn grouped_help_exposes_python_subcommands() {
 #[test]
 fn start_help_keeps_python_home_option() {
     let stdout = stdout_for(&["start", "--help"]);
-    assert_contains_all(&stdout, &["--home", "--host", "--port"]);
+    assert_contains_all(
+        &stdout,
+        &[
+            "--home",
+            "--host",
+            "--port",
+            "--frontend-dir",
+            "--frontend-port",
+            "--dry-run",
+        ],
+    );
+}
+
+#[test]
+fn cli_default_ports_match_python_launcher_defaults() {
+    let top_help = stdout_for(&["--help"]);
+    assert_contains_all(&top_help, &["http://127.0.0.1:8001"]);
+
+    let serve_help = stdout_for(&["serve", "--help"]);
+    assert_contains_all(&serve_help, &["--port", "8001"]);
+
+    let home = unique_temp_dir("default-ports");
+    let output = socartes_cmd()
+        .args(["config", "show", "--home"])
+        .arg(&home)
+        .output()
+        .expect("socartes config show should execute");
+    assert!(
+        output.status.success(),
+        "config show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("config output should be JSON");
+    assert_eq!(value["ports"]["backend"], 8001);
+    assert_eq!(value["ports"]["frontend"], 3782);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn start_dry_run_plans_backend_and_frontend_like_python_launcher() {
+    let home = unique_temp_dir("start-home");
+    let frontend = unique_temp_dir("start-frontend");
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+
+    let output = socartes_cmd()
+        .args(["start", "--dry-run", "--home"])
+        .arg(&home)
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8123",
+            "--frontend-port",
+            "3123",
+            "--frontend-dir",
+        ])
+        .arg(&frontend)
+        .output()
+        .expect("socartes start dry-run should execute");
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&frontend);
+
+    assert!(
+        output.status.success(),
+        "start dry-run failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value =
+        serde_json::from_slice(&output.stdout).expect("start dry-run should print JSON");
+    assert_eq!(plan["backend"]["host"], "127.0.0.1");
+    assert_eq!(plan["backend"]["port"], 8123);
+    assert_eq!(plan["backend"]["url"], "http://127.0.0.1:8123");
+    assert_eq!(plan["backend"]["command"][1], "serve");
+    assert!(
+        plan["backend"]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("8123")),
+        "backend command should include the configured backend port: {plan}"
+    );
+    assert_eq!(plan["frontend"]["port"], 3123);
+    assert_eq!(plan["frontend"]["url"], "http://localhost:3123");
+    assert_eq!(
+        plan["frontend"]["cwd"].as_str(),
+        Some(frontend.to_string_lossy().as_ref())
+    );
+    assert_eq!(plan["frontend"]["command"][0], "npm");
+    assert_eq!(plan["frontend"]["command"][1], "run");
+    assert_eq!(plan["frontend"]["command"][2], "dev");
+    assert_eq!(
+        plan["frontend"]["env"]["NEXT_PUBLIC_API_BASE"],
+        "http://localhost:8123"
+    );
+    assert_eq!(
+        plan["state_path"].as_str(),
+        Some(
+            home.join("data/user/settings/start_web_state.json")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert_eq!(plan["state"]["version"], 1);
+    assert_eq!(plan["state"]["backend_port"], 8123);
+    assert_eq!(plan["state"]["frontend_port"], 3123);
+    assert_eq!(plan["state"]["processes"]["backend"]["pid"], Value::Null);
+    assert_eq!(plan["state"]["processes"]["backend"]["pgid"], Value::Null);
+    assert_eq!(plan["state"]["processes"]["frontend"]["pid"], Value::Null);
+    assert_eq!(plan["state"]["processes"]["frontend"]["pgid"], Value::Null);
+}
+
+#[test]
+fn start_dry_run_reads_env_file_ports_and_auth_like_python_launcher() {
+    let project = unique_temp_dir("start-project");
+    let frontend = project.join("web");
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(
+        project.join(".env"),
+        "BACKEND_PORT=8124\nFRONTEND_PORT=3124\nAUTH_ENABLED=true\n",
+    )
+    .expect(".env should be written");
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .args(["start", "--dry-run"])
+        .output()
+        .expect("socartes start dry-run should execute");
+
+    let _ = fs::remove_dir_all(&project);
+
+    assert!(
+        output.status.success(),
+        "start dry-run with .env failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value =
+        serde_json::from_slice(&output.stdout).expect("start dry-run should print JSON");
+    assert_eq!(plan["backend"]["port"], 8124);
+    assert_eq!(plan["frontend"]["port"], 3124);
+    assert_eq!(
+        plan["frontend"]["cwd"].as_str(),
+        Some(frontend.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        plan["frontend"]["env"]["NEXT_PUBLIC_API_BASE"],
+        "http://localhost:8124"
+    );
+    assert_eq!(plan["frontend"]["env"]["AUTH_ENABLED"], "true");
+    assert_eq!(plan["frontend"]["env"]["NEXT_PUBLIC_AUTH_ENABLED"], "true");
+    assert_eq!(
+        plan["state_path"].as_str(),
+        Some(
+            project
+                .join("data/user/settings/start_web_state.json")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+}
+
+#[test]
+fn start_dry_run_uses_launcher_overrides_for_cleanup_contract_tests() {
+    let project = unique_temp_dir("start-overrides");
+    let frontend = project.join("web");
+    let backend_stub = project.join("backend-stub.sh");
+    let frontend_stub = project.join("frontend-stub.sh");
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(&backend_stub, "#!/bin/sh\nsleep 1\n").expect("backend stub should be written");
+    fs::write(&frontend_stub, "#!/bin/sh\nsleep 1\n").expect("frontend stub should be written");
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .env("SOCARTES_START_BACKEND_COMMAND", &backend_stub)
+        .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
+        .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "25")
+        .env("SOCARTES_START_FRONTEND_READY_TIMEOUT_MS", "50")
+        .args(["start", "--dry-run"])
+        .output()
+        .expect("socartes start dry-run should execute");
+
+    let _ = fs::remove_dir_all(&project);
+
+    assert!(
+        output.status.success(),
+        "start dry-run with launcher overrides failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value =
+        serde_json::from_slice(&output.stdout).expect("start dry-run should print JSON");
+    assert_eq!(
+        plan["backend"]["command"],
+        json!([backend_stub.to_string_lossy()])
+    );
+    assert_eq!(
+        plan["frontend"]["command"],
+        json!([frontend_stub.to_string_lossy()])
+    );
+    assert_eq!(plan["readiness"]["backend_timeout_ms"], 25);
+    assert_eq!(plan["readiness"]["frontend_timeout_ms"], 50);
+}
+
+#[test]
+fn start_cleans_backend_and_state_when_backend_readiness_times_out() {
+    let project = unique_temp_dir("start-backend-timeout");
+    let frontend = project.join("web");
+    let backend_stub = project.join("backend-stub.sh");
+    let frontend_stub = project.join("frontend-stub.sh");
+    let backend_pid = project.join("backend.pid");
+    let state_path = project.join("data/user/settings/start_web_state.json");
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(
+        &backend_stub,
+        format!(
+            "#!/bin/sh\nexec >/dev/null 2>/dev/null\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            backend_pid.display()
+        ),
+    )
+    .expect("backend stub should be written");
+    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    make_executable(&backend_stub);
+    make_executable(&frontend_stub);
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .env("SOCARTES_START_BACKEND_COMMAND", &backend_stub)
+        .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
+        .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "25")
+        .args(["start"])
+        .output()
+        .expect("socartes start should execute");
+
+    let pid = read_pid(&backend_pid);
+    assert!(
+        !output.status.success(),
+        "backend readiness timeout should fail:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_process_stopped(pid);
+    assert!(
+        !state_path.exists(),
+        "state file should be removed on backend readiness failure"
+    );
+
+    let _ = fs::remove_dir_all(project);
+}
+
+#[test]
+fn start_cleans_started_processes_when_frontend_readiness_times_out() {
+    let project = unique_temp_dir("start-frontend-timeout");
+    let frontend = project.join("web");
+    let frontend_stub = project.join("frontend-stub.sh");
+    let backend_pid = project.join("backend.pid");
+    let frontend_pid = project.join("frontend.pid");
+    let state_path = project.join("data/user/settings/start_web_state.json");
+    let backend_port = free_tcp_port();
+    let frontend_port = free_tcp_port();
+    let backend_port_arg = backend_port.to_string();
+    let frontend_port_arg = frontend_port.to_string();
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(
+        &frontend_stub,
+        format!(
+            "#!/bin/sh\nexec >/dev/null 2>/dev/null\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            frontend_pid.display()
+        ),
+    )
+    .expect("frontend stub should be written");
+    make_executable(&frontend_stub);
+
+    let backend_code = format!(
+        "import http.server, os\n\
+         from pathlib import Path\n\
+         Path(r'{pid_path}').write_text(str(os.getpid()))\n\
+         server = http.server.ThreadingHTTPServer(('127.0.0.1', int(os.environ['BACKEND_PORT'])), http.server.SimpleHTTPRequestHandler)\n\
+         server.serve_forever()\n",
+        pid_path = backend_pid.display()
+    );
+    let backend_command = json!(["python3", "-c", backend_code]).to_string();
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .env("SOCARTES_START_BACKEND_COMMAND", backend_command)
+        .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
+        .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "2000")
+        .env("SOCARTES_START_FRONTEND_READY_TIMEOUT_MS", "25")
+        .args([
+            "start",
+            "--port",
+            &backend_port_arg,
+            "--frontend-port",
+            &frontend_port_arg,
+        ])
+        .output()
+        .expect("socartes start should execute");
+
+    let backend_pid = read_pid(&backend_pid);
+    let frontend_pid = read_pid(&frontend_pid);
+    assert!(
+        !output.status.success(),
+        "frontend readiness timeout should fail:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_process_stopped(frontend_pid);
+    assert_process_stopped(backend_pid);
+    assert!(
+        !state_path.exists(),
+        "state file should be removed on frontend readiness failure"
+    );
+
+    let _ = fs::remove_dir_all(project);
 }
 
 #[test]
@@ -249,6 +797,96 @@ fn provider_login_rejects_unknown_provider_like_python() {
             "openai-codex",
             "github-copilot",
         ],
+    );
+}
+
+#[test]
+fn provider_login_openai_codex_reads_codex_auth_file_like_python_oauth_storage() {
+    let codex_home = unique_temp_dir("codex-auth");
+    fs::create_dir_all(&codex_home).expect("codex home should be created");
+    fs::write(
+        codex_home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "codex-access-token",
+                "refresh_token": "codex-refresh-token"
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("codex auth file should be written");
+
+    let output = socartes_cmd()
+        .env_remove("SOCARTES_OPENAI_CODEX_ACCESS_TOKEN")
+        .env_remove("OPENAI_CODEX_ACCESS_TOKEN")
+        .env("CODEX_HOME", &codex_home)
+        .args(["provider", "login", "openai-codex"])
+        .output()
+        .expect("socartes provider login should execute");
+
+    let _ = fs::remove_dir_all(codex_home);
+
+    assert!(
+        output.status.success(),
+        "openai-codex auth file validation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(&stdout, &["OpenAI Codex OAuth authentication succeeded."]);
+    assert!(
+        !stdout.contains("codex-access-token") && !stdout.contains("codex-refresh-token"),
+        "provider login must not print OAuth token material"
+    );
+}
+
+#[test]
+fn provider_login_openai_codex_invokes_helper_when_token_storage_is_empty() {
+    let codex_home = unique_temp_dir("codex-auth-empty");
+    let helper_dir = unique_temp_dir("codex-helper");
+    fs::create_dir_all(&codex_home).expect("codex home should be created");
+    fs::create_dir_all(&helper_dir).expect("helper dir should be created");
+    let marker = helper_dir.join("called");
+    let helper = helper_dir.join("codex-oauth-helper.sh");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .expect("helper script should be written");
+    let mut permissions = fs::metadata(&helper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&helper, permissions).unwrap();
+
+    let output = socartes_cmd()
+        .env_remove("SOCARTES_OPENAI_CODEX_ACCESS_TOKEN")
+        .env_remove("OPENAI_CODEX_ACCESS_TOKEN")
+        .env("CODEX_HOME", &codex_home)
+        .env("SOCARTES_OPENAI_CODEX_HELPER", &helper)
+        .args(["provider", "login", "openai-codex"])
+        .output()
+        .expect("socartes provider login should execute");
+
+    let marker_exists = marker.is_file();
+    let _ = fs::remove_dir_all(codex_home);
+    let _ = fs::remove_dir_all(helper_dir);
+
+    assert!(
+        output.status.success(),
+        "openai-codex helper fallback failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker_exists,
+        "helper should be invoked when token storage is empty"
+    );
+    assert_contains_all(
+        &String::from_utf8(output.stdout).unwrap(),
+        &["OpenAI Codex OAuth authentication succeeded."],
     );
 }
 
@@ -345,6 +983,45 @@ fn init_top_level_wizard_creates_runtime_layout_and_settings() {
         "ui.json should be written"
     );
 
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn init_wizard_subcommand_creates_same_runtime_layout() {
+    let home = unique_temp_dir("init-wizard");
+    let output = socartes_cmd()
+        .args(["init", "wizard", "--yes", "--cli", "--home"])
+        .arg(&home)
+        .args([
+            "--language",
+            "zh",
+            "--backend-port",
+            "8125",
+            "--frontend-port",
+            "3125",
+        ])
+        .output()
+        .expect("socartes init wizard should execute");
+
+    assert!(
+        output.status.success(),
+        "socartes init wizard failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("init wizard output should be JSON");
+    assert_eq!(value["initialized"], true);
+    assert_eq!(value["cli_only"], true);
+    let ui: Value = serde_json::from_slice(
+        &fs::read(home.join("data/settings/ui.json")).expect("ui settings should exist"),
+    )
+    .expect("ui settings should be JSON");
+    assert_eq!(ui["language"], "zh");
+    assert_eq!(ui["ports"]["backend"], 8125);
+    assert_eq!(ui["ports"]["frontend"], 3125);
+    assert!(home.join("data/user/workspace/notebook").is_dir());
+    assert!(home.join("data/memory").is_dir());
     let _ = fs::remove_dir_all(home);
 }
 
@@ -793,5 +1470,572 @@ async fn chat_show_expands_recent_tool_result_like_python_repl() {
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("Unknown chat command"),
         "/show must be a first-class Python-compatible chat command"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_state_mutation_commands_echo_state_and_affect_next_turn_like_python() {
+    let captured_turns = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/plugins/capabilities/deep_solve/execute-stream",
+            post(capture_new_session_stream),
+        )
+        .with_state(captured_turns.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["chat"])
+        .write_stdin(
+            "/tool on rag\n/cap deep_solve\n/kb course-ai\n/history add session-old\n/notebook add nb1:r1\n/config set temperature=0\nsolve this\n/quit\n",
+        )
+        .output()
+        .expect("socartes chat should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "socartes chat failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(
+        &stdout,
+        &[
+            "\"capability\": \"deep_solve\"",
+            "\"rag\"",
+            "\"course-ai\"",
+            "\"history_references\"",
+            "\"session-old\"",
+            "\"notebook_id\": \"nb1\"",
+            "\"temperature\": 0",
+            "first answer",
+        ],
+    );
+    let turns = captured_turns.lock().await;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["tools"], json!(["rag"]));
+    assert_eq!(turns[0]["knowledge_bases"], json!(["course-ai"]));
+    assert_eq!(turns[0]["history_references"], json!(["session-old"]));
+    assert_eq!(
+        turns[0]["notebook_references"],
+        json!([{"notebook_id":"nb1","record_ids":["r1"]}])
+    );
+    assert_eq!(turns[0]["config"]["temperature"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_passes_limit_to_api_like_python_cli() {
+    let captured = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/api/v1/sessions", get(capture_session_list_uri))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["session", "list", "--limit", "1", "--format", "json"])
+        .output()
+        .expect("socartes session list should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "session list failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        captured.lock().await.as_deref(),
+        Some("/api/v1/sessions?limit=1")
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout)
+        .expect("session list --format json should print JSON");
+    assert_eq!(stdout["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_open_enters_chat_repl_with_existing_preferences_like_python() {
+    let app = Router::new().route(
+        "/api/v1/sessions/session-existing",
+        get(existing_cli_session),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["session", "open", "session-existing"])
+        .write_stdin("/refs\n/quit\n")
+        .output()
+        .expect("socartes session open should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "session open failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(
+        &stdout,
+        &[
+            "session-existing",
+            "deep_solve",
+            "rag",
+            "web_search",
+            "course-ai",
+            "history-1",
+            "nb1",
+            "r1",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_cli_commands_call_python_compatible_api_routes() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/api/v1/tutorbot", post(capture_json_request))
+        .route(
+            "/api/v1/book/books/book-1/health",
+            get(capture_json_request),
+        )
+        .route("/api/v1/memory/clear", post(capture_json_request))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let commands = [
+        vec![
+            "bot",
+            "create",
+            "exam-bot",
+            "--name",
+            "Exam Bot",
+            "--persona",
+            "Socratic tutor",
+            "--model",
+            "gpt-test",
+        ],
+        vec!["book", "health", "book-1"],
+        vec!["memory", "clear", "summary", "--force"],
+    ];
+    for args in commands {
+        let output = socartes_cmd()
+            .env("SOCARTES_API_URL", format!("http://{address}"))
+            .args(args)
+            .output()
+            .expect("socartes resource command should execute");
+        assert!(
+            output.status.success(),
+            "resource command failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    server.abort();
+
+    let calls = captured.lock().await;
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(calls[0]["uri"], "/api/v1/tutorbot");
+    assert_eq!(calls[0]["body"]["bot_id"], "exam-bot");
+    assert_eq!(calls[0]["body"]["name"], "Exam Bot");
+    assert_eq!(calls[0]["body"]["persona"], "Socratic tutor");
+    assert_eq!(calls[0]["body"]["model"], "gpt-test");
+    assert_eq!(calls[1]["method"], "GET");
+    assert_eq!(calls[1]["uri"], "/api/v1/book/books/book-1/health");
+    assert_eq!(calls[2]["method"], "POST");
+    assert_eq!(calls[2]["uri"], "/api/v1/memory/clear");
+    assert_eq!(calls[2]["body"], json!({"file": "summary"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kb_search_posts_rag_tool_params_like_python_cli() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/plugins/tools/rag/execute",
+            post(capture_json_request),
+        )
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args([
+            "kb",
+            "search",
+            "course-ai",
+            "What does the hidden plot event mean?",
+            "--mode",
+            "hybrid",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("socartes kb search should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "kb search failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = captured.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(calls[0]["uri"], "/api/v1/plugins/tools/rag/execute");
+    assert_eq!(
+        calls[0]["body"],
+        json!({
+            "params": {
+                "query": "What does the hidden plot event mean?",
+                "kb_name": "course-ai",
+                "mode": "hybrid"
+            }
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kb_create_docs_dir_uploads_only_python_supported_file_types() {
+    let docs_dir = unique_temp_dir("kb-docs-dir");
+    fs::create_dir_all(docs_dir.join("nested")).expect("docs directory should be created");
+    fs::write(docs_dir.join("lesson.md"), "# Lesson").expect("markdown should be written");
+    fs::write(docs_dir.join("paper.PDF"), "%PDF-1.4").expect("pdf should be written");
+    fs::write(docs_dir.join("nested").join("notes.txt"), "notes").expect("text should be written");
+    fs::write(docs_dir.join("image.png"), [0_u8, 1, 2, 3]).expect("png should be written");
+    fs::write(docs_dir.join("archive.bin"), [4_u8, 5, 6]).expect("bin should be written");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/api/v1/knowledge/create", post(capture_multipart_request))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["kb", "create", "course-ai", "--docs-dir"])
+        .arg(&docs_dir)
+        .output()
+        .expect("socartes kb create should execute");
+    server.abort();
+    let _ = fs::remove_dir_all(docs_dir);
+
+    assert!(
+        output.status.success(),
+        "kb create failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = captured.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(calls[0]["uri"], "/api/v1/knowledge/create");
+    let filenames = calls[0]["filenames"]
+        .as_array()
+        .expect("filenames should be captured")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(filenames, vec!["lesson.md", "notes.txt", "paper.PDF"]);
+    assert!(
+        calls[0]["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("course-ai")
+    );
+    assert!(!filenames.contains(&"image.png"));
+    assert!(!filenames.contains(&"archive.bin"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kb_add_docs_dir_posts_upload_endpoint_and_filters_supported_files() {
+    let docs_dir = unique_temp_dir("kb-add-docs-dir");
+    fs::create_dir_all(docs_dir.join("nested")).expect("docs directory should be created");
+    fs::write(docs_dir.join("append.md"), "# Appendix").expect("markdown should be written");
+    fs::write(docs_dir.join("nested").join("append.txt"), "append")
+        .expect("text should be written");
+    fs::write(docs_dir.join("photo.jpg"), [0_u8, 1, 2]).expect("jpg should be written");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/knowledge/course-ai/upload",
+            post(capture_multipart_request),
+        )
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["kb", "add", "course-ai", "--docs-dir"])
+        .arg(&docs_dir)
+        .output()
+        .expect("socartes kb add should execute");
+    server.abort();
+    let _ = fs::remove_dir_all(docs_dir);
+
+    assert!(
+        output.status.success(),
+        "kb add failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = captured.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(calls[0]["uri"], "/api/v1/knowledge/course-ai/upload");
+    let filenames = calls[0]["filenames"]
+        .as_array()
+        .expect("filenames should be captured")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(filenames, vec!["append.md", "append.txt"]);
+    assert!(!filenames.contains(&"photo.jpg"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notebook_add_md_posts_markdown_record_payload_like_python_cli() {
+    let markdown = unique_temp_dir("notebook-md").with_extension("md");
+    fs::write(&markdown, "# Lesson\n\nBody from markdown.").expect("markdown should be written");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/api/v1/notebook/add_record", post(capture_json_request))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["notebook", "add-md", "nb1"])
+        .arg(&markdown)
+        .args(["--title", "Imported Lesson", "--type", "course_note"])
+        .output()
+        .expect("socartes notebook add-md should execute");
+    server.abort();
+    let _ = fs::remove_file(markdown);
+
+    assert!(
+        output.status.success(),
+        "notebook add-md failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = captured.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["uri"], "/api/v1/notebook/add_record");
+    assert_eq!(calls[0]["body"]["notebook_ids"], json!(["nb1"]));
+    assert_eq!(calls[0]["body"]["record_type"], "course_note");
+    assert_eq!(calls[0]["body"]["title"], "Imported Lesson");
+    assert_eq!(
+        calls[0]["body"]["output"],
+        "# Lesson\n\nBody from markdown."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remaining_resource_cli_commands_call_python_compatible_api_routes() {
+    let markdown = unique_temp_dir("notebook-replace").with_extension("md");
+    fs::write(&markdown, "Replacement markdown body.").expect("markdown should be written");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback(capture_json_request)
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let api_url = format!("http://{address}");
+
+    let run = |args: &[&str]| {
+        let output = socartes_cmd()
+            .env("SOCARTES_API_URL", &api_url)
+            .args(args)
+            .output()
+            .expect("socartes resource command should execute");
+        assert!(
+            output.status.success(),
+            "resource command {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    for args in [
+        vec!["book", "list", "--format", "json"],
+        vec!["book", "refresh-fingerprints", "book-1"],
+        vec!["bot", "list", "--format", "json"],
+        vec!["bot", "start", "exam-bot"],
+        vec!["bot", "stop", "exam-bot"],
+        vec!["kb", "list", "--format", "json"],
+        vec!["kb", "info", "course-ai"],
+        vec!["kb", "set-default", "course-ai"],
+        vec!["kb", "delete", "course-ai", "--force"],
+        vec!["notebook", "list", "--format", "json"],
+        vec![
+            "notebook",
+            "create",
+            "Lecture Notes",
+            "--description",
+            "Imported",
+        ],
+        vec!["notebook", "show", "nb1", "--format", "json"],
+        vec!["notebook", "remove-record", "nb1", "rec1"],
+        vec!["memory", "show", "all", "--format", "json"],
+        vec!["plugin", "list", "--format", "json"],
+        vec!["session", "show", "s1", "--format", "json"],
+        vec!["session", "delete", "s1"],
+        vec!["session", "rename", "s1", "--title", "New title"],
+        vec!["config", "show", "--api"],
+    ] {
+        run(&args);
+    }
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", &api_url)
+        .args(["notebook", "replace-md", "nb1", "rec1"])
+        .arg(&markdown)
+        .output()
+        .expect("socartes notebook replace-md should execute");
+    server.abort();
+    let _ = fs::remove_file(markdown);
+
+    assert!(
+        output.status.success(),
+        "notebook replace-md failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = captured.lock().await;
+    let seen = calls
+        .iter()
+        .map(|call| {
+            format!(
+                "{} {}",
+                call["method"].as_str().unwrap_or(""),
+                call["uri"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seen,
+        vec![
+            "GET /api/v1/book/books",
+            "POST /api/v1/book/books/book-1/refresh-fingerprints",
+            "GET /api/v1/tutorbot",
+            "POST /api/v1/tutorbot",
+            "DELETE /api/v1/tutorbot/exam-bot",
+            "GET /api/v1/knowledge/list",
+            "GET /api/v1/knowledge/course-ai",
+            "PUT /api/v1/knowledge/default/course-ai",
+            "DELETE /api/v1/knowledge/course-ai",
+            "GET /api/v1/notebook/list",
+            "POST /api/v1/notebook/create",
+            "GET /api/v1/notebook/nb1",
+            "DELETE /api/v1/notebook/nb1/records/rec1",
+            "GET /api/v1/memory",
+            "GET /api/v1/plugins/list",
+            "GET /api/v1/sessions/s1",
+            "DELETE /api/v1/sessions/s1",
+            "PATCH /api/v1/sessions/s1",
+            "GET /api/v1/settings",
+            "PUT /api/v1/notebook/nb1/records/rec1",
+        ]
+    );
+    assert_eq!(calls[3]["body"], json!({"bot_id": "exam-bot"}));
+    assert_eq!(
+        calls[10]["body"],
+        json!({"name": "Lecture Notes", "description": "Imported"})
+    );
+    assert_eq!(calls[17]["body"], json!({"title": "New title"}));
+    assert_eq!(
+        calls[19]["body"],
+        json!({"output": "Replacement markdown body."})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_info_reads_tool_and_capability_entries_like_python_cli() {
+    let app = Router::new().route("/api/v1/plugins/list", get(plugins_list_response));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let tool_output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["plugin", "info", "rag"])
+        .output()
+        .expect("socartes plugin info rag should execute");
+    let capability_output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["plugin", "info", "deep_solve"])
+        .output()
+        .expect("socartes plugin info deep_solve should execute");
+    server.abort();
+
+    assert!(
+        tool_output.status.success(),
+        "plugin info rag failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&tool_output.stdout),
+        String::from_utf8_lossy(&tool_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(tool_output.stdout).unwrap(),
+        &["\"name\": \"rag\"", "Retrieval-Augmented Generation"],
+    );
+    assert!(
+        capability_output.status.success(),
+        "plugin info deep_solve failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&capability_output.stdout),
+        String::from_utf8_lossy(&capability_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(capability_output.stdout).unwrap(),
+        &[
+            "\"name\": \"deep_solve\"",
+            "Multi-step reasoning",
+            "planner",
+        ],
     );
 }

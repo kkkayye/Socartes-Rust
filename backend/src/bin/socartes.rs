@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -26,7 +26,7 @@ struct Cli {
         long,
         global = true,
         env = "SOCARTES_API_URL",
-        default_value = "http://127.0.0.1:8000"
+        default_value = "http://127.0.0.1:8001"
     )]
     api_url: String,
 
@@ -103,8 +103,14 @@ struct RunArgs {
 struct StartArgs {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
-    #[arg(long, default_value_t = 8000)]
-    port: u16,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    frontend_port: Option<u16>,
+    #[arg(long, env = "SOCARTES_FRONTEND_DIR")]
+    frontend_dir: Option<PathBuf>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    dry_run: bool,
     #[arg(long)]
     home: Option<PathBuf>,
 }
@@ -113,7 +119,7 @@ struct StartArgs {
 struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = 8001)]
     port: u16,
     #[arg(long, action = ArgAction::SetTrue)]
     reload: bool,
@@ -493,7 +499,7 @@ async fn main() -> CliResult {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => serve(args.host, args.port, args.reload, args.home).await,
-        Command::Start(args) => serve(args.host, args.port, false, args.home).await,
+        Command::Start(args) => start_launcher(args).await,
         command => {
             let api = ApiClient::new(&cli.api_url)?;
             dispatch_api_command(api, command).await
@@ -518,6 +524,618 @@ async fn dispatch_api_command(api: ApiClient, command: Command) -> CliResult {
         Command::Serve(_) | Command::Start(_) => {
             unreachable!("serve/start handled before API dispatch")
         }
+    }
+}
+
+async fn start_launcher(args: StartArgs) -> CliResult {
+    let plan = build_start_plan(&args)?;
+    if args.dry_run {
+        return print_json(&plan);
+    }
+
+    let frontend_dir = PathBuf::from(plan["frontend"]["cwd"].as_str().unwrap_or_default());
+    let api_base = plan["frontend"]["env"]["NEXT_PUBLIC_API_BASE"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let auth_enabled = plan["frontend"]["env"]["NEXT_PUBLIC_AUTH_ENABLED"]
+        .as_str()
+        .unwrap_or("false")
+        .to_string();
+    write_frontend_env_local(&frontend_dir, &api_base, &auth_enabled)?;
+
+    let backend_command = string_array(&plan["backend"]["command"]);
+    let frontend_command = string_array(&plan["frontend"]["command"]);
+    if backend_command.is_empty() || frontend_command.is_empty() {
+        return Err("Invalid start plan: missing backend or frontend command.".into());
+    }
+    ensure_command_available(&backend_command[0])?;
+    ensure_command_available(&frontend_command[0])?;
+
+    eprintln!(
+        "Starting Socartes backend at {}",
+        plan["backend"]["url"].as_str().unwrap_or("")
+    );
+    let mut backend = spawn_command(
+        &backend_command,
+        env_pairs(&[
+            ("BACKEND_PORT", plan["backend"]["port"].to_string()),
+            ("FRONTEND_PORT", plan["frontend"]["port"].to_string()),
+        ]),
+        None,
+    )?;
+    if let Err(error) = write_start_state(&plan, Some(&backend), None) {
+        cleanup_started_processes(&plan, Some(&mut backend), None);
+        return Err(error);
+    }
+    if let Err(error) = wait_for_http(
+        plan["backend"]["url"].as_str().unwrap_or_default(),
+        "backend",
+        &mut backend,
+        readiness_timeout(&plan, "backend_timeout_ms", Duration::from_secs(60)),
+    )
+    .await
+    {
+        cleanup_started_processes(&plan, Some(&mut backend), None);
+        return Err(error);
+    }
+
+    eprintln!(
+        "Starting Socartes frontend at {}",
+        plan["frontend"]["url"].as_str().unwrap_or("")
+    );
+    let mut frontend = match spawn_command(
+        &frontend_command,
+        env_pairs(&[
+            ("BACKEND_PORT", plan["backend"]["port"].to_string()),
+            ("FRONTEND_PORT", plan["frontend"]["port"].to_string()),
+            ("NEXT_PUBLIC_API_BASE", api_base.clone()),
+            (
+                "AUTH_ENABLED",
+                plan["frontend"]["env"]["AUTH_ENABLED"]
+                    .as_str()
+                    .unwrap_or("false")
+                    .to_string(),
+            ),
+            (
+                "NEXT_PUBLIC_AUTH_ENABLED",
+                plan["frontend"]["env"]["NEXT_PUBLIC_AUTH_ENABLED"]
+                    .as_str()
+                    .unwrap_or("false")
+                    .to_string(),
+            ),
+        ]),
+        Some(&frontend_dir),
+    ) {
+        Ok(frontend) => frontend,
+        Err(error) => {
+            cleanup_started_processes(&plan, Some(&mut backend), None);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_start_state(&plan, Some(&backend), Some(&frontend)) {
+        cleanup_started_processes(&plan, Some(&mut backend), Some(&mut frontend));
+        return Err(error);
+    }
+    if let Err(error) = wait_for_http(
+        plan["frontend"]["url"].as_str().unwrap_or_default(),
+        "frontend",
+        &mut frontend,
+        readiness_timeout(&plan, "frontend_timeout_ms", Duration::from_secs(120)),
+    )
+    .await
+    {
+        cleanup_started_processes(&plan, Some(&mut backend), Some(&mut frontend));
+        return Err(error);
+    }
+
+    println!(
+        "Open {}",
+        plan["frontend"]["url"].as_str().unwrap_or_default()
+    );
+    let exit_code = monitor_started_processes(&mut backend, &mut frontend);
+    remove_start_state(&plan);
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!("Socartes start exited with code {exit_code}.").into())
+    }
+}
+
+fn build_start_plan(args: &StartArgs) -> CliResult<Value> {
+    let frontend_dir = resolve_frontend_dir(args.frontend_dir.as_deref())?;
+    let settings = resolve_start_settings(args, &frontend_dir)?;
+    let current_exe = env::current_exe()?;
+    let mut backend_command = vec![
+        current_exe.display().to_string(),
+        "serve".to_string(),
+        "--host".to_string(),
+        args.host.clone(),
+        "--port".to_string(),
+        settings.backend_port.to_string(),
+    ];
+    if let Some(home) = &args.home {
+        backend_command.push("--home".to_string());
+        backend_command.push(home.display().to_string());
+    }
+    let backend_command =
+        command_override("SOCARTES_START_BACKEND_COMMAND").unwrap_or(backend_command);
+    let frontend_command = vec![
+        "npm".to_string(),
+        "run".to_string(),
+        "dev".to_string(),
+        "--".to_string(),
+        "--port".to_string(),
+        settings.frontend_port.to_string(),
+    ];
+    let frontend_command =
+        command_override("SOCARTES_START_FRONTEND_COMMAND").unwrap_or(frontend_command);
+    let state_path = start_data_root_from_home(args.home.as_deref())?
+        .join("user")
+        .join("settings")
+        .join("start_web_state.json");
+    let backend_url = format!(
+        "http://{}:{}",
+        normalized_host_for_url(&args.host),
+        settings.backend_port
+    );
+    let api_base = format!("http://localhost:{}", settings.backend_port);
+    let auth_enabled = if settings.auth_enabled {
+        "true"
+    } else {
+        "false"
+    };
+    Ok(json!({
+        "backend": {
+            "host": args.host,
+            "port": settings.backend_port,
+            "url": backend_url,
+            "command": backend_command
+        },
+        "frontend": {
+            "port": settings.frontend_port,
+            "url": format!("http://localhost:{}", settings.frontend_port),
+            "cwd": frontend_dir.display().to_string(),
+            "command": frontend_command,
+            "env": {
+                "BACKEND_PORT": settings.backend_port.to_string(),
+                "FRONTEND_PORT": settings.frontend_port.to_string(),
+                "NEXT_PUBLIC_API_BASE": api_base,
+                "AUTH_ENABLED": auth_enabled,
+                "NEXT_PUBLIC_AUTH_ENABLED": auth_enabled
+            }
+        },
+        "state_path": state_path.display().to_string(),
+        "state": start_state_template(settings.backend_port, settings.frontend_port),
+        "readiness": {
+            "backend_timeout_ms": env_u64("SOCARTES_START_BACKEND_READY_TIMEOUT_MS").unwrap_or(60_000),
+            "frontend_timeout_ms": env_u64("SOCARTES_START_FRONTEND_READY_TIMEOUT_MS").unwrap_or(120_000)
+        }
+    }))
+}
+
+fn command_override(name: &str) -> Option<Vec<String>> {
+    let raw = env::var(name).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('[')
+        && let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed)
+    {
+        let command = items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .collect::<Vec<_>>();
+        return (!command.is_empty()).then_some(command);
+    }
+    Some(vec![trimmed.to_string()])
+}
+
+struct StartSettings {
+    backend_port: u16,
+    frontend_port: u16,
+    auth_enabled: bool,
+}
+
+fn resolve_start_settings(args: &StartArgs, frontend_dir: &Path) -> CliResult<StartSettings> {
+    let project_root = start_project_root(frontend_dir)?;
+    let dotenv = read_env_file(&project_root.join(".env"))?;
+    let backend_port = args
+        .port
+        .or_else(|| env_u16_from_map(&dotenv, "BACKEND_PORT"))
+        .or_else(|| env_u16("BACKEND_PORT"))
+        .unwrap_or(8001);
+    let frontend_port = args
+        .frontend_port
+        .or_else(|| env_u16_from_map(&dotenv, "FRONTEND_PORT"))
+        .or_else(|| env_u16("FRONTEND_PORT"))
+        .unwrap_or(3782);
+    let auth_enabled = env_string_from_map(&dotenv, "NEXT_PUBLIC_AUTH_ENABLED")
+        .or_else(|| env_string_from_map(&dotenv, "AUTH_ENABLED"))
+        .or_else(|| env::var("NEXT_PUBLIC_AUTH_ENABLED").ok())
+        .or_else(|| env::var("AUTH_ENABLED").ok())
+        .map(|value| truthy_env(&value))
+        .unwrap_or(false);
+    Ok(StartSettings {
+        backend_port,
+        frontend_port,
+        auth_enabled,
+    })
+}
+
+fn start_project_root(frontend_dir: &Path) -> CliResult<PathBuf> {
+    if frontend_dir.file_name().and_then(|value| value.to_str()) == Some("web")
+        && let Some(parent) = frontend_dir.parent()
+    {
+        return Ok(parent.to_path_buf());
+    }
+    Ok(env::current_dir()?)
+}
+
+fn start_data_root_from_home(home: Option<&Path>) -> CliResult<PathBuf> {
+    match home {
+        Some(home) => Ok(home.join("data")),
+        None => env::var("SOCARTES_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|_| env::current_dir().map(|cwd| cwd.join("data")))
+            .map_err(Into::into),
+    }
+}
+
+fn read_env_file(path: &Path) -> CliResult<BTreeMap<String, String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut values = BTreeMap::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.insert(
+            key.trim().to_string(),
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        );
+    }
+    Ok(values)
+}
+
+fn env_string_from_map(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    map.get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_u16_from_map(map: &BTreeMap<String, String>, key: &str) -> Option<u16> {
+    env_string_from_map(map, key).and_then(|value| value.parse::<u16>().ok())
+}
+
+fn env_u16(key: &str) -> Option<u16> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn normalized_host_for_url(host: &str) -> String {
+    match host {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn resolve_frontend_dir(explicit: Option<&Path>) -> CliResult<PathBuf> {
+    let candidates = explicit
+        .map(|path| vec![path.to_path_buf()])
+        .unwrap_or_else(default_frontend_dir_candidates);
+    candidates
+        .into_iter()
+        .find(|path| path.join("package.json").is_file() || path.is_dir())
+        .ok_or_else(|| {
+            "Frontend directory not found. Pass --frontend-dir or set SOCARTES_FRONTEND_DIR.".into()
+        })
+}
+
+fn default_frontend_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("web"));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join("web"));
+            candidates.push(parent.join("DeepTutor").join("web"));
+        }
+    }
+    candidates.push(PathBuf::from("/home/coobabm/DeepTutor/web"));
+    candidates.push(PathBuf::from("/home/coobabm/.gitnexus/repos/DeepTutor/web"));
+    candidates
+}
+
+fn write_frontend_env_local(frontend_dir: &Path, api_base: &str, auth_enabled: &str) -> CliResult {
+    fs::create_dir_all(frontend_dir)?;
+    fs::write(
+        frontend_dir.join(".env.local"),
+        format!(
+            "# Auto-generated by socartes start - do not edit manually\nNEXT_PUBLIC_API_BASE={api_base}\nNEXT_PUBLIC_AUTH_ENABLED={auth_enabled}\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn ensure_command_available(command: &str) -> CliResult {
+    if command.contains('/') || command.contains('\\') {
+        if Path::new(command).is_file() {
+            return Ok(());
+        }
+        return Err(format!("Command not found: {command}").into());
+    }
+    let Some(path) = env::var_os("PATH") else {
+        return Err(format!("Command not found on PATH: {command}").into());
+    };
+    for dir in env::split_paths(&path) {
+        if dir.join(command).is_file() {
+            return Ok(());
+        }
+    }
+    Err(format!("Command not found on PATH: {command}").into())
+}
+
+fn env_pairs(pairs: &[(&str, String)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect()
+}
+
+fn spawn_command(
+    command: &[String],
+    envs: Vec<(String, String)>,
+    cwd: Option<&Path>,
+) -> CliResult<std::process::Child> {
+    let mut process = std::process::Command::new(&command[0]);
+    process.args(&command[1..]).envs(envs);
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    configure_child_process_group(&mut process);
+    Ok(process
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?)
+}
+
+fn readiness_timeout(plan: &Value, key: &str, fallback: Duration) -> Duration {
+    plan["readiness"][key]
+        .as_u64()
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(process: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    process.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_process: &mut std::process::Command) {}
+
+async fn wait_for_http(
+    url: &str,
+    name: &str,
+    process: &mut std::process::Child,
+    timeout: Duration,
+) -> CliResult {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = process.try_wait()? {
+            return Err(format!("{name} exited before readiness: {status}").into());
+        }
+        match client.get(url).send().await {
+            Ok(response) if response.status().as_u16() < 500 => return Ok(()),
+            Ok(_) | Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(format!("{name} did not become ready at {url} within {timeout:?}.").into())
+}
+
+fn write_start_state(
+    plan: &Value,
+    backend: Option<&std::process::Child>,
+    frontend: Option<&std::process::Child>,
+) -> CliResult {
+    let path = PathBuf::from(plan["state_path"].as_str().unwrap_or_default());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(
+        &temp_path,
+        serde_json::to_vec_pretty(&start_state_value(
+            plan["backend"]["port"].as_u64().unwrap_or_default(),
+            plan["frontend"]["port"].as_u64().unwrap_or_default(),
+            backend,
+            frontend,
+        ))?,
+    )?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn start_state_template(backend_port: u16, frontend_port: u16) -> Value {
+    json!({
+        "version": 1,
+        "created_at": Value::Null,
+        "backend_port": backend_port,
+        "frontend_port": frontend_port,
+        "processes": {
+            "backend": {"pid": Value::Null, "pgid": Value::Null},
+            "frontend": {"pid": Value::Null, "pgid": Value::Null}
+        }
+    })
+}
+
+fn start_state_value(
+    backend_port: u64,
+    frontend_port: u64,
+    backend: Option<&std::process::Child>,
+    frontend: Option<&std::process::Child>,
+) -> Value {
+    json!({
+        "version": 1,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "backend_port": backend_port,
+        "frontend_port": frontend_port,
+        "processes": {
+            "backend": child_process_state(backend),
+            "frontend": child_process_state(frontend)
+        }
+    })
+}
+
+fn child_process_state(child: Option<&std::process::Child>) -> Value {
+    match child {
+        Some(child) => {
+            let pid = child.id();
+            json!({
+                "pid": pid,
+                "pgid": child_process_group_id(pid)
+            })
+        }
+        None => json!({"pid": Value::Null, "pgid": Value::Null}),
+    }
+}
+
+#[cfg(unix)]
+fn child_process_group_id(pid: u32) -> Value {
+    json!(pid)
+}
+
+#[cfg(not(unix))]
+fn child_process_group_id(_pid: u32) -> Value {
+    Value::Null
+}
+
+fn remove_start_state(plan: &Value) {
+    if let Some(path) = plan["state_path"].as_str() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn cleanup_started_processes(
+    plan: &Value,
+    backend: Option<&mut std::process::Child>,
+    frontend: Option<&mut std::process::Child>,
+) {
+    if let Some(frontend) = frontend {
+        terminate_child_tree(frontend, Duration::from_secs(5));
+    }
+    if let Some(backend) = backend {
+        terminate_child_tree(backend, Duration::from_secs(5));
+    }
+    remove_start_state(plan);
+}
+
+fn terminate_child_tree(child: &mut std::process::Child, grace: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        let _ = child.wait();
+        return;
+    }
+    signal_child_tree(child, "TERM");
+    if wait_child_until(child, grace) {
+        return;
+    }
+    signal_child_tree(child, "KILL");
+    let _ = child.wait();
+}
+
+fn wait_child_until(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let _ = child.wait();
+                return true;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_child_tree(child: &mut std::process::Child, signal: &str) {
+    let pgid = child.id().to_string();
+    let status = std::process::Command::new("kill")
+        .args([format!("-{signal}"), format!("-{pgid}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(status) if status.success()) {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_child_tree(child: &mut std::process::Child, _signal: &str) {
+    let _ = child.kill();
+}
+
+fn monitor_started_processes(
+    backend: &mut std::process::Child,
+    frontend: &mut std::process::Child,
+) -> i32 {
+    loop {
+        match backend.try_wait() {
+            Ok(Some(status)) => {
+                terminate_child_tree(frontend, Duration::from_secs(5));
+                return status.code().unwrap_or(1);
+            }
+            Ok(None) => {}
+            Err(_) => return 1,
+        }
+        match frontend.try_wait() {
+            Ok(Some(status)) => {
+                terminate_child_tree(backend, Duration::from_secs(5));
+                return status.code().unwrap_or(1);
+            }
+            Ok(None) => {}
+            Err(_) => return 1,
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -1022,40 +1640,49 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
             if !state.tools.iter().any(|tool| tool == name) {
                 state.tools.push((*name).to_string());
             }
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/tool", "off", name] => {
             state.tools.retain(|tool| tool != name);
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/cap", name] => {
             state.capability = (*name).to_string();
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/kb", "none"] => {
             state.knowledge_bases.clear();
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/kb", name] => {
             state.knowledge_bases = vec![(*name).to_string()];
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/history", "add", id] => {
             state.history_references.push((*id).to_string());
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/history", "clear"] => {
             state.history_references.clear();
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/notebook", "add", reference] => {
             state
                 .notebook_references
                 .extend(parse_notebook_refs(&[(*reference).to_string()])?);
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/notebook", "clear"] => {
             state.notebook_references.clear();
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/show"] => {
@@ -1072,6 +1699,7 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
         }
         ["/config", "clear"] => {
             state.config = json!({});
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/config", "set", item] => {
@@ -1079,6 +1707,7 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
             let (key, value) = parse_config_item(item)?;
             object.insert(key, value);
             state.config = Value::Object(object);
+            print_chat_state(state)?;
             Ok(true)
         }
         _ => {
@@ -1469,11 +2098,11 @@ fn local_ports_summary(ui: &Value) -> Value {
         "backend": ui.pointer("/ports/backend")
             .or_else(|| ui.get("backend_port"))
             .cloned()
-            .unwrap_or_else(|| json!(8000)),
+            .unwrap_or_else(|| json!(8001)),
         "frontend": ui.pointer("/ports/frontend")
             .or_else(|| ui.get("frontend_port"))
             .cloned()
-            .unwrap_or_else(|| json!(3000))
+            .unwrap_or_else(|| json!(3782))
     })
 }
 
@@ -1599,7 +2228,9 @@ fn local_tools_summary(ui: &Value) -> Value {
 async fn session_command(api: &ApiClient, command: SessionCommand) -> CliResult {
     match command {
         SessionCommand::List { limit, format } => {
-            let mut value = api.get_json("/api/v1/sessions").await?;
+            let mut value = api
+                .get_json(&format!("/api/v1/sessions?limit={limit}"))
+                .await?;
             if let Some(sessions) = value["sessions"].as_array_mut() {
                 sessions.truncate(limit);
             }
@@ -1657,15 +2288,89 @@ fn normalize_provider_name(provider: &str) -> String {
 }
 
 fn login_openai_codex() -> CliResult {
-    let token = env::var("SOCARTES_OPENAI_CODEX_ACCESS_TOKEN")
-        .or_else(|_| env::var("OPENAI_CODEX_ACCESS_TOKEN"))
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    if token.is_some() {
+    if openai_codex_access_token().is_some() {
         println!("OpenAI Codex OAuth authentication succeeded.");
         return Ok(());
     }
-    Err("OpenAI Codex OAuth authentication failed: no existing OAuth token was found. Set SOCARTES_OPENAI_CODEX_ACCESS_TOKEN or run the OpenAI Codex login flow.".into())
+    if run_openai_codex_helper()? {
+        println!("OpenAI Codex OAuth authentication succeeded.");
+        return Ok(());
+    }
+    Err("OpenAI Codex OAuth authentication failed: no existing OAuth token was found. Set SOCARTES_OPENAI_CODEX_ACCESS_TOKEN or run `codex login` / the OpenAI Codex login flow.".into())
+}
+
+fn openai_codex_access_token() -> Option<String> {
+    env_token([
+        "SOCARTES_OPENAI_CODEX_ACCESS_TOKEN",
+        "OPENAI_CODEX_ACCESS_TOKEN",
+    ])
+    .or_else(|| read_codex_auth_access_token(&codex_auth_file()?))
+}
+
+fn env_token<const N: usize>(names: [&str; N]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn codex_auth_file() -> Option<PathBuf> {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    Some(home.join("auth.json"))
+}
+
+fn read_codex_auth_access_token(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value
+        .pointer("/tokens/access_token")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("access_token").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+}
+
+fn run_openai_codex_helper() -> CliResult<bool> {
+    let Some(helper) = env::var_os("SOCARTES_OPENAI_CODEX_HELPER")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(false);
+    };
+    let output = std::process::Command::new(&helper)
+        .output()
+        .map_err(|error| {
+            format!(
+                "OpenAI Codex OAuth helper `{}` failed to start: {error}",
+                helper.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "OpenAI Codex OAuth helper `{}` failed with status {}: {}{}{}",
+        helper.display(),
+        output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string()),
+        stderr.trim(),
+        if stdout.trim().is_empty() || stderr.trim().is_empty() {
+            ""
+        } else {
+            "\n"
+        },
+        stdout.trim()
+    )
+    .into())
 }
 
 async fn login_github_copilot() -> CliResult {
@@ -1880,8 +2585,8 @@ fn configured_cli_ui_settings(options: &RuntimeInitOptions) -> Value {
     }
     if options.backend_port.is_some() || options.frontend_port.is_some() {
         ui["ports"] = json!({
-            "backend": options.backend_port.unwrap_or(8000),
-            "frontend": options.frontend_port.unwrap_or(3000)
+            "backend": options.backend_port.unwrap_or(8001),
+            "frontend": options.frontend_port.unwrap_or(3782)
         });
     }
     ui
@@ -2086,23 +2791,145 @@ fn collect_documents(docs: &[PathBuf], docs_dir: Option<&Path>) -> CliResult<Vec
         if !dir.is_dir() {
             return Err(format!("docs directory does not exist: {}", dir.display()).into());
         }
-        collect_files_recursively(&dir, &mut collected)?;
+        collect_supported_files_recursively(&dir, &mut collected)?;
     }
     Ok(collected.into_values().collect())
 }
 
-fn collect_files_recursively(dir: &Path, collected: &mut BTreeMap<String, PathBuf>) -> CliResult {
+fn collect_supported_files_recursively(
+    dir: &Path,
+    collected: &mut BTreeMap<String, PathBuf>,
+) -> CliResult {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_files_recursively(&path, collected)?;
-        } else if path.is_file() {
+            collect_supported_files_recursively(&path, collected)?;
+        } else if path.is_file() && is_python_supported_kb_file(&path) {
             let path = path.canonicalize()?;
             collected.insert(path.to_string_lossy().to_string(), path);
         }
     }
     Ok(())
+}
+
+fn is_python_supported_kb_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "pdf"
+                    | "docx"
+                    | "xlsx"
+                    | "pptx"
+                    | "txt"
+                    | "text"
+                    | "log"
+                    | "md"
+                    | "markdown"
+                    | "rst"
+                    | "asciidoc"
+                    | "json"
+                    | "jsonc"
+                    | "json5"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "csv"
+                    | "tsv"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "env"
+                    | "properties"
+                    | "tex"
+                    | "latex"
+                    | "bib"
+                    | "js"
+                    | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "mts"
+                    | "cts"
+                    | "jsx"
+                    | "tsx"
+                    | "vue"
+                    | "svelte"
+                    | "py"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "scala"
+                    | "groovy"
+                    | "gradle"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cc"
+                    | "cxx"
+                    | "hpp"
+                    | "hh"
+                    | "hxx"
+                    | "cs"
+                    | "go"
+                    | "rs"
+                    | "zig"
+                    | "nim"
+                    | "swift"
+                    | "m"
+                    | "mm"
+                    | "rb"
+                    | "php"
+                    | "pl"
+                    | "pm"
+                    | "lua"
+                    | "r"
+                    | "jl"
+                    | "dart"
+                    | "hs"
+                    | "clj"
+                    | "cljs"
+                    | "cljc"
+                    | "ex"
+                    | "exs"
+                    | "erl"
+                    | "ml"
+                    | "mli"
+                    | "fs"
+                    | "fsx"
+                    | "lisp"
+                    | "lsp"
+                    | "scm"
+                    | "rkt"
+                    | "html"
+                    | "htm"
+                    | "xml"
+                    | "svg"
+                    | "css"
+                    | "scss"
+                    | "sass"
+                    | "less"
+                    | "sol"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "ps1"
+                    | "vim"
+                    | "sql"
+                    | "graphql"
+                    | "gql"
+                    | "proto"
+                    | "cmake"
+                    | "mk"
+                    | "tf"
+                    | "hcl"
+                    | "nginxconf"
+                    | "dockerfile"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn multipart_form_with_files(

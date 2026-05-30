@@ -18996,6 +18996,34 @@ async fn legacy_solve_ws_writes_python_style_output_dir_and_final_answer_file() 
     assert_eq!(result["metadata"]["total_steps"], 1);
     assert_eq!(result["metadata"]["completed_steps"], 1);
     assert_eq!(result["metadata"]["plan_revisions"], 0);
+    assert_eq!(result["metadata"]["cost_summary"]["total_tokens"], 15);
+    assert_eq!(result["metadata"]["cost_summary"]["total_calls"], 1);
+
+    let scratchpad: Value = serde_json::from_str(
+        &std::fs::read_to_string(output_path.join("scratchpad.json"))
+            .expect("Python-compatible solve scratchpad"),
+    )
+    .expect("scratchpad should be JSON");
+    assert_eq!(scratchpad["version"], "1.0");
+    assert_eq!(scratchpad["question"], "Write a solve output artifact.");
+    assert_eq!(scratchpad["plan"]["steps"][0]["status"], "completed");
+    assert_eq!(scratchpad["metadata"]["plan_revisions"], 0);
+
+    let cost_report: Value = serde_json::from_str(
+        &std::fs::read_to_string(output_path.join("cost_report.json"))
+            .expect("Python-compatible solve cost report"),
+    )
+    .expect("cost report should be JSON");
+    assert_eq!(cost_report["summary"]["total_prompt_tokens"], 11);
+    assert_eq!(cost_report["summary"]["total_completion_tokens"], 4);
+    assert_eq!(cost_report["summary"]["total_tokens"], 15);
+    assert_eq!(cost_report["summary"]["total_calls"], 1);
+    assert_eq!(
+        cost_report["summary"]["by_model"]["provider-chat-model"]["total_tokens"],
+        15
+    );
+    assert_eq!(cost_report["records"][0]["agent_name"], "WriterAgent");
+    assert_eq!(cost_report["records"][0]["stage"], "write");
 
     llm_server.abort();
     server.abort();

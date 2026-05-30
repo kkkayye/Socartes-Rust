@@ -15,6 +15,18 @@ path = "src/main.rs"
 name = "socartes"
 path = "src/bin/socartes.rs"
 
+[[bin]]
+name = "socartes-cli"
+path = "src/bin/socartes_cli.rs"
+
+[[bin]]
+name = "deeptutor"
+path = "src/bin/deeptutor.rs"
+
+[[bin]]
+name = "deeptutor-cli"
+path = "src/bin/deeptutor_cli.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
