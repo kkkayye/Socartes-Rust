@@ -782,6 +782,20 @@ solve = "shadow"
 }
 
 #[tokio::test]
+async fn question_generate_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    assert_quiz_ws_shadow_route(
+        "/api/v1/question/generate",
+        "hello question generate shadow",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn question_mimic_ws_shadow_mode_returns_python_frames_and_tees_to_native_ws() {
+    assert_quiz_ws_shadow_route("/api/v1/question/mimic", "hello question mimic shadow").await;
+}
+
+#[tokio::test]
 async fn disabled_migration_fallback_returns_404_without_python() {
     let runtime = Arc::new(MigrationRuntime::from_config_for_tests(
         MigrationConfig::default(),
@@ -798,6 +812,86 @@ async fn disabled_migration_fallback_returns_404_without_python() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"");
+}
+
+async fn assert_quiz_ws_shadow_route(path: &'static str, payload: &'static str) {
+    let upstream = Router::new().route(path, get(echo_ws));
+    let upstream_addr = spawn_app(upstream).await;
+
+    let native_messages = Arc::new(Mutex::new(Vec::<String>::new()));
+    let native_header_seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let native = Router::new().route(
+        path,
+        get({
+            let native_messages = native_messages.clone();
+            let native_header_seen = native_header_seen.clone();
+            move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                let native_messages = native_messages.clone();
+                let native_header_seen = native_header_seen.clone();
+                async move {
+                    native_header_seen
+                        .lock()
+                        .await
+                        .push(is_shadow_native_ws_request(
+                            &headers,
+                            "socartes-test-shadow-token",
+                        ));
+                    observed_native_ws(ws, native_messages).await
+                }
+            }
+        }),
+    );
+    let native_addr = spawn_app(native).await;
+    let config = format!(
+        r#"
+enabled = true
+python_base_url = "http://{upstream_addr}"
+python_ws_base_url = "ws://{upstream_addr}"
+fallback = "proxy"
+
+[routes]
+quiz = "shadow"
+"#
+    );
+    let env_guard = MigrationEnvGuard::with_config(&config, &format!("ws://{native_addr}")).await;
+    let app =
+        app_with_knowledge_root_and_auth(env_guard.data_root().join("knowledge_bases"), false);
+    let app_addr = spawn_app(app).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{app_addr}{path}?turn=1"))
+        .await
+        .expect("quiz websocket should connect through app router");
+    socket
+        .send(TungsteniteMessage::Text(payload.into()))
+        .await
+        .expect("client message should send");
+    let echoed = socket
+        .next()
+        .await
+        .expect("python echo should arrive")
+        .expect("python echo should be ok");
+    assert_eq!(
+        echoed,
+        TungsteniteMessage::Text(format!("python:{payload}").into())
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "native shadow frames must not be forwarded to the client"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if native_messages.lock().await.as_slice() == [payload] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native websocket should receive the client frame");
+    assert_eq!(native_header_seen.lock().await.as_slice(), [true]);
 }
 
 async fn observed_native_ws(ws: WebSocketUpgrade, messages: Arc<Mutex<Vec<String>>>) -> Response {
