@@ -13664,19 +13664,20 @@ fn validate_embedding_probe_payload(
     }
     let mut dimension = None;
     for vector in vectors {
-        if vector.is_empty() {
+        let parsed = parse_embedding_vector(vector)?;
+        if parsed.is_empty() {
             return Err(invalid_embedding_response(
                 "Embedding service returned an empty vector.",
             ));
         }
         match dimension {
-            Some(expected) if expected != vector.len() => {
+            Some(expected) if expected != parsed.len() => {
                 return Err(invalid_embedding_response(
                     "Embedding service returned inconsistent vector dimensions.",
                 ));
             }
             Some(_) => {}
-            None => dimension = Some(vector.len()),
+            None => dimension = Some(parsed.len()),
         }
     }
     Ok(dimension.unwrap_or_default())
@@ -13851,8 +13852,8 @@ async fn embedding_settings_events(state: &AppState, catalog: &Value) -> String 
     let detected_dim = match probe_embedding_provider(
         &selection,
         &[
-            "DeepTutor embedding smoke test",
-            "DeepTutor retrieval batch probe",
+            "Socartes embedding smoke test",
+            "Socartes retrieval batch probe",
         ],
         false,
     )
@@ -20579,9 +20580,13 @@ async fn reopen_settings_tour() -> Json<Value> {
 
 async fn start_settings_test(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(service): Path<String>,
     payload: Option<Json<Value>>,
 ) -> axum::response::Response {
+    if let Err(error) = require_settings_admin(&state, &headers) {
+        return error.into_response();
+    }
     let payload = payload
         .map(|Json(value)| value)
         .unwrap_or_else(|| json!({}));
@@ -20609,8 +20614,12 @@ async fn start_settings_test(
 
 async fn settings_test_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((service, run_id)): Path<(String, String)>,
 ) -> axum::response::Response {
+    if let Err(error) = require_settings_admin(&state, &headers) {
+        return error.into_response();
+    }
     let service = service.replace('"', "");
     let run_id = run_id.replace('"', "");
     let path = match settings_test_run_path(&state, &run_id) {
@@ -20645,15 +20654,25 @@ async fn settings_test_events(
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
-async fn cancel_settings_test(Path((_service, _run_id)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "message": "Cancelled" }))
+async fn cancel_settings_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((_service, _run_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    if let Err(error) = require_settings_admin(&state, &headers) {
+        return error.into_response();
+    }
+    Json(json!({ "message": "Cancelled" })).into_response()
 }
 
-async fn system_status(State(state): State<AppState>) -> Json<Value> {
+async fn system_status(
+    State(state): State<AppState>,
+    Extension(payload): Extension<AuthTokenPayload>,
+) -> Json<Value> {
     let catalog = load_settings_catalog(&state);
     let llm_model = active_catalog_model_name(&catalog, "llm");
     let embedding_model = active_catalog_model_name(&catalog, "embedding");
-    Json(json!({
+    let mut result = json!({
         "backend": {
             "status": "online",
             "timestamp": now_label()
@@ -20669,7 +20688,19 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
             "testable": true
         },
         "search": system_status_search_payload(&catalog)
-    }))
+    });
+    if payload.role != "admin" {
+        if let Some(section) = result["llm"].as_object_mut() {
+            section.remove("model");
+        }
+        if let Some(section) = result["embeddings"].as_object_mut() {
+            section.remove("model");
+        }
+        if let Some(section) = result["search"].as_object_mut() {
+            section.remove("provider");
+        }
+    }
+    Json(result)
 }
 
 fn system_status_search_payload(catalog: &Value) -> Value {
@@ -20716,18 +20747,22 @@ async fn system_runtime_topology() -> Json<Value> {
     Json(json!({
         "primary_runtime": {
             "transport": "/api/v1/ws",
-            "manager": "RustTurnRuntime",
-            "orchestrator": "SocartesOrchestrator",
-            "session_store": "FileSessionStore",
-            "capability_entry": "Rust compatibility endpoints",
-            "tool_entry": "Deterministic local adapters"
+            "manager": "TurnRuntimeManager",
+            "orchestrator": "ChatOrchestrator",
+            "session_store": "SQLiteSessionStore",
+            "capability_entry": "CapabilityRegistry",
+            "tool_entry": "ToolRegistry"
         },
         "compatibility_routes": [
-            {"router": "book", "mode": "file_backed_compatibility"},
-            {"router": "knowledge", "mode": "file_backed_compatibility"},
-            {"router": "settings", "mode": "file_backed_compatibility"}
+            {"router": "chat", "mode": "legacy_adapter_target"},
+            {"router": "solve", "mode": "legacy_adapter_target"},
+            {"router": "question", "mode": "legacy_specialized"},
+            {"router": "research", "mode": "legacy_specialized"}
         ],
-        "isolated_subsystems": []
+        "isolated_subsystems": [
+            {"router": "co_writer", "mode": "independent_subsystem"},
+            {"router": "plugins_api", "mode": "playground_transport"}
+        ]
     }))
 }
 

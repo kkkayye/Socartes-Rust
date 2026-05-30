@@ -43,6 +43,8 @@ const SEARCH_ENV_KEYS: &[&str] = &[
     "SERPER_API_KEY",
     "SEARXNG_BASE_URL",
 ];
+const INVALID_EMBEDDING_RESPONSE_DETAIL: &str =
+    "Embedding response must contain one non-empty vector per input";
 
 struct SearchEnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
@@ -25221,6 +25223,206 @@ async fn system_status_search_reports_configured_for_duckduckgo_like_python() {
 }
 
 #[tokio::test]
+async fn system_runtime_topology_matches_python_operator_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/system/runtime-topology")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(
+        payload,
+        json!({
+            "primary_runtime": {
+                "transport": "/api/v1/ws",
+                "manager": "TurnRuntimeManager",
+                "orchestrator": "ChatOrchestrator",
+                "session_store": "SQLiteSessionStore",
+                "capability_entry": "CapabilityRegistry",
+                "tool_entry": "ToolRegistry"
+            },
+            "compatibility_routes": [
+                {"router": "chat", "mode": "legacy_adapter_target"},
+                {"router": "solve", "mode": "legacy_adapter_target"},
+                {"router": "question", "mode": "legacy_specialized"},
+                {"router": "research", "mode": "legacy_specialized"}
+            ],
+            "isolated_subsystems": [
+                {"router": "co_writer", "mode": "independent_subsystem"},
+                {"router": "plugins_api", "mode": "playground_transport"}
+            ]
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_redacts_runtime_model_details_for_non_admin_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (admin_token, user_token, _user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+
+    let catalog = llm_test_catalog("https://internal-llm.example/v1");
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+
+    let admin_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/system/status")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_response.status(), http::StatusCode::OK);
+    let admin_status = json_response(admin_response).await;
+    assert_eq!(admin_status["llm"]["model"], "provider-chat-model");
+    assert_eq!(
+        admin_status["embeddings"]["model"],
+        "deterministic-embedding"
+    );
+    assert_eq!(admin_status["search"]["provider"], "duckduckgo");
+
+    let user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/system/status")
+                .header(http::header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_response.status(), http::StatusCode::OK);
+    let user_status = json_response(user_response).await;
+    assert!(
+        !user_status["llm"]
+            .as_object()
+            .unwrap()
+            .contains_key("model")
+    );
+    assert!(
+        !user_status["embeddings"]
+            .as_object()
+            .unwrap()
+            .contains_key("model")
+    );
+    assert!(
+        !user_status["search"]
+            .as_object()
+            .unwrap()
+            .contains_key("provider")
+    );
+    assert_eq!(user_status["llm"]["testable"], true);
+    assert_eq!(user_status["embeddings"]["testable"], true);
+    assert_eq!(user_status["search"]["testable"], true);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_test_routes_require_settings_admin_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (admin_token, user_token, _user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+    let catalog = llm_test_catalog("http://127.0.0.1:9/v1");
+
+    let forbidden_start = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/llm/start")
+                .header(http::header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog.clone()}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden_start.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(forbidden_start).await["detail"],
+        "Model configuration is managed by an administrator."
+    );
+
+    let admin_start = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/llm/start")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_start.status(), http::StatusCode::OK);
+    let run_id = json_response(admin_start).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (method, uri) in [
+        ("GET", format!("/api/v1/settings/tests/llm/{run_id}/events")),
+        (
+            "POST",
+            format!("/api/v1/settings/tests/llm/{run_id}/cancel"),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {user_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_response(response).await["detail"],
+            "Model configuration is managed by an administrator."
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn system_status_search_reports_configured_for_tavily_with_key_like_python() {
     let _env = SearchEnvGuard::clear().await;
     let root = unique_test_knowledge_root();
@@ -27193,6 +27395,47 @@ async fn system_embedding_test_uses_ollama_payload_and_response_shape() {
 }
 
 #[tokio::test]
+async fn system_embedding_test_rejects_non_numeric_vector_values() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, _requests, server) = spawn_embedding_mock(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": 0, "embedding": [0.1, "not-a-number", 0.3]},
+            {"object": "embedding", "index": 1, "embedding": [0.4, 0.5, true]}
+        ],
+        "model": "text-embedding-3-small"
+    }))
+    .await;
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": embedding_test_catalog(&base_url)}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert_eq!(
+        payload["message"],
+        "Embeddings connection failed: Invalid response"
+    );
+    assert_eq!(payload["error"], INVALID_EMBEDDING_RESPONSE_DETAIL);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn settings_embedding_test_events_report_provider_failure() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -27330,8 +27573,8 @@ async fn settings_embedding_test_events_detect_dimension_without_dimensions_para
     assert_eq!(
         requests[0]["input"],
         json!([
-            "DeepTutor embedding smoke test",
-            "DeepTutor retrieval batch probe"
+            "Socartes embedding smoke test",
+            "Socartes retrieval batch probe"
         ])
     );
     assert!(requests[0].get("dimensions").is_none());
