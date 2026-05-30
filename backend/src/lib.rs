@@ -4199,11 +4199,12 @@ async fn record_knowledge_task_processing_progress(
     total: usize,
     index_action: &str,
 ) -> Value {
-    let percent = if total == 0 {
-        0
-    } else {
-        ((current.min(total) * 100) / total).min(99)
-    };
+    let percent = current
+        .min(total)
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(99);
     let progress = json!({
         "task_id": task_id,
         "stage": "processing_documents",
@@ -17189,7 +17190,7 @@ fn recent_tutorbot_summaries(state: &AppState, limit: usize) -> Vec<Value> {
             }),
         ));
     }
-    recent.sort_by(|left, right| right.0.cmp(&left.0));
+    recent.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     recent
         .into_iter()
         .take(limit)
@@ -27953,15 +27954,14 @@ async fn emit_legacy_chat_events(socket: &mut WebSocket, events: &[Value]) -> bo
                 return send_legacy_ws_json(socket, json!({"type": "error", "message": message}))
                     .await;
             }
-            "done" => {
-                if event["metadata"]["status"].as_str() == Some("completed") {
-                    return send_legacy_ws_json(
-                        socket,
-                        json!({"type": "result", "content": final_content}),
-                    )
-                    .await;
-                }
+            "done" if event["metadata"]["status"].as_str() == Some("completed") => {
+                return send_legacy_ws_json(
+                    socket,
+                    json!({"type": "result", "content": final_content}),
+                )
+                .await;
             }
+            "done" => {}
             _ => {}
         }
     }
