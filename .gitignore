@@ -1,4 +1,6 @@
 /backend/target/
+/backend/data/
+/runtime/
 **/*.rs.bk
 .env
 .DS_Store

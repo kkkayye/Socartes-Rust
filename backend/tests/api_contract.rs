@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{Cursor, Write},
     path::Path,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -14,14 +15,85 @@ use axum::http;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use socartes_backend::{app, app_with_knowledge_root};
-use tokio::net::TcpListener;
-use tokio::time::{Duration, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
+use socartes_backend::{
+    app, app_with_knowledge_root, app_with_knowledge_root_and_auth,
+    app_with_knowledge_root_and_auth_env_user, app_with_knowledge_root_and_pocketbase_auth,
+    app_with_knowledge_root_and_stored_auth,
+};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Duration, sleep, timeout};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Error as TungsteniteError, Message as TungsteniteMessage, client::IntoClientRequest,
+    },
+};
 use tower::ServiceExt;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SEARCH_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+const SEARCH_ENV_KEYS: &[&str] = &[
+    "SEARCH_PROVIDER",
+    "BRAVE_SEARCH_API_KEY",
+    "BRAVE_API_KEY",
+    "TAVILY_API_KEY",
+    "JINA_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "SERPER_API_KEY",
+    "SEARXNG_BASE_URL",
+];
+
+struct SearchEnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[derive(Default)]
+struct MockPocketBaseState {
+    login_requests: tokio::sync::Mutex<Vec<Value>>,
+    refresh_authorizations: tokio::sync::Mutex<Vec<String>>,
+    register_requests: tokio::sync::Mutex<Vec<Value>>,
+    collection_records: tokio::sync::Mutex<HashMap<String, Vec<Value>>>,
+    reject_message_role: tokio::sync::Mutex<Option<String>>,
+}
+
+impl SearchEnvGuard {
+    async fn clear() -> Self {
+        let guard = SEARCH_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let saved = SEARCH_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for key in SEARCH_ENV_KEYS {
+            // SAFETY: tests that mutate search env hold SEARCH_ENV_MUTEX until restore.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        Self {
+            saved,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for SearchEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            // SAFETY: SEARCH_ENV_MUTEX is still held while this guard restores variables.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 async fn json_response(response: axum::response::Response) -> Value {
     let bytes = response
@@ -41,6 +113,622 @@ async fn text_response(response: axum::response::Response) -> String {
         .expect("response body")
         .to_bytes();
     String::from_utf8(bytes.to_vec()).expect("utf8 response")
+}
+
+async fn start_mock_pocketbase() -> (String, Arc<MockPocketBaseState>) {
+    let state = Arc::new(MockPocketBaseState::default());
+    let app = axum::Router::new()
+        .route(
+            "/api/collections/users/auth-with-password",
+            axum::routing::post(mock_pocketbase_login),
+        )
+        .route(
+            "/api/collections/users/auth-refresh",
+            axum::routing::post(mock_pocketbase_auth_refresh),
+        )
+        .route(
+            "/api/collections/users/records",
+            axum::routing::post(mock_pocketbase_register),
+        )
+        .route(
+            "/api/collections/sessions/records",
+            axum::routing::get(mock_pocketbase_list_sessions).post(mock_pocketbase_create_session),
+        )
+        .route(
+            "/api/collections/sessions/records/{id}",
+            axum::routing::patch(mock_pocketbase_update_session)
+                .delete(mock_pocketbase_delete_session),
+        )
+        .route(
+            "/api/collections/messages/records",
+            axum::routing::get(mock_pocketbase_list_messages).post(mock_pocketbase_create_message),
+        )
+        .route(
+            "/api/collections/messages/records/{id}",
+            axum::routing::patch(mock_pocketbase_update_message)
+                .delete(mock_pocketbase_delete_message),
+        )
+        .route(
+            "/api/collections/turns/records",
+            axum::routing::get(mock_pocketbase_list_turns).post(mock_pocketbase_create_turn),
+        )
+        .route(
+            "/api/collections/turns/records/{id}",
+            axum::routing::patch(mock_pocketbase_update_turn).delete(mock_pocketbase_delete_turn),
+        )
+        .route(
+            "/api/collections/turn_events/records",
+            axum::routing::get(mock_pocketbase_list_turn_events)
+                .post(mock_pocketbase_create_turn_event),
+        )
+        .route(
+            "/api/collections/turn_events/records/{id}",
+            axum::routing::patch(mock_pocketbase_update_turn_event)
+                .delete(mock_pocketbase_delete_turn_event),
+        )
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock pocketbase");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock pocketbase server");
+    });
+    (url, state)
+}
+
+async fn mock_pocketbase_login(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    state.login_requests.lock().await.push(body.clone());
+    if body["identity"] != "alice@example.com" || body["password"] != "password123" {
+        return (
+            http::StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"message": "invalid credentials"})),
+        );
+    }
+    (
+        http::StatusCode::OK,
+        axum::Json(json!({
+            "token": "pb.raw.login.token",
+            "record": {
+                "id": "pb-user-1",
+                "email": "alice@example.com"
+            }
+        })),
+    )
+}
+
+async fn mock_pocketbase_auth_refresh(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    headers: http::HeaderMap,
+) -> impl axum::response::IntoResponse {
+    let authorization = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    state
+        .refresh_authorizations
+        .lock()
+        .await
+        .push(authorization.clone());
+    let Some(token) = authorization.strip_prefix("Bearer ") else {
+        return (
+            http::StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"message": "missing bearer token"})),
+        );
+    };
+    match token {
+        "pb.existing.token" => (
+            http::StatusCode::OK,
+            axum::Json(json!({
+                "token": token,
+                "record": {
+                    "id": "pb-existing-user",
+                    "email": "existing@example.com",
+                    "role": "admin"
+                }
+            })),
+        ),
+        "pb.raw.login.token" => (
+            http::StatusCode::OK,
+            axum::Json(json!({
+                "token": token,
+                "record": {
+                    "id": "pb-user-1",
+                    "email": "alice@example.com"
+                }
+            })),
+        ),
+        _ => (
+            http::StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"message": "invalid bearer token"})),
+        ),
+    }
+}
+
+async fn mock_pocketbase_register(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    state.register_requests.lock().await.push(body.clone());
+    if body["email"] == "taken@example.com" {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"message": "already exists"})),
+        );
+    }
+    (
+        http::StatusCode::OK,
+        axum::Json(json!({
+            "id": "pb-created-user",
+            "username": body["username"].as_str().unwrap_or(""),
+            "email": body["email"].as_str().unwrap_or("")
+        })),
+    )
+}
+
+async fn mock_pocketbase_create_session(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_create_collection_record(state, "sessions", body).await
+}
+
+async fn mock_pocketbase_create_message(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    if state
+        .reject_message_role
+        .lock()
+        .await
+        .as_deref()
+        .is_some_and(|role| body["role"].as_str() == Some(role))
+    {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "message": "messages.metadata_json validation failed: metadata_json must match PocketBase object schema"
+            })),
+        );
+    }
+    mock_pocketbase_create_collection_record(state, "messages", body).await
+}
+
+async fn mock_pocketbase_create_turn(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_create_collection_record(state, "turns", body).await
+}
+
+async fn mock_pocketbase_create_turn_event(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_create_collection_record(state, "turn_events", body).await
+}
+
+async fn mock_pocketbase_create_collection_record(
+    state: Arc<MockPocketBaseState>,
+    collection: &str,
+    body: Value,
+) -> (http::StatusCode, axum::Json<Value>) {
+    let mut records = state.collection_records.lock().await;
+    let items = records.entry(collection.to_string()).or_default();
+    let mut record = body;
+    record["id"] = json!(format!("{collection}-{}", items.len() + 1));
+    record["created"] = json!(format!("2026-05-30 00:00:{:02}.000Z", items.len()));
+    record["updated"] = record["created"].clone();
+    items.push(record.clone());
+    (http::StatusCode::OK, axum::Json(record))
+}
+
+async fn mock_pocketbase_update_session(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_update_collection_record(state, "sessions", id, body).await
+}
+
+async fn mock_pocketbase_update_message(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_update_collection_record(state, "messages", id, body).await
+}
+
+async fn mock_pocketbase_update_turn(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_update_collection_record(state, "turns", id, body).await
+}
+
+async fn mock_pocketbase_update_turn_event(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_update_collection_record(state, "turn_events", id, body).await
+}
+
+async fn mock_pocketbase_update_collection_record(
+    state: Arc<MockPocketBaseState>,
+    collection: &str,
+    id: String,
+    body: Value,
+) -> (http::StatusCode, axum::Json<Value>) {
+    let mut records = state.collection_records.lock().await;
+    let items = records.entry(collection.to_string()).or_default();
+    let Some(record) = items.iter_mut().find(|record| record["id"] == id) else {
+        return (
+            http::StatusCode::NOT_FOUND,
+            axum::Json(json!({"message": "record not found"})),
+        );
+    };
+    if let (Some(record), Some(body)) = (record.as_object_mut(), body.as_object()) {
+        for (key, value) in body {
+            record.insert(key.clone(), value.clone());
+        }
+        record.insert("updated".to_string(), json!("2026-05-30 00:01:00.000Z"));
+    }
+    (http::StatusCode::OK, axum::Json(record.clone()))
+}
+
+async fn mock_pocketbase_delete_session(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_delete_collection_record(state, "sessions", id).await
+}
+
+async fn mock_pocketbase_delete_message(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_delete_collection_record(state, "messages", id).await
+}
+
+async fn mock_pocketbase_delete_turn(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_delete_collection_record(state, "turns", id).await
+}
+
+async fn mock_pocketbase_delete_turn_event(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_delete_collection_record(state, "turn_events", id).await
+}
+
+async fn mock_pocketbase_delete_collection_record(
+    state: Arc<MockPocketBaseState>,
+    collection: &str,
+    id: String,
+) -> (http::StatusCode, axum::Json<Value>) {
+    let mut records = state.collection_records.lock().await;
+    let items = records.entry(collection.to_string()).or_default();
+    let initial_len = items.len();
+    items.retain(|record| record["id"] != id);
+    if items.len() == initial_len {
+        return (
+            http::StatusCode::NOT_FOUND,
+            axum::Json(json!({"message": "record not found"})),
+        );
+    }
+    (http::StatusCode::NO_CONTENT, axum::Json(json!({})))
+}
+
+async fn mock_pocketbase_list_sessions(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_list_collection_records(state, "sessions", query).await
+}
+
+async fn mock_pocketbase_list_messages(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_list_collection_records(state, "messages", query).await
+}
+
+async fn mock_pocketbase_list_turns(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_list_collection_records(state, "turns", query).await
+}
+
+async fn mock_pocketbase_list_turn_events(
+    axum::extract::State(state): axum::extract::State<Arc<MockPocketBaseState>>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    mock_pocketbase_list_collection_records(state, "turn_events", query).await
+}
+
+async fn mock_pocketbase_list_collection_records(
+    state: Arc<MockPocketBaseState>,
+    collection: &str,
+    query: HashMap<String, String>,
+) -> impl axum::response::IntoResponse {
+    let filter = query.get("filter").map(String::as_str).unwrap_or("");
+    let sort = query.get("sort").map(String::as_str).unwrap_or("");
+    let records = state.collection_records.lock().await;
+    let mut items = records
+        .get(collection)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| mock_pocketbase_filter_matches(record, filter))
+        .collect::<Vec<_>>();
+    match sort {
+        "msg_created_at" => items.sort_by(mock_sort_number("msg_created_at", false)),
+        "-msg_created_at" => items.sort_by(mock_sort_number("msg_created_at", true)),
+        "seq" => items.sort_by(mock_sort_number("seq", false)),
+        "-turn_updated_at" => items.sort_by(mock_sort_number("turn_updated_at", true)),
+        "-updated" => items.sort_by(|left, right| {
+            right["updated"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(left["updated"].as_str().unwrap_or_default())
+        }),
+        _ => {}
+    }
+    (
+        http::StatusCode::OK,
+        axum::Json(json!({
+            "page": 1,
+            "perPage": items.len(),
+            "totalItems": items.len(),
+            "totalPages": 1,
+            "items": items
+        })),
+    )
+}
+
+fn mock_sort_number(
+    key: &'static str,
+    descending: bool,
+) -> impl FnMut(&Value, &Value) -> std::cmp::Ordering {
+    move |left, right| {
+        let left = left[key].as_f64().unwrap_or_default();
+        let right = right[key].as_f64().unwrap_or_default();
+        if descending {
+            right.partial_cmp(&left)
+        } else {
+            left.partial_cmp(&right)
+        }
+        .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+fn mock_pocketbase_filter_matches(record: &Value, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    filter.split("&&").all(|part| {
+        let expr = part.trim();
+        if let Some((field, value)) = expr.split_once("=\"") {
+            let expected = value.trim_end_matches('"');
+            return record[field.trim()].as_str() == Some(expected);
+        }
+        if let Some((field, value)) = expr.split_once(" > ") {
+            let expected = value.trim().parse::<f64>().unwrap_or_default();
+            return record[field.trim()].as_f64().unwrap_or_default() > expected;
+        }
+        true
+    })
+}
+
+async fn mock_pocketbase_collection_records(
+    state: &Arc<MockPocketBaseState>,
+    collection: &str,
+) -> Vec<Value> {
+    state
+        .collection_records
+        .lock()
+        .await
+        .get(collection)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn wait_for_knowledge_progress_terminal(
+    app: axum::Router,
+    name: &str,
+    task_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri(format!("/api/v1/knowledge/{name}/progress"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let progress = json_response(response).await;
+            if progress["task_id"] == task_id
+                && matches!(
+                    progress["stage"].as_str(),
+                    Some("completed") | Some("error")
+                )
+            {
+                return progress;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("knowledge task should reach terminal progress")
+}
+
+async fn setup_auth_admin_and_user(
+    app: axum::Router,
+    username: &str,
+    password: &str,
+) -> (String, String, String) {
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let admin_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login_response.status(), http::StatusCode::OK);
+    let admin_token = auth_token_from_set_cookie(&admin_login_response);
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": username, "password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let user_id = json_response(create_user_response).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let user_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": username, "password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_login_response.status(), http::StatusCode::OK);
+    let user_token = auth_token_from_set_cookie(&user_login_response);
+
+    (admin_token, user_token, user_id)
+}
+
+async fn create_auth_user_and_login(
+    app: axum::Router,
+    admin_token: &str,
+    username: &str,
+    password: &str,
+) -> (String, String) {
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": username, "password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let user_id = json_response(create_user_response).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": username, "password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let token = auth_token_from_set_cookie(&login_response);
+
+    (token, user_id)
+}
+
+fn auth_token_from_set_cookie(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("login cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string()
+}
+
+fn json_object_has_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key(key) || object.values().any(|child| json_object_has_key(child, key))
+        }
+        Value::Array(values) => values.iter().any(|child| json_object_has_key(child, key)),
+        _ => false,
+    }
 }
 
 fn unique_test_knowledge_root() -> std::path::PathBuf {
@@ -88,6 +776,79 @@ fn test_co_writer_docs_root(knowledge_root: &Path) -> std::path::PathBuf {
         .join("workspace")
         .join("co-writer")
         .join("documents")
+}
+
+async fn collect_book_ws_events_until(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    terminal_type: &str,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    for _ in 0..32 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("book ws event")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        let terminal = event["type"] == terminal_type || event["type"] == "error";
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
+async fn collect_ws_json_until(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    terminal_type: &str,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    for _ in 0..48 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("websocket event")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).expect("json websocket event");
+        let terminal = event["type"] == terminal_type || event["type"] == "error";
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
+async fn assert_next_ws_close_code(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    expected_code: u16,
+) {
+    let message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("websocket close frame")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Close(Some(frame)) = message else {
+        panic!("expected websocket close frame with code {expected_code}");
+    };
+    assert_eq!(u16::from(frame.code), expected_code);
+}
+
+async fn assert_ws_handshake_status(request: impl IntoClientRequest + Unpin, expected_status: u16) {
+    match connect_async(request).await {
+        Err(TungsteniteError::Http(response)) => {
+            assert_eq!(response.status().as_u16(), expected_status);
+        }
+        Ok(_) => panic!("expected websocket handshake to fail with HTTP {expected_status}"),
+        Err(error) => panic!("expected HTTP handshake failure, got {error:?}"),
+    }
 }
 
 fn test_user_output_root(knowledge_root: &Path) -> std::path::PathBuf {
@@ -259,6 +1020,412 @@ async fn spawn_embedding_request_recorder(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn spawn_searxng_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/search",
+        axum::routing::get(
+            move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    requests.lock().await.push(json!(query));
+                    axum::Json(json!({
+                        "results": [{
+                            "title": "Mock Socartes Search",
+                            "url": "https://example.test/socartes",
+                            "content": "Mock snippet from local SearXNG.",
+                            "engine": "mock-searxng"
+                        }]
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_duckduckgo_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/html/",
+        axum::routing::get(
+            move |headers: http::HeaderMap,
+                  uri: http::Uri,
+                  axum::extract::Query(query): axum::extract::Query<
+                HashMap<String, String>,
+            >| {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    let headers = headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), json!(value)))
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    requests.lock().await.push(json!({
+                        "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                        "headers": headers,
+                        "query": query
+                    }));
+                    axum::response::Html(
+                        r#"
+                        <!doctype html>
+                        <html>
+                          <body>
+                            <div class="result">
+                              <a class="result__a" href="https://example.test/duckduckgo-socartes">Mock DuckDuckGo Socartes Result</a>
+                              <a class="result__snippet">Mock DuckDuckGo snippet.</a>
+                            </div>
+                            <div class="result">
+                              <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.test%2Fduckduckgo-redirected">Redirected DuckDuckGo Result</a>
+                              <div class="result__snippet">Redirected DuckDuckGo snippet.</div>
+                            </div>
+                          </body>
+                        </html>
+                        "#,
+                    )
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_brave_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app =
+        axum::Router::new().route(
+            "/res/v1/web/search",
+            axum::routing::get(
+                move |headers: http::HeaderMap,
+                      uri: http::Uri,
+                      axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
+                    let requests = Arc::clone(&handler_requests);
+                    async move {
+                        let headers = headers
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|value| (name.as_str().to_string(), json!(value)))
+                            })
+                            .collect::<serde_json::Map<_, _>>();
+                        requests.lock().await.push(json!({
+                            "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                            "headers": headers,
+                            "query": query
+                        }));
+                        axum::Json(json!({
+                            "web": {
+                                "results": [{
+                                    "title": "Mock Brave Socartes Result",
+                                    "url": "https://example.test/brave-socartes",
+                                    "description": "Mock snippet from local Brave provider.",
+                                    "age": "May 30, 2026"
+                                }]
+                            }
+                        }))
+                    }
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_tavily_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/search",
+        axum::routing::post(
+            move |headers: http::HeaderMap,
+                  uri: http::Uri,
+                  axum::Json(payload): axum::Json<Value>| {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    let headers = headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), json!(value)))
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    requests.lock().await.push(json!({
+                        "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                        "headers": headers,
+                        "payload": payload
+                    }));
+                    axum::Json(json!({
+                        "answer": "Mock Tavily answer from local provider.",
+                        "results": [{
+                            "title": "Mock Tavily Socartes Result",
+                            "url": "https://example.test/tavily-socartes",
+                            "content": "Mock Tavily content snippet.",
+                            "published_date": "2026-05-30",
+                            "source": "mock-tavily-source",
+                            "raw_content": "Mock Tavily raw content.",
+                            "score": 0.87
+                        }],
+                        "images": ["https://example.test/tavily-image.png"],
+                        "response_time": 0.42
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_serper_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/search",
+        axum::routing::post(
+            move |headers: http::HeaderMap,
+                  uri: http::Uri,
+                  axum::Json(payload): axum::Json<Value>| {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    let headers = headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), json!(value)))
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    requests.lock().await.push(json!({
+                        "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                        "headers": headers,
+                        "payload": payload
+                    }));
+                    axum::Json(json!({
+                        "searchParameters": {
+                            "q": "serper mock query",
+                            "gl": "us",
+                            "hl": "en",
+                            "type": "search"
+                        },
+                        "answerBox": {
+                            "answer": "Mock Serper answer box.",
+                            "snippet": "Fallback Serper answer snippet."
+                        },
+                        "knowledgeGraph": {
+                            "title": "Socartes",
+                            "description": "Mock Serper knowledge graph description."
+                        },
+                        "peopleAlsoAsk": [{
+                            "question": "What is Socartes?",
+                            "snippet": "A mock question from Serper."
+                        }],
+                        "relatedSearches": [{
+                            "query": "socartes rust backend"
+                        }],
+                        "organic": [{
+                            "title": "Mock Serper Socartes Result",
+                            "link": "https://example.test/serper-socartes",
+                            "snippet": "Mock Serper organic snippet.",
+                            "date": "May 30, 2026",
+                            "source": "Example Test",
+                            "sitelinks": [{
+                                "title": "Nested Serper Link",
+                                "link": "https://example.test/serper-sitelink"
+                            }],
+                            "attributes": {
+                                "position": "1",
+                                "category": "mock"
+                            }
+                        }]
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_perplexity_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(
+            move |headers: http::HeaderMap,
+                  uri: http::Uri,
+                  axum::Json(payload): axum::Json<Value>| {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    let headers = headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), json!(value)))
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    requests.lock().await.push(json!({
+                        "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                        "headers": headers,
+                        "payload": payload
+                    }));
+                    axum::Json(json!({
+                        "id": "mock-perplexity-search",
+                        "model": "sonar",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "Mock Perplexity answer grounded in web citations."
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 11,
+                            "completion_tokens": 13,
+                            "total_tokens": 24,
+                            "cost": {
+                                "total_cost": 0.0012,
+                                "input_tokens_cost": 0.0005,
+                                "output_tokens_cost": 0.0007
+                            }
+                        },
+                        "citations": ["https://example.test/perplexity-source"],
+                        "search_results": [{
+                            "title": "Mock Perplexity Socartes Source",
+                            "url": "https://example.test/perplexity-source",
+                            "snippet": "Mock Perplexity search result snippet.",
+                            "date": "2026-05-30",
+                            "source": "mock-perplexity"
+                        }]
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_jina_search_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/{*encoded_query}",
+        axum::routing::get(move |headers: http::HeaderMap, uri: http::Uri| {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers
+                }));
+                axum::Json(json!({
+                    "code": 200,
+                    "status": 20000,
+                    "data": [{
+                        "title": "Mock Jina Socartes Result",
+                        "url": "https://example.test/jina-socartes",
+                        "description": "Mock Jina description snippet.",
+                        "date": "2026-05-30",
+                        "content": "Full content extracted by Jina.",
+                        "images": ["https://example.test/jina-image.png"],
+                        "publishedTime": "2026-05-30T12:00:00Z",
+                        "metadata": {"siteName": "Example Test"},
+                        "external": {"source": "mock-jina"},
+                        "usage": {"tokens": 111}
+                    }],
+                    "meta": {"usage": {"tokens": 321}}
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
 async fn spawn_status_request_recorder(
     status: http::StatusCode,
     response: Value,
@@ -288,6 +1455,55 @@ async fn spawn_status_request_recorder(
                     "headers": headers,
                     "payload": payload
                 }));
+                axum::response::IntoResponse::into_response((status, axum::Json(response)))
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_sequential_status_request_recorder(
+    responses: Vec<(http::StatusCode, Value)>,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let responses = Arc::new(responses);
+    let response_index = Arc::new(AtomicU64::new(0));
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let responses = Arc::clone(&responses);
+            let response_index = Arc::clone(&response_index);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                let index = response_index.fetch_add(1, Ordering::Relaxed) as usize;
+                let (status, response) = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_else(|| (http::StatusCode::OK, json!({"choices": []})));
                 axum::response::IntoResponse::into_response((status, axum::Json(response)))
             }
         },
@@ -338,6 +1554,107 @@ async fn spawn_sequential_request_recorder(
                     .cloned()
                     .unwrap_or_else(|| json!({"choices": []}));
                 axum::Json(response)
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_delayed_request_recorder(
+    response: Value,
+    delay: Duration,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let response = response.clone();
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                sleep(delay).await;
+                axum::Json(response)
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_delayed_dynamic_embedding_recorder(
+    delay: Duration,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                sleep(delay).await;
+                let input_count = payload["input"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(1)
+                    .max(1);
+                let data = (0..input_count)
+                    .map(|index| {
+                        json!({
+                            "object": "embedding",
+                            "index": index,
+                            "embedding": [1.0, index as f64, 0.0]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                axum::Json(json!({
+                    "object": "list",
+                    "data": data,
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": input_count, "total_tokens": input_count}
+                }))
             }
         },
     ));
@@ -504,12 +1821,156 @@ fn llm_test_catalog(base_url: &str) -> Value {
     })
 }
 
+fn search_test_catalog(provider: &str, api_key: &str, base_url: &str) -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "search": {
+                "active_profile_id": "search-profile",
+                "profiles": [{
+                    "id": "search-profile",
+                    "name": "Search Profile",
+                    "provider": provider,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
+            }
+        }
+    })
+}
+
+async fn system_status_for_search_catalog(app: &axum::Router, catalog: Value) -> Value {
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/system/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), http::StatusCode::OK);
+    json_response(status_response).await
+}
+
+fn llm_snapshot_replay_catalog(base_url: &str) -> Value {
+    json!({
+        "version": 1,
+        "services": {
+            "llm": {
+                "active_profile_id": "preference-llm",
+                "active_model_id": "preference-model",
+                "profiles": [
+                    {
+                        "id": "snapshot-llm",
+                        "name": "Snapshot LLM",
+                        "binding": "openai",
+                        "base_url": base_url,
+                        "api_key": "snapshot-key",
+                        "api_version": "",
+                        "extra_headers": {
+                            "x-socartes-test": "snapshot-chat"
+                        },
+                        "models": [{
+                            "id": "snapshot-model",
+                            "name": "Snapshot Chat Model",
+                            "model": "snapshot-chat-model",
+                            "context_window": "8192"
+                        }]
+                    },
+                    {
+                        "id": "preference-llm",
+                        "name": "Preference LLM",
+                        "binding": "openai",
+                        "base_url": base_url,
+                        "api_key": "preference-key",
+                        "api_version": "",
+                        "extra_headers": {
+                            "x-socartes-test": "preference-chat"
+                        },
+                        "models": [{
+                            "id": "preference-model",
+                            "name": "Preference Chat Model",
+                            "model": "preference-chat-model",
+                            "context_window": "8192"
+                        }]
+                    }
+                ]
+            },
+            "embedding": {
+                "active_profile_id": "socartes-rust-embedding",
+                "active_model_id": "deterministic-embedding",
+                "profiles": [{
+                    "id": "socartes-rust-embedding",
+                    "name": "Socartes Rust Embedding",
+                    "binding": "openai",
+                    "base_url": "local://socartes-rust",
+                    "api_key": "",
+                    "api_version": "",
+                    "extra_headers": {},
+                    "models": [{
+                        "id": "deterministic-embedding",
+                        "name": "Deterministic Embedding",
+                        "model": "deterministic-embedding",
+                        "dimension": "64"
+                    }]
+                }]
+            },
+            "search": {
+                "active_profile_id": "duckduckgo-local",
+                "profiles": [{
+                    "id": "duckduckgo-local",
+                    "name": "DuckDuckGo Local",
+                    "provider": "duckduckgo",
+                    "base_url": "",
+                    "api_key": "",
+                    "api_version": "",
+                    "proxy": "",
+                    "max_results": 5,
+                    "models": []
+                }]
+            }
+        }
+    })
+}
+
 async fn create_markdown_knowledge_base(
     app: axum::Router,
     name: &str,
     filename: &str,
     content: &str,
 ) {
+    let _ =
+        create_markdown_knowledge_base_at(app, "/api/v1/knowledge/create", name, filename, content)
+            .await;
+}
+
+async fn create_markdown_knowledge_base_at(
+    app: axum::Router,
+    uri: &str,
+    name: &str,
+    filename: &str,
+    content: &str,
+) -> Value {
     let boundary = format!(
         "SOCARTESCOURSE{}",
         TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -529,7 +1990,7 @@ async fn create_markdown_knowledge_base(
         .oneshot(
             http::Request::builder()
                 .method("POST")
-                .uri("/api/v1/knowledge/create")
+                .uri(uri)
                 .header(
                     http::header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={boundary}"),
@@ -540,6 +2001,7 @@ async fn create_markdown_knowledge_base(
         .await
         .unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
+    json_response(response).await
 }
 
 fn parse_sse_data_events(body: &str) -> Vec<Value> {
@@ -551,6 +2013,40 @@ fn parse_sse_data_events(body: &str) -> Vec<Value> {
                 .map(|data| serde_json::from_str::<Value>(data).expect("sse data json"))
         })
         .collect()
+}
+
+fn parse_sse_events(body: &str) -> Vec<(String, Value)> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            let event = block
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))?;
+            let data = block.lines().find_map(|line| line.strip_prefix("data: "))?;
+            Some((
+                event.to_string(),
+                serde_json::from_str::<Value>(data).expect("sse data json"),
+            ))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn root_endpoint_matches_python_welcome_contract() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(response).await,
+        json!({"message": "Welcome to Socartes API"})
+    );
 }
 
 #[tokio::test]
@@ -574,6 +2070,4272 @@ async fn health_endpoint_reports_backend_identity() {
             "version": "0.1.0"
         })
     );
+}
+
+#[tokio::test]
+async fn auth_disabled_routes_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(status_response).await,
+        json!({
+            "enabled": false,
+            "authenticated": true,
+            "user_id": "local-admin",
+            "username": "local",
+            "role": "admin",
+            "is_admin": true
+        })
+    );
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "local", "password": "unused"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    assert!(
+        login_response
+            .headers()
+            .get(http::header::SET_COOKIE)
+            .is_none()
+    );
+    assert_eq!(
+        json_response(login_response).await,
+        json!({"ok": true, "message": "Auth is disabled — no login required."})
+    );
+
+    let logout_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_response.status(), http::StatusCode::OK);
+    let cookie = logout_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("delete cookie")
+        .to_str()
+        .unwrap();
+    assert!(cookie.starts_with("dt_token="));
+    assert!(cookie.contains("Max-Age=0"));
+    assert_eq!(json_response(logout_response).await, json!({"ok": true}));
+
+    let first_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/is_first_user")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_user_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(first_user_response).await,
+        json!({"is_first_user": false})
+    );
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(register_response).await["detail"],
+        "Auth is disabled — registration is not available."
+    );
+
+    let users_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/users")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(users_response).await, json!([]));
+
+    let create_user_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(create_user_response).await["detail"],
+        "Auth is disabled — user creation is not available."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_login_status_and_guard_use_raw_pb_token_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/status")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(status_response).await,
+        json!({
+            "enabled": true,
+            "authenticated": true,
+            "user_id": "pb-existing-user",
+            "username": "existing@example.com",
+            "role": "admin",
+            "is_admin": true
+        })
+    );
+    assert!(
+        pocketbase_state
+            .refresh_authorizations
+            .lock()
+            .await
+            .contains(&"Bearer pb.existing.token".to_string())
+    );
+
+    let protected_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected_response.status(), http::StatusCode::OK);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice@example.com", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("pocketbase login cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+    assert_eq!(token, "pb.raw.login.token");
+    let login_payload = json_response(login_response).await;
+    assert_eq!(
+        login_payload,
+        json!({
+            "ok": true,
+            "user_id": "pb-user-1",
+            "username": "alice@example.com",
+            "role": "user",
+            "is_admin": false
+        })
+    );
+    assert_eq!(
+        pocketbase_state.login_requests.lock().await.as_slice(),
+        &[json!({"identity": "alice@example.com", "password": "password123"})]
+    );
+
+    let cookie_status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/status")
+                .header(http::header::COOKIE, format!("dt_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_status_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(cookie_status_response).await,
+        json!({
+            "enabled": true,
+            "authenticated": true,
+            "user_id": "pb-user-1",
+            "username": "alice@example.com",
+            "role": "user",
+            "is_admin": false
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_register_creates_pb_user_as_non_admin_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let first_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/is_first_user")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_user_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(first_user_response).await,
+        json!({"is_first_user": true})
+    );
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "new@example.com", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+    assert_eq!(
+        json_response(register_response).await,
+        json!({
+            "ok": true,
+            "user_id": "pb-created-user",
+            "username": "new@example.com",
+            "role": "user",
+            "is_first_user": true,
+            "is_admin": false
+        })
+    );
+    assert_eq!(
+        pocketbase_state.register_requests.lock().await.as_slice(),
+        &[json!({
+            "username": "new@example.com",
+            "email": "new@example.com",
+            "password": "password123",
+            "passwordConfirm": "password123"
+        })]
+    );
+    let users_path = test_data_root(&root)
+        .join("multi-user")
+        .join("_system")
+        .join("auth")
+        .join("users.json");
+    assert!(
+        !users_path.exists(),
+        "PocketBase register should not create a local admin user store"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_admin_create_user_proxies_to_pb_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "second@example.com", "password": "password123"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::CREATED);
+    assert_eq!(
+        json_response(create_response).await,
+        json!({
+            "ok": true,
+            "user_id": "pb-created-user",
+            "username": "second@example.com",
+            "role": "user",
+            "is_admin": false
+        })
+    );
+    assert_eq!(
+        pocketbase_state.register_requests.lock().await.as_slice(),
+        &[json!({
+            "username": "second@example.com",
+            "email": "second@example.com",
+            "password": "password123",
+            "passwordConfirm": "password123"
+        })]
+    );
+    let users_path = test_data_root(&root)
+        .join("multi-user")
+        .join("_system")
+        .join("auth")
+        .join("users.json");
+    assert!(
+        !users_path.exists(),
+        "PocketBase admin user creation should not write the local users store"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_test_chat_turn_persists_chat_records_to_pb_not_local_json_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+    let content = "Persist this chat turn in PocketBase.";
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": "pb-chat-session-1",
+                        "content": content,
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_result = json_response(chat_response).await;
+    let session_id = chat_result["session_id"].as_str().unwrap();
+    let turn_id = chat_result["turn_id"].as_str().unwrap();
+    assert_eq!(session_id, "pb-chat-session-1");
+    assert!(turn_id.starts_with("rust-turn-"));
+    assert!(
+        pocketbase_state
+            .refresh_authorizations
+            .lock()
+            .await
+            .contains(&"Bearer pb.existing.token".to_string())
+    );
+
+    let sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    let messages = mock_pocketbase_collection_records(&pocketbase_state, "messages").await;
+    let turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+    let turn_events = mock_pocketbase_collection_records(&pocketbase_state, "turn_events").await;
+
+    let session = sessions
+        .iter()
+        .find(|record| record["session_id"] == session_id)
+        .expect("session should be written to PocketBase");
+    assert_eq!(session["status"], "completed");
+    assert_eq!(session["capability"], "chat");
+    assert_eq!(session["preferences_json"]["language"], "en");
+    assert_eq!(session["preferences_json"]["knowledge_bases"], json!([]));
+
+    let user_message = messages
+        .iter()
+        .find(|record| record["session_id"] == session_id && record["role"] == "user")
+        .expect("user message should be written to PocketBase");
+    assert_eq!(user_message["content"], content);
+    assert_eq!(user_message["metadata_json"]["turn_id"], turn_id);
+    assert_eq!(
+        user_message["metadata_json"]["request_snapshot"]["content"],
+        content
+    );
+    let assistant_message = messages
+        .iter()
+        .find(|record| record["session_id"] == session_id && record["role"] == "assistant")
+        .expect("assistant message should be written to PocketBase");
+    assert!(
+        assistant_message["content"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+    );
+    assert_eq!(assistant_message["metadata_json"]["turn_id"], turn_id);
+    assert!(
+        assistant_message["events_json"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+    );
+
+    let turn = turns
+        .iter()
+        .find(|record| record["turn_id"] == turn_id)
+        .expect("turn should be written to PocketBase");
+    assert_eq!(turn["session_id"], session_id);
+    assert_eq!(turn["status"], "completed");
+    assert!(turn["finished_at"].as_f64().unwrap_or_default() > 0.0);
+
+    assert!(
+        turn_events.len() >= 3,
+        "turn events should be split into PocketBase turn_events records"
+    );
+    assert!(
+        turn_events
+            .iter()
+            .all(|event| event["session_id"] == session_id)
+    );
+    assert!(turn_events.iter().all(|event| event["turn_id"] == turn_id));
+    assert!(turn_events.iter().any(|event| event["type"] == "session"));
+    assert!(turn_events.iter().any(|event| event["type"] == "content"));
+    let done_event = turn_events
+        .iter()
+        .find(|event| event["type"] == "done")
+        .expect("done event should be written to PocketBase");
+    assert_eq!(done_event["metadata_json"]["status"], "completed");
+
+    let sessions_dir = test_data_root(&root).join("sessions");
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PocketBase chat persistence must not write local session JSON"
+    );
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["session_id"], session_id);
+    assert_eq!(detail["status"], "completed");
+    assert_eq!(detail["active_turn_id"], Value::Null);
+    assert_eq!(detail["active_turns"], json!([]));
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["messages"][0]["role"], "user");
+    assert_eq!(detail["messages"][1]["role"], "assistant");
+    assert!(
+        detail["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|turn| turn["id"] == turn_id && turn["status"] == "completed")
+    );
+    assert!(
+        detail["turn_events"][turn_id]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "done" && event["metadata"]["status"] == "completed")
+    );
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list_payload = json_response(list_response).await;
+    let listed_session = list_payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == session_id)
+        .expect("PB session should appear in list_sessions");
+    assert_eq!(listed_session["status"], "completed");
+    assert_eq!(listed_session["message_count"], 2);
+    assert_eq!(listed_session["last_message"], assistant_message["content"]);
+
+    let rename_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"title": "Renamed PB chat"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(rename_response).await["session"]["title"],
+        "Renamed PB chat"
+    );
+
+    let renamed_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed_detail_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(renamed_detail_response).await["title"],
+        "Renamed PB chat"
+    );
+
+    let delete_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_response).await,
+        json!({"deleted": true})
+    );
+    for collection in ["sessions", "messages", "turns", "turn_events"] {
+        assert!(
+            mock_pocketbase_collection_records(&pocketbase_state, collection)
+                .await
+                .is_empty(),
+            "{collection} records should be deleted with the session"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_chat_turn_rolls_back_pb_half_writes_when_message_metadata_schema_rejects()
+ {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    *pocketbase_state.reject_message_role.lock().await = Some("assistant".to_string());
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": "pb-schema-reject-session",
+                        "content": "This turn should not leave partial PB records.",
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    let payload = json_response(response).await;
+    assert!(
+        payload["detail"]
+            .as_str()
+            .unwrap()
+            .contains("messages.metadata_json validation failed")
+    );
+
+    for collection in ["sessions", "messages", "turns", "turn_events"] {
+        assert!(
+            mock_pocketbase_collection_records(&pocketbase_state, collection)
+                .await
+                .is_empty(),
+            "{collection} should not keep records after terminal turn persistence fails"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_quiz_results_records_pb_message_and_question_notebook_without_local_json()
+ {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+    let session_id = "pb-quiz-session";
+    {
+        let mut records = pocketbase_state.collection_records.lock().await;
+        records.insert(
+            "sessions".to_string(),
+            vec![json!({
+                "id": "sessions-quiz-1",
+                "session_id": session_id,
+                "title": "PB quiz source",
+                "status": "completed",
+                "capability": "chat",
+                "preferences_json": {"language": "en", "knowledge_bases": []},
+                "compressed_summary": "",
+                "summary_up_to_msg_id": 0,
+                "created_at": 1000.0,
+                "updated_at": 1000.0,
+                "created": "2026-05-30 00:00:00.000Z",
+                "updated": "2026-05-30 00:00:00.000Z"
+            })],
+        );
+    }
+
+    let expected_content = "[Quiz Performance]\n\
+1. [q1] Q: Which agent checks citations? -> Answered: A (Incorrect, correct: B)\n\
+2. [q2] Q: Which agent plans the task? -> Answered: Planner (Correct)\n\
+Score: 1/2 (50%)";
+    let quiz_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/sessions/{session_id}/quiz-results"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "answers": [
+                            {
+                                "question_id": "q1",
+                                "question": "Which agent checks citations?",
+                                "question_type": "multiple_choice",
+                                "options": { "A": "Planner", "B": "Critic" },
+                                "correct_answer": "B",
+                                "explanation": "The critic checks citation quality.",
+                                "difficulty": "medium",
+                                "user_answer": "A",
+                                "is_correct": false
+                            },
+                            {
+                                "question_id": "q2",
+                                "question": "Which agent plans the task?",
+                                "question_type": "short_answer",
+                                "correct_answer": "Planner",
+                                "user_answer": "Planner",
+                                "is_correct": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(quiz_response.status(), http::StatusCode::OK);
+    let quiz_payload = json_response(quiz_response).await;
+    assert_eq!(quiz_payload["recorded"], true);
+    assert_eq!(quiz_payload["session_id"], session_id);
+    assert_eq!(quiz_payload["answer_count"], 2);
+    assert_eq!(quiz_payload["notebook_count"], 2);
+    assert_eq!(quiz_payload["content"], expected_content);
+
+    let pb_messages = mock_pocketbase_collection_records(&pocketbase_state, "messages").await;
+    assert_eq!(pb_messages.len(), 1);
+    let quiz_message = &pb_messages[0];
+    assert_eq!(quiz_message["session_id"], session_id);
+    assert_eq!(quiz_message["role"], "user");
+    assert_eq!(quiz_message["capability"], "deep_question");
+    assert_eq!(quiz_message["content"], expected_content);
+    assert_eq!(quiz_message["events_json"], json!([]));
+    assert_eq!(quiz_message["attachments_json"], json!([]));
+    assert_eq!(quiz_message["metadata_json"], json!({}));
+    assert!(quiz_message["msg_created_at"].as_f64().unwrap_or_default() > 0.0);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["session_id"], session_id);
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["messages"][0]["role"], "user");
+    assert_eq!(detail["messages"][0]["capability"], "deep_question");
+    assert_eq!(detail["messages"][0]["content"], expected_content);
+    assert_eq!(detail["messages"][0]["events"], json!([]));
+    assert_eq!(detail["messages"][0]["attachments"], json!([]));
+    assert_eq!(detail["messages"][0]["metadata"], json!({}));
+
+    let sessions_dir = test_data_root(&root).join("sessions");
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PocketBase quiz-results persistence must not write local session JSON"
+    );
+
+    let lookup_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/v1/question-notebook/entries/lookup/by-question?session_id={session_id}&question_id=q1"
+                ))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lookup_response.status(), http::StatusCode::OK);
+    let first_entry = json_response(lookup_response).await;
+    assert_eq!(first_entry["session_title"], "PB quiz source");
+    assert_eq!(first_entry["question"], "Which agent checks citations?");
+    assert_eq!(first_entry["options"]["B"], "Critic");
+    assert_eq!(first_entry["correct_answer"], "B");
+    assert_eq!(first_entry["user_answer"], "A");
+    assert_eq!(first_entry["is_correct"], false);
+    let first_updated_at = first_entry["updated_at"].as_f64().unwrap();
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/sessions/{session_id}/quiz-results"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "answers": [{
+                            "question_id": "q1",
+                            "question": "A changed question should not overwrite the notebook stem",
+                            "question_type": "multiple_choice",
+                            "options": { "A": "Planner", "B": "Critic", "C": "Executor" },
+                            "correct_answer": "C",
+                            "explanation": "Changed explanation should not overwrite.",
+                            "difficulty": "hard",
+                            "user_answer": "B",
+                            "is_correct": true
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+    let update_payload = json_response(update_response).await;
+    assert_eq!(update_payload["answer_count"], 1);
+    assert_eq!(update_payload["notebook_count"], 1);
+
+    let updated_lookup_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/v1/question-notebook/entries/lookup/by-question?session_id={session_id}&question_id=q1"
+                ))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_lookup_response.status(), http::StatusCode::OK);
+    let updated_entry = json_response(updated_lookup_response).await;
+    assert_eq!(updated_entry["question"], "Which agent checks citations?");
+    assert_eq!(
+        updated_entry["options"],
+        json!({ "A": "Planner", "B": "Critic" })
+    );
+    assert_eq!(updated_entry["correct_answer"], "B");
+    assert_eq!(updated_entry["user_answer"], "B");
+    assert_eq!(updated_entry["is_correct"], true);
+    assert!(
+        updated_entry["updated_at"].as_f64().unwrap() >= first_updated_at,
+        "PB quiz retry should update the notebook entry timestamp"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_followup_turn_preserves_renamed_session_title_like_python() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+    let session_id = "pb-renamed-title-session";
+
+    let first_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": session_id,
+                        "content": "Original title seed for PocketBase session.",
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), http::StatusCode::OK);
+
+    let rename_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"title": "Pinned PB title"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(rename_response).await["session"]["title"],
+        "Pinned PB title"
+    );
+
+    let followup_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": session_id,
+                        "content": "This follow-up question must not replace the renamed title.",
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(followup_response.status(), http::StatusCode::OK);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["title"], "Pinned PB title");
+    assert_eq!(detail["messages"].as_array().unwrap().len(), 4);
+
+    let sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    let session = sessions
+        .iter()
+        .find(|record| record["session_id"] == session_id)
+        .expect("renamed PB session");
+    assert_eq!(session["title"], "Pinned PB title");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_chat_ws_subscribe_turn_replays_persisted_events_and_continues_running_turn_contract()
+ {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut starter_socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/ws?token=pb.existing.token"))
+            .await
+            .unwrap();
+    starter_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Explain PocketBase replayable running turn events.",
+                "capability": "chat",
+                "language": "en",
+                "knowledge_bases": [],
+                "config": { "debug_stream_delay_ms": 25 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = timeout(Duration::from_secs(2), starter_socket.next())
+        .await
+        .expect("first websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(first_text) = first_message else {
+        panic!("expected text websocket message, got {first_message:?}");
+    };
+    let session_event: Value = serde_json::from_str(&first_text).unwrap();
+    assert_eq!(session_event["type"], "session");
+    let session_id = session_event["session_id"].as_str().unwrap().to_string();
+    let turn_id = session_event["turn_id"].as_str().unwrap().to_string();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let pb_turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+            if pb_turns
+                .iter()
+                .any(|record| record["turn_id"] == turn_id && record["status"] == "completed")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PocketBase turn should be terminal after websocket done");
+
+    let pb_sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    let pb_turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+    let pb_turn_events = mock_pocketbase_collection_records(&pocketbase_state, "turn_events").await;
+    assert!(
+        pb_sessions.iter().any(|record| {
+            record["session_id"] == session_id
+                && matches!(
+                    record["status"].as_str(),
+                    Some("running") | Some("completed")
+                )
+        }),
+        "running websocket turn should create/update a PocketBase session immediately"
+    );
+    assert!(
+        pb_turns.iter().any(|record| {
+            record["turn_id"] == turn_id
+                && record["session_id"] == session_id
+                && matches!(
+                    record["status"].as_str(),
+                    Some("running") | Some("completed")
+                )
+        }),
+        "running websocket turn should create/update a PocketBase turn immediately"
+    );
+    assert!(
+        pb_turn_events.iter().any(|event| {
+            event["turn_id"] == turn_id
+                && event["session_id"] == session_id
+                && event["type"] == "session"
+                && event["seq"] == 1
+        }),
+        "first websocket event should be persisted to PocketBase before live broadcast"
+    );
+
+    let (mut subscriber_socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/ws?token=pb.existing.token"))
+            .await
+            .unwrap();
+    subscriber_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 1
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let subscriber_events = collect_ws_json_until(&mut subscriber_socket, "done").await;
+    assert!(
+        !subscriber_events.is_empty(),
+        "subscriber should receive replayed and live events"
+    );
+    assert_eq!(subscriber_events[0]["seq"], 2);
+    assert!(
+        subscriber_events
+            .windows(2)
+            .all(|pair| { pair[0]["seq"].as_u64().unwrap() < pair[1]["seq"].as_u64().unwrap() })
+    );
+    assert!(
+        subscriber_events
+            .iter()
+            .all(|event| event["session_id"] == session_id)
+    );
+    assert!(
+        subscriber_events
+            .iter()
+            .all(|event| event["turn_id"] == turn_id)
+    );
+    assert_eq!(subscriber_events.last().unwrap()["type"], "done");
+    assert_eq!(
+        subscriber_events.last().unwrap()["metadata"]["status"],
+        "completed"
+    );
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let pb_turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+            if pb_turns
+                .iter()
+                .any(|record| record["turn_id"] == turn_id && record["status"] == "completed")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PocketBase turn should be terminal after websocket done");
+
+    let pb_sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    let pb_turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+    let pb_turn_events = mock_pocketbase_collection_records(&pocketbase_state, "turn_events").await;
+    assert_eq!(
+        pb_sessions
+            .iter()
+            .filter(|record| record["session_id"] == session_id)
+            .count(),
+        1,
+        "partial and terminal persistence should not duplicate PB sessions"
+    );
+    assert_eq!(
+        pb_turns
+            .iter()
+            .filter(|record| record["turn_id"] == turn_id)
+            .count(),
+        1,
+        "partial and terminal persistence should not duplicate PB turns"
+    );
+    let turn = pb_turns
+        .iter()
+        .find(|record| record["turn_id"] == turn_id)
+        .expect("turn should still be stored in PocketBase");
+    assert_eq!(turn["status"], "completed");
+    assert!(turn["finished_at"].as_f64().unwrap_or_default() > 0.0);
+    let mut seen_seqs = Vec::new();
+    for event in pb_turn_events
+        .iter()
+        .filter(|event| event["turn_id"] == turn_id)
+    {
+        let seq = event["seq"].as_u64().unwrap();
+        assert!(
+            !seen_seqs.contains(&seq),
+            "turn_events should be unique by turn_id and seq"
+        );
+        seen_seqs.push(seq);
+    }
+    seen_seqs.sort_unstable();
+    assert_eq!(seen_seqs, vec![1, 2, 3, 4, 5, 6, 7]);
+
+    let sessions_dir = test_data_root(&root).join("sessions");
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PocketBase websocket persistence must not write local session JSON"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_cancel_stored_running_turn_updates_pb_and_replays_terminal_events() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let session_id = "pb-stored-running-session";
+    let turn_id = "pb-stored-running-turn";
+    {
+        let mut records = pocketbase_state.collection_records.lock().await;
+        records.insert(
+            "sessions".to_string(),
+            vec![json!({
+                "id": "sessions-1",
+                "session_id": session_id,
+                "title": "PB stored running turn",
+                "compressed_summary": "",
+                "summary_up_to_msg_id": 0,
+                "preferences_json": {"language": "en", "knowledge_bases": []},
+                "capability": "chat",
+                "status": "running",
+                "created": "2026-05-30 00:00:00.000Z",
+                "updated": "2026-05-30 00:00:01.000Z"
+            })],
+        );
+        records.insert(
+            "messages".to_string(),
+            vec![json!({
+                "id": "messages-1",
+                "session_id": session_id,
+                "role": "user",
+                "content": "Cancel this PocketBase stored running turn",
+                "capability": "chat",
+                "events_json": [],
+                "attachments_json": [],
+                "metadata_json": {"turn_id": turn_id},
+                "msg_created_at": 10.0,
+                "created": "2026-05-30 00:00:02.000Z",
+                "updated": "2026-05-30 00:00:02.000Z"
+            })],
+        );
+        records.insert(
+            "turns".to_string(),
+            vec![json!({
+                "id": "turns-1",
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "capability": "chat",
+                "status": "running",
+                "error": "",
+                "turn_created_at": 20.0,
+                "turn_updated_at": 21.0,
+                "created": "2026-05-30 00:00:03.000Z",
+                "updated": "2026-05-30 00:00:03.000Z"
+            })],
+        );
+        records.insert(
+            "turn_events".to_string(),
+            vec![
+                json!({
+                    "id": "turn_events-1",
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "seq": 1,
+                    "type": "session",
+                    "source": "turn_runtime",
+                    "stage": "",
+                    "content": "",
+                    "metadata_json": {"session_id": session_id, "turn_id": turn_id},
+                    "event_timestamp": 20.0,
+                    "created": "2026-05-30 00:00:04.000Z",
+                    "updated": "2026-05-30 00:00:04.000Z"
+                }),
+                json!({
+                    "id": "turn_events-2",
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "seq": 2,
+                    "type": "stage_start",
+                    "source": "planner",
+                    "stage": "planner",
+                    "content": "Stored PB running event",
+                    "metadata_json": {},
+                    "event_timestamp": 21.0,
+                    "created": "2026-05-30 00:00:05.000Z",
+                    "updated": "2026-05-30 00:00:05.000Z"
+                }),
+            ],
+        );
+    }
+
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+    let detail_app = app.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut cancel_socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/ws?token=pb.existing.token"))
+            .await
+            .unwrap();
+    cancel_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "cancel_turn",
+                "session_id": session_id,
+                "turn_id": turn_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let pb_turn_events =
+                mock_pocketbase_collection_records(&pocketbase_state, "turn_events").await;
+            if pb_turn_events
+                .iter()
+                .any(|event| event["turn_id"] == turn_id && event["type"] == "done")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancel_turn should append terminal PocketBase events");
+
+    let (mut replay_socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/ws?token=pb.existing.token"))
+            .await
+            .unwrap();
+    replay_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "subscribe_turn",
+                "turn_id": turn_id,
+                "after_seq": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut replay_events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), replay_socket.next())
+            .await
+            .expect("PocketBase stored cancellation should replay terminal events")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        let done = event["type"] == "done";
+        replay_events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    assert_eq!(
+        replay_events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(replay_events[2]["type"], "error");
+    assert_eq!(replay_events[2]["metadata"]["status"], "cancelled");
+    assert_eq!(replay_events[2]["metadata"]["turn_terminal"], true);
+    assert_eq!(replay_events[2]["content"], "Turn cancelled");
+    assert_eq!(replay_events[3]["type"], "done");
+    assert_eq!(replay_events[3]["metadata"]["status"], "cancelled");
+
+    let detail_response = detail_app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["status"], "cancelled");
+    assert_eq!(detail["active_turn_id"], Value::Null);
+    assert_eq!(detail["active_turns"], json!([]));
+    assert_eq!(detail["turns"][0]["status"], "cancelled");
+    assert_eq!(detail["turns"][0]["error"], "Turn cancelled");
+    assert_eq!(detail["turns"][0]["event_count"], 4);
+
+    let pb_sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    let pb_turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+    let pb_messages = mock_pocketbase_collection_records(&pocketbase_state, "messages").await;
+    let pb_turn_events = mock_pocketbase_collection_records(&pocketbase_state, "turn_events").await;
+    let session = pb_sessions
+        .iter()
+        .find(|record| record["session_id"] == session_id)
+        .expect("session should remain in PocketBase");
+    assert_eq!(session["status"], "cancelled");
+    let turn = pb_turns
+        .iter()
+        .find(|record| record["turn_id"] == turn_id)
+        .expect("turn should remain in PocketBase");
+    assert_eq!(turn["status"], "cancelled");
+    assert_eq!(turn["error"], "Turn cancelled");
+    assert!(turn["finished_at"].as_f64().unwrap_or_default() > 0.0);
+    assert_eq!(pb_messages.len(), 1, "cancel should not mutate messages");
+    let mut event_seqs = pb_turn_events
+        .iter()
+        .filter(|event| event["turn_id"] == turn_id)
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    event_seqs.sort_unstable();
+    assert_eq!(event_seqs, vec![1, 2, 3, 4]);
+
+    let sessions_dir = test_data_root(&root).join("sessions");
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PocketBase stored cancellation must not write local session JSON"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn pocketbase_auth_mode_chat_ws_regenerate_reuses_pb_session_without_local_json_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+    let original_question = "Explain PB-backed regenerate without local session JSON.";
+
+    let first_turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "session_id": "pb-regenerate-session-1",
+                        "content": original_question,
+                        "capability": "chat",
+                        "language": "en",
+                        "tools": [],
+                        "knowledge_bases": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_turn_response.status(), http::StatusCode::OK);
+    let first_turn = json_response(first_turn_response).await;
+    let session_id = first_turn["session_id"].as_str().unwrap().to_string();
+    let first_turn_id = first_turn["turn_id"].as_str().unwrap().to_string();
+
+    let sessions_dir = test_data_root(&root).join("sessions");
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PB-backed seed turn must not create local session JSON"
+    );
+
+    let server_app = app.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_app).await.unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws?token=pb.existing.token"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate",
+                "session_id": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    server.abort();
+
+    assert!(
+        events.iter().all(|event| event["type"] != "error"),
+        "PB regenerate should not fail with protocol error: {events:?}"
+    );
+    let session_event = events
+        .iter()
+        .find(|event| event["type"] == "session")
+        .expect("regenerate session event");
+    let regenerated_turn_id = session_event["turn_id"].as_str().unwrap();
+    assert_ne!(regenerated_turn_id, first_turn_id);
+    assert_eq!(session_event["metadata"]["regenerate"], true);
+    assert!(
+        session_event["metadata"]["regenerated_from_message_id"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(
+        session_event["metadata"]["superseded_turn_id"],
+        first_turn_id
+    );
+    assert_eq!(events.last().unwrap()["type"], "done");
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+            if turns
+                .iter()
+                .any(|turn| turn["turn_id"] == regenerated_turn_id && turn["status"] == "completed")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("regenerated PB turn should reach completed storage state");
+
+    let messages = mock_pocketbase_collection_records(&pocketbase_state, "messages").await;
+    let user_messages = messages
+        .iter()
+        .filter(|message| message["session_id"] == session_id && message["role"] == "user")
+        .collect::<Vec<_>>();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message["session_id"] == session_id && message["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(user_messages[0]["content"], original_question);
+    assert_eq!(
+        session_event["metadata"]["regenerated_from_message_id"], user_messages[0]["id"],
+        "PB regenerate should identify the original user message record"
+    );
+    assert_eq!(
+        user_messages[0]["metadata_json"]["turn_id"], first_turn_id,
+        "regenerate should reuse the original user message"
+    );
+    assert_eq!(assistant_messages.len(), 1);
+    assert_eq!(
+        assistant_messages[0]["metadata_json"]["turn_id"], regenerated_turn_id,
+        "regenerate should replace the superseded assistant message"
+    );
+    assert!(
+        assistant_messages
+            .iter()
+            .all(|message| message["metadata_json"]["turn_id"] != first_turn_id),
+        "regenerate should delete the superseded assistant message record"
+    );
+
+    let sessions = mock_pocketbase_collection_records(&pocketbase_state, "sessions").await;
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session["session_id"] == session_id)
+            .count(),
+        1,
+        "regenerate should reuse the PB session record instead of creating a duplicate"
+    );
+    let turns = mock_pocketbase_collection_records(&pocketbase_state, "turns").await;
+    assert_eq!(
+        turns
+            .iter()
+            .filter(|turn| turn["session_id"] == session_id)
+            .count(),
+        2,
+        "regenerate should preserve the superseded turn and add one new turn"
+    );
+    assert!(
+        !sessions_dir.exists()
+            || fs::read_dir(&sessions_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+        "PB-backed regenerate must not create local session JSON"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_register_login_status_and_users_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let first_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/is_first_user")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_user_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(first_user_response).await,
+        json!({"is_first_user": true})
+    );
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+    let registered = json_response(register_response).await;
+    assert_eq!(registered["ok"], true);
+    assert_eq!(registered["username"], "alice");
+    assert_eq!(registered["role"], "admin");
+    assert_eq!(registered["is_first_user"], true);
+    assert_eq!(registered["is_admin"], true);
+    assert!(registered["user_id"].as_str().unwrap().starts_with("u_"));
+
+    let closed_register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        closed_register_response.status(),
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(closed_register_response).await["detail"],
+        "Self-registration is closed. Ask an administrator to create your account."
+    );
+
+    let anonymous_status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous_status_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(anonymous_status_response).await,
+        json!({
+            "enabled": true,
+            "authenticated": false,
+            "user_id": null,
+            "username": null,
+            "role": null,
+            "is_admin": false
+        })
+    );
+
+    let bad_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "wrong-password"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_login_response.status(), http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_response(bad_login_response).await["detail"],
+        "Incorrect username or password"
+    );
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("login cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("dt_token="));
+    assert!(cookie.contains("Max-Age=86400"));
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Lax"));
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+    assert!(!token.is_empty());
+    let logged_in = json_response(login_response).await;
+    assert_eq!(logged_in["ok"], true);
+    assert_eq!(logged_in["user_id"], registered["user_id"]);
+    assert_eq!(logged_in["username"], "alice");
+    assert_eq!(logged_in["role"], "admin");
+    assert_eq!(logged_in["is_admin"], true);
+
+    for auth_header in [
+        format!("Bearer {token}"),
+        "Bearer invalid-token".to_string(),
+    ] {
+        let status_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api/v1/auth/status")
+                    .header(http::header::AUTHORIZATION, &auth_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), http::StatusCode::OK);
+        let status = json_response(status_response).await;
+        assert_eq!(status["enabled"], true);
+        if auth_header.starts_with("Bearer invalid") {
+            assert_eq!(status["authenticated"], false);
+        } else {
+            assert_eq!(status["authenticated"], true);
+            assert_eq!(status["user_id"], registered["user_id"]);
+            assert_eq!(status["username"], "alice");
+            assert_eq!(status["role"], "admin");
+            assert_eq!(status["is_admin"], true);
+        }
+    }
+
+    let cookie_status_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/status")
+                .header(http::header::COOKIE, format!("dt_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_status_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(cookie_status_response).await["authenticated"],
+        true
+    );
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let created_user = json_response(create_user_response).await;
+    assert_eq!(created_user["ok"], true);
+    assert_eq!(created_user["username"], "bob");
+    assert_eq!(created_user["role"], "user");
+    assert_eq!(created_user["is_admin"], false);
+
+    let users_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_response.status(), http::StatusCode::OK);
+    let users = json_response(users_response).await;
+    assert_eq!(users.as_array().unwrap().len(), 2);
+    assert_eq!(users[0]["username"], "alice");
+    assert_eq!(users[0]["role"], "admin");
+    assert!(users[0].get("hash").is_none());
+    assert_eq!(users[1]["username"], "bob");
+    assert_eq!(users[1]["role"], "user");
+    assert!(users[1].get("hash").is_none());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_admin_user_management_guards_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let admin_cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("admin cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let admin_token = admin_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+
+    let bob_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login_response.status(), http::StatusCode::OK);
+    let bob_token = bob_login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("bob cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+
+    let user_list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_list_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(user_list_response).await["detail"],
+        "Admin access required"
+    );
+
+    let promote_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/auth/users/bob/role")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"role": "admin"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promote_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(promote_response).await,
+        json!({"ok": true, "username": "bob", "role": "admin"})
+    );
+
+    let self_role_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/auth/users/alice/role")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"role": "user"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(self_role_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(self_role_response).await["detail"],
+        "You cannot change your own role"
+    );
+
+    let self_delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/auth/users/alice")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(self_delete_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(self_delete_response).await["detail"],
+        "You cannot delete your own account"
+    );
+
+    let missing_delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/auth/users/missing")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_delete_response.status(),
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_response(missing_delete_response).await["detail"],
+        "User not found"
+    );
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/auth/users/bob")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(delete_response).await, json!({"ok": true}));
+
+    let users_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_response.status(), http::StatusCode::OK);
+    let users = json_response(users_response).await;
+    assert_eq!(users.as_array().unwrap().len(), 1);
+    assert_eq!(users[0]["username"], "alice");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_migrates_legacy_users_and_secret_like_python_contract() {
+    let root = unique_test_knowledge_root();
+    let data_root = test_data_root(&root);
+    let legacy_auth_root = data_root.join("user");
+    fs::create_dir_all(&legacy_auth_root).unwrap();
+    fs::write(
+        legacy_auth_root.join("auth_secret"),
+        " legacy-secret-from-python \n",
+    )
+    .unwrap();
+
+    let alice_hash = bcrypt::hash("password123", 4).unwrap();
+    let bob_hash = bcrypt::hash("password456", 4).unwrap();
+    fs::write(
+        legacy_auth_root.join("auth_users.json"),
+        serde_json::to_string_pretty(&json!({
+            "alice": alice_hash,
+            "bob": {
+                "id": "legacy-bob",
+                "password_hash": bob_hash,
+                "role": "not-a-real-role",
+                "created_at": "2026-05-01T00:00:00+00:00",
+                "disabled": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let app = app_with_knowledge_root_and_stored_auth(&root);
+
+    let canonical_secret_path = data_root
+        .join("multi-user")
+        .join("_system")
+        .join("auth")
+        .join("auth_secret");
+    assert_eq!(
+        fs::read_to_string(&canonical_secret_path).unwrap().trim(),
+        "legacy-secret-from-python"
+    );
+
+    let alice_login = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(alice_login.status(), http::StatusCode::OK);
+    let alice = json_response(alice_login).await;
+    assert_eq!(alice["username"], "alice");
+    assert_eq!(alice["role"], "admin");
+    assert_eq!(alice["is_admin"], true);
+    assert!(alice["user_id"].as_str().unwrap().starts_with("u_"));
+
+    let bob_login = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login.status(), http::StatusCode::OK);
+    let bob = json_response(bob_login).await;
+    assert_eq!(bob["username"], "bob");
+    assert_eq!(bob["user_id"], "legacy-bob");
+    assert_eq!(bob["role"], "user");
+    assert_eq!(bob["is_admin"], false);
+
+    let canonical_users_path = data_root
+        .join("multi-user")
+        .join("_system")
+        .join("auth")
+        .join("users.json");
+    let canonical_users: Value =
+        serde_json::from_str(&fs::read_to_string(canonical_users_path).unwrap()).unwrap();
+    assert_eq!(canonical_users["alice"]["role"], "admin");
+    assert!(
+        canonical_users["alice"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("u_")
+    );
+    assert_eq!(canonical_users["bob"]["id"], "legacy-bob");
+    assert_eq!(canonical_users["bob"]["hash"], bob_hash);
+    assert_eq!(canonical_users["bob"]["role"], "user");
+    assert_eq!(
+        canonical_users["bob"]["created_at"],
+        "2026-05-01T00:00:00+00:00"
+    );
+    assert!(legacy_auth_root.join("auth_users.json").exists());
+
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[tokio::test]
+async fn auth_enabled_env_user_fallback_matches_python_contract() {
+    let root = unique_test_knowledge_root();
+    let password_hash = bcrypt::hash("password123", 4).unwrap();
+    let app = app_with_knowledge_root_and_auth_env_user(&root, "env-admin", &password_hash);
+
+    let first_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/is_first_user")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_user_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(first_user_response).await,
+        json!({"is_first_user": false})
+    );
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "env-admin", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let token = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("env login cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+    let logged_in = json_response(login_response).await;
+    assert_eq!(logged_in["user_id"], "env-admin");
+    assert_eq!(logged_in["username"], "env-admin");
+    assert_eq!(logged_in["role"], "admin");
+    assert_eq!(logged_in["is_admin"], true);
+
+    let users_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_response.status(), http::StatusCode::OK);
+    let users = json_response(users_response).await;
+    assert_eq!(users.as_array().unwrap().len(), 1);
+    assert_eq!(users[0]["id"], "env-admin");
+    assert_eq!(users[0]["username"], "env-admin");
+    assert_eq!(users[0]["role"], "admin");
+    assert!(users[0].get("hash").is_none());
+
+    let users_path = test_data_root(&root)
+        .join("multi-user")
+        .join("_system")
+        .join("auth")
+        .join("users.json");
+    assert!(!users_path.exists());
+
+    let register_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(register_response).await["detail"],
+        "Self-registration is closed. Ask an administrator to create your account."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_auth_enabled_role_crops_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let admin_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login_response.status(), http::StatusCode::OK);
+    let admin_token = auth_token_from_set_cookie(&admin_login_response);
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+
+    let bob_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login_response.status(), http::StatusCode::OK);
+    let bob_token = auth_token_from_set_cookie(&bob_login_response);
+
+    let mut catalog = llm_test_catalog("https://internal-llm.example/v1");
+    catalog["services"]["llm"]["profiles"][0]["api_key"] = json!("llm-secret");
+    catalog["services"]["llm"]["profiles"][0]["api_version"] = json!("2026-05-29");
+    catalog["services"]["llm"]["profiles"][0]["extra_headers"] = json!({
+        "Authorization": "Bearer hidden-runtime-token"
+    });
+    catalog["services"]["embedding"]["profiles"][0]["api_key"] = json!("embedding-secret");
+    catalog["services"]["search"]["profiles"][0]["api_key"] = json!("search-secret");
+
+    let update_catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_catalog_response.status(), http::StatusCode::OK);
+    let updated_catalog = json_response(update_catalog_response).await;
+    assert_eq!(
+        updated_catalog["catalog"]["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+    assert_eq!(
+        updated_catalog["catalog"]["services"]["llm"]["profiles"][0]["base_url"],
+        "https://internal-llm.example/v1"
+    );
+
+    let admin_settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_settings_response.status(), http::StatusCode::OK);
+    let admin_settings = json_response(admin_settings_response).await;
+    assert!(admin_settings.get("ui").is_some());
+    assert!(admin_settings.get("catalog").is_some());
+    assert!(admin_settings.get("providers").is_some());
+    assert!(admin_settings.get("model_access").is_none());
+    assert_eq!(
+        admin_settings["catalog"]["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+    assert_eq!(
+        admin_settings["catalog"]["services"]["embedding"]["profiles"][0]["api_key"],
+        "********"
+    );
+    assert_eq!(
+        admin_settings["catalog"]["services"]["search"]["profiles"][0]["api_key"],
+        "********"
+    );
+    assert_eq!(
+        admin_settings["catalog"]["services"]["llm"]["profiles"][0]["base_url"],
+        "https://internal-llm.example/v1"
+    );
+    assert!(!json_object_has_key(
+        &admin_settings["providers"],
+        "api_key"
+    ));
+
+    let user_settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_settings_response.status(), http::StatusCode::OK);
+    let user_settings = json_response(user_settings_response).await;
+    assert!(user_settings.get("ui").is_some());
+    assert!(user_settings.get("model_access").is_some());
+    assert!(user_settings.get("catalog").is_none());
+    assert!(user_settings.get("providers").is_none());
+    assert_eq!(user_settings["model_access"]["llm"], json!([]));
+    assert_eq!(user_settings["model_access"]["embedding"], json!([]));
+    assert_eq!(user_settings["model_access"]["search"], json!([]));
+    for forbidden in [
+        "api_key",
+        "base_url",
+        "api_version",
+        "extra_headers",
+        "binding",
+        "token",
+        "secret",
+        "password",
+        "path",
+    ] {
+        assert!(
+            !json_object_has_key(&user_settings["model_access"], forbidden),
+            "ordinary user model_access leaked key {forbidden}"
+        );
+    }
+
+    let user_catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/catalog")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_catalog_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(user_catalog_response).await["detail"],
+        "Model configuration is managed by an administrator."
+    );
+
+    for (method, uri) in [
+        ("PUT", "/api/v1/settings/catalog"),
+        ("POST", "/api/v1/settings/apply"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"catalog": catalog}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_response(response).await["detail"],
+            "Model configuration is managed by an administrator."
+        );
+    }
+
+    let mut masked_catalog = updated_catalog["catalog"].clone();
+    masked_catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] =
+        json!("masked-submit-model");
+    let masked_update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": masked_catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(masked_update_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(masked_update_response).await["catalog"]["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+    let persisted_catalog = fs::read_to_string(test_data_root(&root).join("settings/catalog.json"))
+        .expect("persisted catalog");
+    assert!(persisted_catalog.contains("llm-secret"));
+    assert!(!persisted_catalog.contains("\"api_key\": \"********\""));
+
+    let apply_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/apply")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": updated_catalog["catalog"].clone()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(apply_response.status(), http::StatusCode::OK);
+    let apply_payload = json_response(apply_response).await;
+    assert_eq!(
+        apply_payload["catalog"]["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+    assert_eq!(apply_payload["env"]["SOCARTES_LLM_API_KEY"], "********");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_global_guard_protects_business_http_routes_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    for uri in [
+        "/health",
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+        "/api/v1/auth/status",
+        "/api/v1/auth/is_first_user",
+        "/api/outputs/missing-artifact.txt",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            http::StatusCode::UNAUTHORIZED,
+            "{uri} should remain public when auth is enabled"
+        );
+    }
+
+    for uri in [
+        "/api/v1/knowledge/list",
+        "/api/v1/courses",
+        "/api/v1/course",
+        "/api/v1/settings",
+        "/api/v1/sessions",
+        "/api/attachments/session/attachment/file.txt",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            http::StatusCode::UNAUTHORIZED,
+            "{uri} should require auth when AUTH_ENABLED=true"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail": "Not authenticated"})
+        );
+    }
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("login cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+
+    for (uri, header_name, header_value) in [
+        (
+            "/api/v1/knowledge/list",
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}"),
+        ),
+        (
+            "/api/v1/courses",
+            http::header::COOKIE,
+            format!("dt_token={token}"),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .header(header_name, header_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    let invalid_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .header(http::header::AUTHORIZATION, "Bearer invalid-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_response(invalid_response).await,
+        json!({"detail": "Invalid or expired token"})
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn multi_user_access_resources_and_grants_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let admin_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login_response.status(), http::StatusCode::OK);
+    let admin_token = auth_token_from_set_cookie(&admin_login_response);
+    let admin_payload = json_response(admin_login_response).await;
+    let admin_user_id = admin_payload["user_id"].as_str().unwrap().to_string();
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let bob_user_id = json_response(create_user_response).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let bob_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login_response.status(), http::StatusCode::OK);
+    let bob_token = auth_token_from_set_cookie(&bob_login_response);
+
+    let data_root = test_data_root(&root);
+    fs::create_dir_all(data_root.join("settings")).unwrap();
+    fs::write(
+        data_root.join("settings").join("catalog.json"),
+        serde_json::to_string_pretty(&llm_test_catalog("https://llm.internal/v1")).unwrap(),
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("bases").join("admin-course")).unwrap();
+    let skill_dir = test_skills_root(&root).join("essay-coach");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: essay-coach\ndescription: Essay Coach\ntags:\n- writing\n---\n\nCoach essays with course evidence.\n",
+    )
+    .unwrap();
+
+    let unauth_access = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/me/access")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_access.status(), http::StatusCode::UNAUTHORIZED);
+
+    let user_access_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/me/access")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_access_response.status(), http::StatusCode::OK);
+    let user_access = json_response(user_access_response).await;
+    assert_eq!(user_access["user"]["id"], bob_user_id);
+    assert_eq!(user_access["user"]["username"], "bob");
+    assert_eq!(user_access["user"]["role"], "user");
+    assert_eq!(user_access["user"]["is_admin"], false);
+    assert_eq!(user_access["models"]["llm"], json!([]));
+    assert_eq!(user_access["knowledge_bases"], json!([]));
+    assert_eq!(user_access["skills"], json!([]));
+    assert_eq!(user_access["spaces"], json!([]));
+
+    let user_resources_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/admin/resources")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        user_resources_response.status(),
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(user_resources_response).await["detail"],
+        "Admin access required"
+    );
+
+    let resources_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/admin/resources")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resources_response.status(), http::StatusCode::OK);
+    let resources = json_response(resources_response).await;
+    assert!(
+        resources["models"]["llm"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["profile_id"] == "mock-llm"
+                && profile["models"][0]["model_id"] == "mock-model")
+    );
+    assert!(
+        resources["knowledge_bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kb| kb["resource_id"] == "admin:kb:admin-course"
+                && kb["name"] == "admin-course"
+                && kb["source"] == "admin")
+    );
+    assert!(
+        resources["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill["name"] == "essay-coach")
+    );
+
+    let default_grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(default_grant_response.status(), http::StatusCode::OK);
+    let default_grant = json_response(default_grant_response).await["grant"].clone();
+    assert_eq!(default_grant["version"], 1);
+    assert_eq!(default_grant["user_id"], bob_user_id);
+    assert_eq!(default_grant["models"]["llm"], json!([]));
+    assert_eq!(default_grant["knowledge_bases"], json!([]));
+    assert_eq!(default_grant["skills"], json!([]));
+    assert_eq!(default_grant["spaces"], json!([]));
+
+    let grant_payload = json!({
+        "grant": {
+            "version": 7,
+            "user_id": "client-cannot-choose-this",
+            "models": {
+                "llm": [{"profile_id": "mock-llm", "model_ids": ["mock-model"]}],
+                "embedding": [],
+                "search": [{"profile_id": "duckduckgo-local"}]
+            },
+            "knowledge_bases": [{
+                "resource_id": "admin:kb:admin-course",
+                "name": "admin-course",
+                "needs_admin_reindex": true
+            }],
+            "skills": [{"skill_id": "essay-coach"}],
+            "spaces": [{"space_id": "unit-one"}]
+        }
+    });
+    let put_grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(grant_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put_grant_response.status(), http::StatusCode::OK);
+    let saved_grant = json_response(put_grant_response).await["grant"].clone();
+    assert_eq!(saved_grant["version"], 7);
+    assert_eq!(saved_grant["user_id"], bob_user_id);
+    assert_eq!(saved_grant["models"]["llm"][0]["profile_id"], "mock-llm");
+    assert_eq!(
+        saved_grant["knowledge_bases"][0]["resource_id"],
+        "admin:kb:admin-course"
+    );
+    assert_eq!(saved_grant["skills"][0]["skill_id"], "essay-coach");
+    assert_eq!(saved_grant["spaces"][0]["space_id"], "unit-one");
+
+    let persisted_grant: Value = serde_json::from_str(
+        &fs::read_to_string(
+            data_root
+                .join("multi-user")
+                .join("_system")
+                .join("grants")
+                .join(format!("{bob_user_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted_grant, saved_grant);
+
+    let assigned_access_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/me/access")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assigned_access_response.status(), http::StatusCode::OK);
+    let assigned_access = json_response(assigned_access_response).await;
+    assert_eq!(
+        assigned_access["models"]["llm"][0],
+        json!({
+            "profile_id": "mock-llm",
+            "model_id": "mock-model",
+            "name": "Mock Chat Model",
+            "model": "provider-chat-model",
+            "source": "admin",
+            "available": true
+        })
+    );
+    assert_eq!(
+        assigned_access["models"]["search"][0],
+        json!({
+            "profile_id": "duckduckgo-local",
+            "name": "DuckDuckGo Local",
+            "provider": "duckduckgo",
+            "source": "admin",
+            "available": true
+        })
+    );
+    assert!(
+        assigned_access["knowledge_bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kb| kb["id"] == "admin:kb:admin-course"
+                && kb["assigned"] == true
+                && kb["read_only"] == true
+                && kb["available"] == true)
+    );
+    assert_eq!(assigned_access["skills"], json!(["essay-coach"]));
+    assert_eq!(assigned_access["spaces"], json!([{"space_id": "unit-one"}]));
+
+    let secret_grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"grant": {"models": {"llm": [{"profile_id": "mock-llm", "api_key": "sk-hidden"}]}}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        secret_grant_response.status(),
+        http::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        json_response(secret_grant_response).await["detail"],
+        "Grants must not contain secret/path field: grant.models.llm[0].api_key"
+    );
+
+    let admin_grant_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/multi-user/users/{admin_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_grant_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(admin_grant_response).await["detail"],
+        "Admin users use the main workspace and cannot receive assignments."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn multi_user_users_list_and_space_assignment_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let admin_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login_response.status(), http::StatusCode::OK);
+    let admin_token = auth_token_from_set_cookie(&admin_login_response);
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let bob_user_id = json_response(create_user_response).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let bob_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login_response.status(), http::StatusCode::OK);
+    let bob_token = auth_token_from_set_cookie(&bob_login_response);
+
+    let user_list_forbidden = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_list_forbidden.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(user_list_forbidden).await["detail"],
+        "Admin access required"
+    );
+
+    let users_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/multi-user/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_response.status(), http::StatusCode::OK);
+    let users = json_response(users_response).await["users"].clone();
+    assert!(
+        users
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|user| user["username"] == "alice"
+                && user["role"] == "admin"
+                && user.get("hash").is_none())
+    );
+    assert!(
+        users
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|user| user["id"] == bob_user_id
+                && user["username"] == "bob"
+                && user["role"] == "user"
+                && user["disabled"] == false
+                && user.get("hash").is_none())
+    );
+
+    let data_root = test_data_root(&root);
+    let admin_workspace = data_root.join("user").join("workspace");
+    let template = admin_workspace.join("templates").join("starter");
+    fs::create_dir_all(&template).unwrap();
+    fs::write(template.join("README.md"), "Starter space").unwrap();
+
+    let escape_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/multi-user/users/{bob_user_id}/spaces/assign"
+                ))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"source": "../templates/starter"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(escape_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(escape_response).await["detail"],
+        "Path escapes workspace root"
+    );
+
+    let missing_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/multi-user/users/{bob_user_id}/spaces/assign"
+                ))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"source": "templates/missing"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_response).await["detail"],
+        "Source space/template not found"
+    );
+
+    let assign_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/multi-user/users/{bob_user_id}/spaces/assign"
+                ))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"source": "templates/starter", "target": "unit-one"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assign_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(assign_response).await,
+        json!({"ok": true, "target": "unit-one"})
+    );
+
+    let user_workspace = data_root
+        .join("multi-user")
+        .join(&bob_user_id)
+        .join("user")
+        .join("workspace");
+    let assigned_space = user_workspace.join("unit-one");
+    assert_eq!(
+        fs::read_to_string(assigned_space.join("README.md")).unwrap(),
+        "Starter space"
+    );
+    let provenance: Value = serde_json::from_str(
+        &fs::read_to_string(assigned_space.join(".socartes_provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(provenance["source"], "admin");
+    assert_eq!(provenance["source_path"], "templates/starter");
+    assert_eq!(provenance["assigned_by"], "alice");
+
+    let saved_grant: Value = serde_json::from_str(
+        &fs::read_to_string(
+            data_root
+                .join("multi-user")
+                .join("_system")
+                .join("grants")
+                .join(format!("{bob_user_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved_grant["spaces"][0]["space_id"], "unit-one");
+    assert_eq!(saved_grant["spaces"][0]["mode"], "copy");
+    assert_eq!(saved_grant["spaces"][0]["source"], "admin");
+    assert_eq!(saved_grant["spaces"][0]["provenance"], provenance);
+
+    let duplicate_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/multi-user/users/{bob_user_id}/spaces/assign"
+                ))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"source": "templates/starter", "target": "unit-one"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_response.status(), http::StatusCode::CONFLICT);
+    assert_eq!(
+        json_response(duplicate_response).await["detail"],
+        "Target already exists"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn multi_user_knowledge_routes_scope_user_and_assigned_admin_bases_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (admin_token, bob_token, bob_user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+
+    let data_root = test_data_root(&root);
+    let admin_course_dir = root.join("bases").join("admin-course");
+    let hidden_admin_dir = root.join("bases").join("hidden-admin");
+    let user_course_dir = data_root
+        .join("multi-user")
+        .join(&bob_user_id)
+        .join("knowledge_bases")
+        .join("user-course");
+    for dir in [&admin_course_dir, &hidden_admin_dir, &user_course_dir] {
+        fs::create_dir_all(dir.join("files")).unwrap();
+    }
+    fs::write(
+        admin_course_dir.join("files").join("admin.md"),
+        "The assigned admin course says silver delta.",
+    )
+    .unwrap();
+    fs::write(
+        hidden_admin_dir.join("files").join("hidden.md"),
+        "The hidden admin course must not be visible.",
+    )
+    .unwrap();
+    fs::write(
+        user_course_dir.join("files").join("user.md"),
+        "The user's own course says blue comet.",
+    )
+    .unwrap();
+
+    let grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "grant": {
+                            "knowledge_bases": [{
+                                "resource_id": "admin:kb:admin-course",
+                                "name": "admin-course"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant_response.status(), http::StatusCode::OK);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    let bases = list.as_array().unwrap();
+    assert!(bases.iter().any(|kb| {
+        kb["name"] == "user-course"
+            && kb["id"] == "user:kb:user-course"
+            && kb["source"] == "user"
+            && kb["assigned"] == false
+            && kb["read_only"] == false
+    }));
+    let assigned_admin = bases
+        .iter()
+        .find(|kb| kb["name"] == "admin-course")
+        .expect("assigned admin course");
+    assert_eq!(assigned_admin["id"], "admin:kb:admin-course");
+    assert_eq!(assigned_admin["source"], "admin");
+    assert_eq!(assigned_admin["assigned"], true);
+    assert_eq!(assigned_admin["read_only"], true);
+    assert!(
+        assigned_admin.get("path").is_none() || assigned_admin["path"].is_null(),
+        "assigned admin KB must not expose filesystem path"
+    );
+    assert!(!bases.iter().any(|kb| kb["name"] == "hidden-admin"));
+
+    for (uri, expected_id, expected_source, expected_assigned, expected_read_only) in [
+        (
+            "/api/v1/knowledge/user-course",
+            "user:kb:user-course",
+            "user",
+            false,
+            false,
+        ),
+        (
+            "/api/v1/knowledge/admin-course",
+            "admin:kb:admin-course",
+            "admin",
+            true,
+            true,
+        ),
+        (
+            "/api/v1/knowledge/admin:kb:admin-course",
+            "admin:kb:admin-course",
+            "admin",
+            true,
+            true,
+        ),
+    ] {
+        let detail_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), http::StatusCode::OK, "{uri}");
+        let detail = json_response(detail_response).await;
+        assert_eq!(detail["id"], expected_id, "{uri}");
+        assert_eq!(detail["source"], expected_source, "{uri}");
+        assert_eq!(detail["assigned"], expected_assigned, "{uri}");
+        assert_eq!(detail["read_only"], expected_read_only, "{uri}");
+        if expected_assigned {
+            assert!(
+                detail.get("path").is_none() || detail["path"].is_null(),
+                "{uri} must not expose assigned admin path"
+            );
+        }
+    }
+
+    let bare_hidden_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/hidden-admin")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bare_hidden_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(bare_hidden_response).await["detail"],
+        "Knowledge base 'hidden-admin' not found"
+    );
+
+    let explicit_hidden_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/admin:kb:hidden-admin")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_hidden_response.status(),
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(explicit_hidden_response).await["detail"],
+        "Knowledge base is not assigned to you"
+    );
+
+    for (method, uri) in [
+        ("POST", "/api/v1/knowledge/admin-course/reindex"),
+        ("DELETE", "/api/v1/knowledge/admin-course"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            http::StatusCode::FORBIDDEN,
+            "{method} {uri}"
+        );
+        assert_eq!(
+            json_response(response).await["detail"],
+            "Assigned admin knowledge bases are read-only"
+        );
+    }
+
+    let boundary = "ASSIGNEDADMINUPLOAD";
+    let mut upload_body = Vec::new();
+    push_multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "extra.md",
+        "text/markdown",
+        b"attempted write",
+    );
+    finish_multipart(&mut upload_body, boundary);
+    let upload_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/admin-course/upload")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(upload_response).await["detail"],
+        "Assigned admin knowledge bases are read-only"
+    );
+
+    let no_kb_rag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "silver delta"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_kb_rag_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(no_kb_rag_response).await["detail"],
+        "No knowledge base selected. Pass kb_name explicitly or set a default."
+    );
+
+    let hidden_rag_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "hidden", "kb_name": "hidden-admin"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden_rag_response.status(), http::StatusCode::NOT_FOUND);
+
+    let assigned_rag_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "silver delta", "kb_name": "admin-course"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assigned_rag_response.status(), http::StatusCode::OK);
+    let assigned_rag = json_response(assigned_rag_response).await;
+    assert!(
+        assigned_rag["content"]
+            .as_str()
+            .unwrap()
+            .contains("silver delta")
+    );
+
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[tokio::test]
+async fn multi_user_skills_scope_assigned_admin_and_user_shadow_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (admin_token, bob_token, bob_user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+    let (charlie_token, _charlie_user_id) =
+        create_auth_user_and_login(app.clone(), &admin_token, "charlie", "password789").await;
+
+    let admin_skill_root = test_skills_root(&root);
+    for (name, description, body) in [
+        (
+            "research-mode",
+            "Research Mode",
+            "Use assigned admin research methods.",
+        ),
+        (
+            "hidden-mode",
+            "Hidden Mode",
+            "This admin skill must not be visible without a grant.",
+        ),
+    ] {
+        let dir = admin_skill_root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\ntags:\n- research\n---\n\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"grant": {"skills": [{"skill_id": "research-mode"}]}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant_response.status(), http::StatusCode::OK);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/list")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list = json_response(list_response).await;
+    let skills = list["skills"].as_array().unwrap();
+    assert_eq!(
+        skills
+            .iter()
+            .filter(|skill| skill["name"] == "research-mode")
+            .count(),
+        1
+    );
+    let assigned = skills
+        .iter()
+        .find(|skill| skill["name"] == "research-mode")
+        .expect("assigned skill");
+    assert_eq!(assigned["source"], "admin");
+    assert_eq!(assigned["assigned"], true);
+    assert_eq!(assigned["read_only"], true);
+    assert!(!skills.iter().any(|skill| skill["name"] == "hidden-mode"));
+
+    let assigned_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/research-mode")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assigned_detail_response.status(), http::StatusCode::OK);
+    let assigned_detail = json_response(assigned_detail_response).await;
+    assert_eq!(assigned_detail["source"], "admin");
+    assert_eq!(assigned_detail["assigned"], true);
+    assert_eq!(assigned_detail["read_only"], true);
+    assert!(
+        assigned_detail["content"]
+            .as_str()
+            .unwrap()
+            .contains("Use assigned admin research methods.")
+    );
+
+    let hidden_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/hidden-mode")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden_detail_response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_response(hidden_detail_response).await["detail"],
+        "Skill is not assigned to you"
+    );
+
+    let charlie_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/research-mode")
+                .header(
+                    http::header::AUTHORIZATION,
+                    format!("Bearer {charlie_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        charlie_detail_response.status(),
+        http::StatusCode::FORBIDDEN
+    );
+
+    for (method, uri, body) in [
+        (
+            "PUT",
+            "/api/v1/skills/research-mode",
+            json!({"description": "cannot update admin assignment"}).to_string(),
+        ),
+        ("DELETE", "/api/v1/skills/research-mode", String::new()),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            http::StatusCode::NOT_FOUND,
+            "{method} {uri}"
+        );
+        assert_eq!(
+            json_response(response).await["detail"],
+            "Skill not found: research-mode"
+        );
+    }
+
+    let shadow_create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/skills/create")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "research-mode",
+                        "description": "User shadow",
+                        "content": "Use the user's shadow skill.",
+                        "tags": ["research"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shadow_create_response.status(), http::StatusCode::OK);
+    assert!(
+        test_data_root(&root)
+            .join("multi-user")
+            .join(&bob_user_id)
+            .join("user")
+            .join("workspace")
+            .join("skills")
+            .join("research-mode")
+            .join("SKILL.md")
+            .is_file()
+    );
+
+    let shadow_detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/research-mode")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shadow_detail_response.status(), http::StatusCode::OK);
+    let shadow_detail = json_response(shadow_detail_response).await;
+    assert_eq!(shadow_detail["source"], "user");
+    assert_eq!(shadow_detail["assigned"], false);
+    assert_eq!(shadow_detail["read_only"], false);
+    assert!(
+        shadow_detail["content"]
+            .as_str()
+            .unwrap()
+            .contains("Use the user's shadow skill.")
+    );
+
+    let shadow_list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/list")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shadow_list_response.status(), http::StatusCode::OK);
+    let shadow_list = json_response(shadow_list_response).await;
+    let shadow_skills = shadow_list["skills"].as_array().unwrap();
+    assert_eq!(
+        shadow_skills
+            .iter()
+            .filter(|skill| skill["name"] == "research-mode")
+            .count(),
+        1
+    );
+    assert_eq!(
+        shadow_skills
+            .iter()
+            .find(|skill| skill["name"] == "research-mode")
+            .unwrap()["source"],
+        "user"
+    );
+
+    let shadow_delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/skills/research-mode")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shadow_delete_response.status(), http::StatusCode::OK);
+
+    let fallback_detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/skills/research-mode")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fallback_detail_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(fallback_detail_response).await["source"],
+        "admin"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_unified_ws_requires_query_or_cookie_token_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("login cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut missing_token_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    assert_next_ws_close_code(&mut missing_token_socket, 4001).await;
+
+    let (mut invalid_token_socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/ws?token=invalid-token"))
+            .await
+            .unwrap();
+    assert_next_ws_close_code(&mut invalid_token_socket, 4001).await;
+
+    let (mut query_token_socket, _) = connect_async(format!("ws://{addr}/api/v1/ws?token={token}"))
+        .await
+        .unwrap();
+    query_token_socket
+        .send(TungsteniteMessage::Text(
+            json!({"type": "ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let query_events = collect_ws_json_until(&mut query_token_socket, "pong").await;
+    assert_eq!(query_events.last().unwrap()["type"], "pong");
+
+    let mut cookie_request = format!("ws://{addr}/api/v1/ws")
+        .into_client_request()
+        .unwrap();
+    cookie_request.headers_mut().insert(
+        http::header::COOKIE,
+        format!("dt_token={token}").parse().unwrap(),
+    );
+    let (mut cookie_token_socket, _) = connect_async(cookie_request).await.unwrap();
+    cookie_token_socket
+        .send(TungsteniteMessage::Text(
+            json!({"type": "ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let cookie_events = collect_ws_json_until(&mut cookie_token_socket, "pong").await;
+    assert_eq!(cookie_events.last().unwrap()["type"], "pong");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_unified_ws_rag_rejects_unassigned_admin_kb_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (_admin_token, bob_token, _bob_user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+
+    let hidden_dir = root.join("bases").join("hidden-admin").join("files");
+    fs::create_dir_all(&hidden_dir).unwrap();
+    fs::write(
+        hidden_dir.join("hidden.md"),
+        "The hidden admin course says indigo cipher.",
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws?token={bob_token}"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "What phrase appears in the hidden admin course?",
+                "language": "en",
+                "tools": ["rag"],
+                "knowledge_bases": ["hidden-admin"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("unassigned admin knowledge base should fail the turn");
+    assert!(
+        error["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Knowledge base 'hidden-admin' not found"))
+    );
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "failed");
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("indigo cipher"),
+        "unassigned admin course content must not leak through chat events"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_legacy_solve_without_kb_does_not_fallback_to_builtin_for_user() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+    let (_admin_token, bob_token, _bob_user_id) =
+        setup_auth_admin_and_user(app.clone(), "bob", "password456").await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut request = format!("ws://{addr}/api/v1/solve")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {bob_token}").parse().unwrap(),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Explain planner executor critic flow",
+                "tools": ["rag"],
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..32 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("legacy solve event")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let terminal = event["type"] == "error" || event["type"] == "result";
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("ordinary user solve RAG without kb_name should fail");
+    assert!(error["content"].as_str().is_some_and(|content| {
+        content.contains("No knowledge base selected. Pass kb_name explicitly or set a default.")
+    }));
+    assert!(
+        events.iter().all(|event| event["type"] != "result"),
+        "legacy solve must not emit a successful result after auth-scoped RAG failure"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn auth_enabled_router_level_websockets_require_bearer_or_cookie_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_response.status(), http::StatusCode::OK);
+    let cookie = login_response
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("login cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("dt_token=")
+        .unwrap()
+        .to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for path in [
+        "/api/v1/book/ws",
+        "/api/v1/question/generate",
+        "/api/v1/question/mimic",
+        "/api/v1/chat",
+        "/api/v1/solve",
+        "/api/v1/vision/solve",
+        "/api/v1/tutorbot/auth-bot/ws",
+        "/api/v1/knowledge/auth-course/progress/ws",
+    ] {
+        assert_ws_handshake_status(format!("ws://{addr}{path}"), 401).await;
+        assert_ws_handshake_status(format!("ws://{addr}{path}?token={token}"), 401).await;
+
+        let mut invalid_request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        invalid_request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            "Bearer invalid-token".parse().unwrap(),
+        );
+        assert_ws_handshake_status(invalid_request, 401).await;
+    }
+
+    let mut bearer_request = format!("ws://{addr}/api/v1/book/ws")
+        .into_client_request()
+        .unwrap();
+    bearer_request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (mut bearer_socket, _) = connect_async(bearer_request).await.unwrap();
+    let bearer_events = collect_book_ws_events_until(&mut bearer_socket, "connected").await;
+    assert_eq!(bearer_events.last().unwrap()["type"], "connected");
+
+    let mut cookie_request = format!("ws://{addr}/api/v1/book/ws")
+        .into_client_request()
+        .unwrap();
+    cookie_request.headers_mut().insert(
+        http::header::COOKIE,
+        format!("dt_token={token}").parse().unwrap(),
+    );
+    let (mut cookie_socket, _) = connect_async(cookie_request).await.unwrap();
+    let cookie_events = collect_book_ws_events_until(&mut cookie_socket, "connected").await;
+    assert_eq!(cookie_events.last().unwrap()["type"], "connected");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]
@@ -659,7 +6421,7 @@ async fn live_chat_frontend_bootstrap_endpoints_are_available() {
 
     assert_eq!(knowledge_response.status(), http::StatusCode::OK);
     let knowledge_payload = json_response(knowledge_response).await;
-    assert!(knowledge_payload["knowledge_bases"].is_array());
+    assert!(knowledge_payload.as_array().is_some());
 
     let llm_response = app()
         .oneshot(
@@ -688,6 +6450,252 @@ async fn live_chat_frontend_bootstrap_endpoints_are_available() {
     assert_eq!(sessions_response.status(), http::StatusCode::OK);
     let sessions_payload = json_response(sessions_response).await;
     assert!(sessions_payload["sessions"].is_array());
+}
+
+#[tokio::test]
+async fn settings_llm_options_reflect_catalog_active_default() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let mut catalog = llm_test_catalog("https://catalog-llm.example/v1");
+    catalog["services"]["llm"]["profiles"][0]["id"] = json!("llm-profile-default");
+    catalog["services"]["llm"]["profiles"][0]["name"] = json!("Catalog LLM Profile");
+    catalog["services"]["llm"]["profiles"][0]["binding"] = json!("openai");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["id"] = json!("llm-model-default");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["name"] = json!("Catalog Chat Model");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("gpt-catalog-test");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["context_window"] = json!("12345");
+    catalog["services"]["llm"]["active_profile_id"] = json!("llm-profile-default");
+    catalog["services"]["llm"]["active_model_id"] = json!("llm-model-default");
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+
+    let options_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/llm-options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(options_response.status(), http::StatusCode::OK);
+    let payload = json_response(options_response).await;
+    assert_eq!(
+        payload["active"],
+        json!({"profile_id": "llm-profile-default", "model_id": "llm-model-default"})
+    );
+    assert_eq!(payload["options"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        payload["options"][0],
+        json!({
+            "profile_id": "llm-profile-default",
+            "model_id": "llm-model-default",
+            "profile_name": "Catalog LLM Profile",
+            "model_name": "Catalog Chat Model",
+            "model": "gpt-catalog-test",
+            "provider": "openai",
+            "is_active_default": true,
+            "context_window": 12345
+        })
+    );
+    assert!(!payload.to_string().contains("deterministic-agent-loop"));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_llm_options_filter_to_user_model_grants_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root_and_auth(&root, true);
+
+    let unauth_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/llm-options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_response.status(), http::StatusCode::UNAUTHORIZED);
+
+    let register_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_response.status(), http::StatusCode::CREATED);
+
+    let admin_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "alice", "password": "password123"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login_response.status(), http::StatusCode::OK);
+    let admin_token = auth_token_from_set_cookie(&admin_login_response);
+
+    let create_user_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/users")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user_response.status(), http::StatusCode::CREATED);
+    let bob_user_id = json_response(create_user_response).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let bob_login_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "bob", "password": "password456"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_login_response.status(), http::StatusCode::OK);
+    let bob_token = auth_token_from_set_cookie(&bob_login_response);
+
+    let mut catalog = llm_test_catalog("https://catalog-llm.example/v1");
+    catalog["services"]["llm"]["profiles"][0]["api_key"] = json!("hidden-llm-key");
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+
+    let no_grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/llm-options")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_grant_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(no_grant_response).await,
+        json!({"active": null, "options": []})
+    );
+
+    let grant_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/multi-user/users/{bob_user_id}/grants"))
+                .header(http::header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "grant": {
+                            "models": {
+                                "llm": [{"profile_id": "mock-llm", "model_ids": ["mock-model"]}]
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant_response.status(), http::StatusCode::OK);
+
+    let granted_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/llm-options")
+                .header(http::header::AUTHORIZATION, format!("Bearer {bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(granted_response.status(), http::StatusCode::OK);
+    let granted = json_response(granted_response).await;
+    assert_eq!(granted["active"], Value::Null);
+    assert_eq!(
+        granted["options"][0],
+        json!({
+            "profile_id": "mock-llm",
+            "model_id": "mock-model",
+            "profile_name": "Mock Chat Model",
+            "model_name": "Mock Chat Model",
+            "label": "Mock Chat Model",
+            "model": "provider-chat-model",
+            "provider": "",
+            "source": "admin",
+            "is_active_default": false
+        })
+    );
+    for forbidden in ["api_key", "base_url", "api_version", "extra_headers"] {
+        assert!(
+            !json_object_has_key(&granted, forbidden),
+            "ordinary user llm-options leaked key {forbidden}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]
@@ -780,6 +6788,115 @@ async fn course_knowledge_frontend_bootstrap_endpoints_are_available() {
 }
 
 #[tokio::test]
+async fn knowledge_file_preview_serves_inline_mime_and_preserves_subdirectories_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let files_dir = root.join("bases").join("preview-course").join("files");
+    fs::create_dir_all(files_dir.join("slides").join("week1")).unwrap();
+    fs::write(files_dir.join("lesson.pdf"), b"top-level-pdf").unwrap();
+    fs::write(files_dir.join("diagram.png"), b"png-bytes").unwrap();
+    fs::write(
+        files_dir.join("slides").join("week1").join("intro.pdf"),
+        b"nested-pdf",
+    )
+    .unwrap();
+
+    let pdf_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/preview-course/files/lesson.pdf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pdf_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        pdf_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "application/pdf"
+    );
+    let pdf_disposition = pdf_response
+        .headers()
+        .get(http::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(pdf_disposition.starts_with("inline;"));
+    assert!(pdf_disposition.contains("filename=\"lesson.pdf\""));
+    assert_eq!(text_response(pdf_response).await, "top-level-pdf");
+
+    let image_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/preview-course/files/diagram.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        image_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "image/png"
+    );
+    let image_disposition = image_response
+        .headers()
+        .get(http::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(image_disposition.starts_with("inline;"));
+    assert!(image_disposition.contains("filename=\"diagram.png\""));
+    assert_eq!(text_response(image_response).await, "png-bytes");
+
+    let nested_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/preview-course/files/slides/week1/intro.pdf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        nested_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "application/pdf"
+    );
+    let nested_disposition = nested_response
+        .headers()
+        .get(http::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(nested_disposition.starts_with("inline;"));
+    assert!(nested_disposition.contains("filename=\"intro.pdf\""));
+    assert_eq!(text_response(nested_response).await, "nested-pdf");
+
+    let traversal_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/preview-course/files/%2e%2e/metadata.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(traversal_response.status(), http::StatusCode::FORBIDDEN);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn knowledge_python_config_progress_and_linked_folder_endpoints_match_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -864,6 +6981,9 @@ rust replacement notes\r\n\
         .await
         .unwrap();
     assert_eq!(create_response.status(), http::StatusCode::OK);
+    let create_payload = json_response(create_response).await;
+    let create_task_id = create_payload["task_id"].as_str().unwrap();
+    assert!(create_task_id.starts_with("kb_init_"));
 
     let config_update_response = app
         .clone()
@@ -921,10 +7041,34 @@ rust replacement notes\r\n\
         .await
         .unwrap();
     assert_eq!(progress_response.status(), http::StatusCode::OK);
-    assert_eq!(
-        json_response(progress_response).await,
-        json!({"status": "not_started", "message": "Initialization not started"})
+    let progress = json_response(progress_response).await;
+    assert_eq!(progress["task_id"], create_task_id);
+    assert!(
+        ["initializing", "processing_documents", "completed"]
+            .contains(&progress["stage"].as_str().unwrap())
     );
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/python-contract-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    if let Some(reindex_task_id) = reindex["task_id"].as_str() {
+        wait_for_knowledge_progress_terminal(
+            app.clone(),
+            "python-contract-course",
+            reindex_task_id,
+        )
+        .await;
+    }
 
     let linked_dir = test_data_root(&root).join("linked-source");
     fs::create_dir_all(&linked_dir).unwrap();
@@ -984,7 +7128,9 @@ rust replacement notes\r\n\
     assert_eq!(sync_response.status(), http::StatusCode::OK);
     let sync = json_response(sync_response).await;
     assert_eq!(sync["file_count"], 1);
-    assert!(sync["task_id"].as_str().unwrap().starts_with("kb_upload-"));
+    let sync_task_id = sync["task_id"].as_str().unwrap();
+    assert!(sync_task_id.starts_with("kb_upload_"));
+    wait_for_knowledge_progress_terminal(app.clone(), "python-contract-course", sync_task_id).await;
 
     let clear_progress_response = app
         .clone()
@@ -1020,6 +7166,1071 @@ rust replacement notes\r\n\
         json_response(unlink_response).await["message"],
         "Folder unlinked successfully"
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_tracks_state_and_skips_unchanged_files() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "sync-state-course",
+        "seed.md",
+        "Initial material for linked folder sync.",
+    )
+    .await;
+
+    let linked_dir = test_data_root(&root).join("sync-state-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    let linked_file = linked_dir.join("linked.md");
+    fs::write(&linked_file, "linked source v1").unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-state-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().unwrap();
+
+    let first_sync_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-state-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_sync_response.status(), http::StatusCode::OK);
+    let first_sync = json_response(first_sync_response).await;
+    assert_eq!(first_sync["new_files"], 1);
+    assert_eq!(first_sync["modified_files"], 0);
+    assert_eq!(first_sync["file_count"], 1);
+    assert!(
+        first_sync["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("kb_upload_")
+    );
+    let first_sync_task_id = first_sync["task_id"].as_str().unwrap();
+    wait_for_knowledge_progress_terminal(app.clone(), "sync-state-course", first_sync_task_id)
+        .await;
+
+    let folders_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/sync-state-course/linked-folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folders_response.status(), http::StatusCode::OK);
+    let folders = json_response(folders_response).await;
+    let synced_folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["id"] == folder_id)
+        .unwrap();
+    assert_eq!(synced_folder["file_count"], 1);
+    assert!(synced_folder["last_sync"].as_str().is_some());
+    assert!(
+        synced_folder["synced_files"]
+            .as_object()
+            .unwrap()
+            .contains_key(linked_file.to_string_lossy().as_ref())
+    );
+
+    let unchanged_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-state-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged_response.status(), http::StatusCode::OK);
+    let unchanged = json_response(unchanged_response).await;
+    assert_eq!(unchanged["message"], "No new or modified files to sync");
+    assert_eq!(unchanged["files"], json!([]));
+    assert_eq!(unchanged["file_count"], 0);
+    assert!(unchanged.get("task_id").is_none());
+
+    sleep(Duration::from_millis(20)).await;
+    fs::write(&linked_file, "linked source v2").unwrap();
+
+    let modified_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-state-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(modified_response.status(), http::StatusCode::OK);
+    let modified = json_response(modified_response).await;
+    assert_eq!(modified["new_files"], 0);
+    assert_eq!(modified["modified_files"], 1);
+    assert_eq!(modified["file_count"], 1);
+    assert!(
+        modified["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("kb_upload_")
+    );
+    let modified_task_id = modified["task_id"].as_str().unwrap();
+    wait_for_knowledge_progress_terminal(app.clone(), "sync-state-course", modified_task_id).await;
+
+    let _ = fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_rejects_needs_reindex_without_starting_task_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "sync-stale-course",
+        "seed.md",
+        "Sync stale course seed.",
+    )
+    .await;
+
+    let config_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/knowledge/sync-stale-course/config")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"needs_reindex": true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config_response.status(), http::StatusCode::OK);
+
+    let linked_dir = test_data_root(&root).join("sync-stale-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    fs::write(
+        linked_dir.join("linked.md"),
+        "linked source should wait for reindex",
+    )
+    .unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-stale-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().unwrap();
+
+    let sync_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-stale-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::CONFLICT);
+    let error = json_response(sync_response).await;
+    assert_eq!(
+        error["detail"],
+        "Knowledge base 'sync-stale-course' uses legacy index format and needs reindex before accepting incremental uploads."
+    );
+    assert!(error["task_id"].is_null());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_without_active_index_returns_task_then_failed_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let kb_dir = root.join("bases").join("sync-unindexed-course");
+    fs::create_dir_all(&kb_dir).unwrap();
+    fs::write(
+        kb_dir.join("metadata.json"),
+        json!({
+            "name": "sync-unindexed-course",
+            "rag_provider": "llamaindex",
+            "needs_reindex": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let linked_dir = test_data_root(&root).join("sync-unindexed-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    let linked_file = linked_dir.join("linked.md");
+    fs::write(
+        &linked_file,
+        "This linked file should not be marked synced before an index exists.",
+    )
+    .unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-unindexed-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().unwrap();
+
+    let sync_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-unindexed-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::OK);
+    let sync = json_response(sync_response).await;
+    let task_id = sync["task_id"].as_str().expect("sync task id");
+    assert!(task_id.starts_with("kb_upload_"));
+
+    let progress =
+        wait_for_knowledge_progress_terminal(app.clone(), "sync-unindexed-course", task_id).await;
+    assert_eq!(progress["stage"], "error");
+    assert_eq!(
+        progress["message"],
+        "Processing failed: Upload processing failed (KB 'sync-unindexed-course'): Knowledge base not initialized (llamaindex): sync-unindexed-course"
+    );
+    assert_eq!(
+        progress["error"],
+        "Upload processing failed (KB 'sync-unindexed-course'): Knowledge base not initialized (llamaindex): sync-unindexed-course"
+    );
+
+    let stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_events = parse_sse_events(&text_response(stream_response).await);
+    assert!(stream_events.iter().any(|(event, payload)| {
+        event == "process_log"
+            && payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Upload processing failed (KB 'sync-unindexed-course')")
+    }));
+    assert!(stream_events.iter().any(|(event, payload)| {
+        event == "process_log"
+            && payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Stack trace:\nTraceback")
+    }));
+    assert!(stream_events.iter().any(|(event, payload)| {
+        event == "progress"
+            && payload["stage"] == "error"
+            && payload["error"]
+                == "Upload processing failed (KB 'sync-unindexed-course'): Knowledge base not initialized (llamaindex): sync-unindexed-course"
+    }));
+    let failed = stream_events
+        .iter()
+        .find(|(event, _)| event == "failed")
+        .expect("failed event");
+    assert_eq!(
+        failed.1["detail"],
+        "Upload processing failed (KB 'sync-unindexed-course'): Knowledge base not initialized (llamaindex): sync-unindexed-course"
+    );
+    assert_eq!(failed.1["task_id"], task_id);
+    assert!(
+        failed.1["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Traceback (most recent call last):")
+    );
+    assert!(failed.1["details"].as_str().unwrap_or_default().contains(
+        "ValueError: Knowledge base not initialized (llamaindex): sync-unindexed-course"
+    ));
+    assert!(!stream_events.iter().any(|(event, _)| event == "complete"));
+
+    let folders_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/sync-unindexed-course/linked-folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folders_response.status(), http::StatusCode::OK);
+    let folders = json_response(folders_response).await;
+    assert!(folders[0].get("last_sync").is_none());
+    assert!(folders[0].get("synced_files").is_none());
+    assert!(
+        !kb_dir.join("files").join("linked.md").exists(),
+        "Python DocumentAdder fails before staging linked files when no index exists"
+    );
+    let metadata =
+        serde_json::from_str::<Value>(&fs::read_to_string(kb_dir.join("metadata.json")).unwrap())
+            .unwrap();
+    assert!(metadata.get("last_indexed_action").is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_updates_active_chunk_index_like_python_upload() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "sync-rag-course",
+        "seed.md",
+        "The seed sync course only mentions planner executor critic setup.",
+    )
+    .await;
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-rag-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let reindex_task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "sync-rag-course", reindex_task_id).await;
+
+    let linked_dir = test_data_root(&root).join("sync-rag-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    fs::write(
+        linked_dir.join("linked-rag.md"),
+        "The linked folder answer is amber circuit, and it appears only in this synced file.",
+    )
+    .unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-rag-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().expect("folder id");
+
+    let sync_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-rag-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::OK);
+    let sync = json_response(sync_response).await;
+    let sync_task_id = sync["task_id"].as_str().expect("sync task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "sync-rag-course", sync_task_id).await;
+
+    let plugin_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "What is the linked folder answer?",
+                            "kb_name": "sync-rag-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    assert!(plugin["sources"].as_array().unwrap().iter().any(|source| {
+        source["source"].as_str() == Some("linked-rag.md")
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("amber circuit"))
+    }));
+
+    let _ = fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_skips_bad_parser_file_like_python_document_adder() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let created = create_markdown_knowledge_base_at(
+        app.clone(),
+        "/api/v1/knowledge/create",
+        "sync-bad-parser-course",
+        "seed.md",
+        "The sync bad parser seed remains searchable.",
+    )
+    .await;
+    let create_task_id = created["task_id"].as_str().expect("create task id");
+    let create_progress =
+        wait_for_knowledge_progress_terminal(app.clone(), "sync-bad-parser-course", create_task_id)
+            .await;
+    assert_eq!(create_progress["stage"], "completed");
+
+    let linked_dir = test_data_root(&root).join("sync-bad-parser-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    let broken_path = linked_dir.join("broken.docx");
+    fs::write(&broken_path, b"not an Office Open XML document").unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/sync-bad-parser-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().expect("folder id");
+
+    let sync_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/sync-bad-parser-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::OK);
+    let sync = json_response(sync_response).await;
+    let sync_task_id = sync["task_id"].as_str().expect("sync task id");
+    let sync_progress =
+        wait_for_knowledge_progress_terminal(app.clone(), "sync-bad-parser-course", sync_task_id)
+            .await;
+    assert_eq!(sync_progress["stage"], "completed");
+    assert_eq!(sync_progress["message"], "Successfully processed 0 files!");
+    assert_eq!(sync_progress["indexed_count"], 0);
+    assert_eq!(sync_progress["index_changed"], false);
+
+    let metadata_path = root
+        .join("bases")
+        .join("sync-bad-parser-course")
+        .join("metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
+            .expect("valid metadata");
+    assert!(metadata["file_hashes"]["broken.docx"].is_null());
+    assert_ne!(metadata["last_indexed_action"], "upload");
+
+    let folders_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/sync-bad-parser-course/linked-folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folders_response.status(), http::StatusCode::OK);
+    let folders = json_response(folders_response).await;
+    let synced_folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["id"] == folder_id)
+        .unwrap();
+    assert_eq!(synced_folder["file_count"], 0);
+    assert!(
+        !synced_folder["synced_files"]
+            .as_object()
+            .unwrap()
+            .contains_key(broken_path.to_string_lossy().as_ref())
+    );
+
+    let copied_file = root
+        .join("bases")
+        .join("sync-bad-parser-course")
+        .join("files")
+        .join("broken.docx");
+    assert!(copied_file.is_file());
+
+    let _ = fs::remove_dir_all(test_data_root(&root));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_sync_folder_returns_before_slow_background_indexing_like_python_upload() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, _requests, server) =
+        spawn_delayed_dynamic_embedding_recorder(Duration::from_secs(2)).await;
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": embedding_test_catalog(&base_url) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "background-sync-course",
+        "seed.md",
+        "The seed background sync course introduces planner executor critic roles.",
+    )
+    .await;
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/background-sync-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let reindex_task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "background-sync-course", reindex_task_id)
+        .await;
+
+    let linked_dir = test_data_root(&root).join("background-sync-source");
+    fs::create_dir_all(&linked_dir).unwrap();
+    fs::write(
+        linked_dir.join("background-linked.md"),
+        "The background sync answer is indigo relay and it appears only in this linked file.",
+    )
+    .unwrap();
+
+    let link_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/background-sync-course/link-folder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"folder_path": linked_dir.to_string_lossy()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(link_response.status(), http::StatusCode::OK);
+    let linked = json_response(link_response).await;
+    let folder_id = linked["id"].as_str().expect("folder id");
+
+    let sync_response = timeout(
+        Duration::from_millis(500),
+        app.clone().oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/knowledge/background-sync-course/sync-folder/{folder_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("sync-folder response should not wait for slow background indexing")
+    .unwrap();
+    assert_eq!(sync_response.status(), http::StatusCode::OK);
+    let sync = json_response(sync_response).await;
+    let sync_task_id = sync["task_id"].as_str().expect("sync task id");
+    assert!(sync_task_id.starts_with("kb_upload_"));
+
+    let progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/background-sync-course/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress_response.status(), http::StatusCode::OK);
+    let progress = json_response(progress_response).await;
+    assert_eq!(progress["task_id"], sync_task_id);
+    assert_ne!(progress["stage"], "completed");
+
+    let stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{sync_task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = timeout(Duration::from_secs(5), text_response(stream_response))
+        .await
+        .expect("background sync should eventually complete");
+    assert!(stream_body.contains("event: process_log"));
+    assert!(stream_body.contains("event: progress"));
+    assert!(stream_body.contains("event: complete"));
+    assert!(stream_body.contains("Successfully processed 1 files"));
+
+    let plugin_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "What is the background sync answer?",
+                            "kb_name": "background-sync-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    assert!(plugin["sources"].as_array().unwrap().iter().any(|source| {
+        source["source"].as_str() == Some("background-linked.md")
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("indigo relay"))
+    }));
+
+    server.abort();
+    let _ = fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn course_alias_routes_bridge_to_knowledge_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "alias-course",
+        "lesson.md",
+        "Alias course notes for the legacy course endpoint.",
+    )
+    .await;
+
+    let knowledge_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(knowledge_response.status(), http::StatusCode::OK);
+    let knowledge_payload = json_response(knowledge_response).await;
+    assert!(
+        knowledge_payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kb| kb["name"] == "alias-course")
+    );
+
+    let courses_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/courses")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(courses_response.status(), http::StatusCode::OK);
+    let courses_payload = json_response(courses_response).await;
+    assert_eq!(courses_payload, knowledge_payload);
+    assert!(
+        courses_payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kb| kb["name"] == "alias-course")
+    );
+
+    let courses_slash_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/courses/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(courses_slash_response.status(), http::StatusCode::OK);
+    let courses_slash_payload = json_response(courses_slash_response).await;
+    assert!(
+        courses_slash_payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kb| kb["name"] == "alias-course")
+    );
+
+    for uri in ["/api/v1/courses/list", "/api/v1/course/list"] {
+        let list_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), http::StatusCode::OK);
+        let list_payload = json_response(list_response).await;
+        assert!(
+            list_payload
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kb| kb["name"] == "alias-course"),
+            "{uri} should expose the Python course-list alias shape"
+        );
+    }
+
+    let set_default_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/course/default/alias-course")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set_default_response.status(), http::StatusCode::OK);
+
+    let updated_knowledge_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_knowledge_response.status(), http::StatusCode::OK);
+    let updated_knowledge_payload = json_response(updated_knowledge_response).await;
+
+    let course_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/course")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(course_response.status(), http::StatusCode::OK);
+    let course_payload = json_response(course_response).await;
+    assert_eq!(
+        course_payload, updated_knowledge_payload,
+        "/api/v1/course should bridge to the knowledge list shape, not a standalone default object"
+    );
+
+    let course_slash_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/course/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(course_slash_response.status(), http::StatusCode::OK);
+    let course_slash_payload = json_response(course_slash_response).await;
+    assert_eq!(
+        course_slash_payload, updated_knowledge_payload,
+        "/api/v1/course/ should bridge to the knowledge list shape, not a standalone default object"
+    );
+
+    let singular_create = create_markdown_knowledge_base_at(
+        app.clone(),
+        "/api/v1/course",
+        "singular-course",
+        "singular.md",
+        "Created through the singular legacy course root.",
+    )
+    .await;
+    assert_eq!(singular_create["name"], "singular-course");
+
+    let singular_slash_create = create_markdown_knowledge_base_at(
+        app.clone(),
+        "/api/v1/course/",
+        "singular-course-slash",
+        "singular-slash.md",
+        "Created through the slash-terminated singular legacy course root.",
+    )
+    .await;
+    assert_eq!(singular_slash_create["name"], "singular-course-slash");
+
+    let courses_after_singular_create = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/courses")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(courses_after_singular_create.status(), http::StatusCode::OK);
+    let courses_after_singular_create_payload = json_response(courses_after_singular_create).await;
+    let course_names = courses_after_singular_create_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(course_names.contains("singular-course"));
+    assert!(course_names.contains("singular-course-slash"));
+
+    for uri in [
+        "/api/v1/courses/alias-course",
+        "/api/v1/course/alias-course",
+    ] {
+        let detail_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), http::StatusCode::OK);
+        let detail = json_response(detail_response).await;
+        assert_eq!(detail["name"], "alias-course");
+        assert_eq!(detail["id"], "admin:kb:alias-course");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_routes_read_python_legacy_flat_course_layout() {
+    let root = unique_test_knowledge_root();
+    let legacy_course = root.join("legacy-course");
+    fs::create_dir_all(legacy_course.join("raw")).unwrap();
+    fs::create_dir_all(legacy_course.join("version-1")).unwrap();
+    fs::write(
+        legacy_course.join("raw").join("lesson.md"),
+        "Legacy Python course notes that were stored under raw.",
+    )
+    .unwrap();
+    fs::write(
+        legacy_course.join("metadata.json"),
+        json!({
+            "description": "Legacy flat course",
+            "rag_provider": "llamaindex",
+            "needs_reindex": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        legacy_course.join("version-1").join("meta.json"),
+        json!({
+            "version": "version-1",
+            "signature": "legacy-signature",
+            "binding": "openai",
+            "model": "text-embedding-3-large",
+            "dimension": 3072,
+            "ready": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("kb_config.json"),
+        json!({
+            "defaults": {
+                "default_kb": "legacy-course",
+                "rag_provider": "llamaindex",
+                "search_mode": "hybrid"
+            },
+            "knowledge_bases": {
+                "legacy-course": {
+                    "description": "Legacy flat course",
+                    "needs_reindex": false,
+                    "rag_provider": "llamaindex"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let app = app_with_knowledge_root(&root);
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/courses")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let list_payload = json_response(list_response).await;
+    let legacy_summary = list_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "legacy-course")
+        .expect("legacy flat course appears in course list");
+    assert_eq!(legacy_summary["is_default"], true);
+    assert_eq!(legacy_summary["statistics"]["raw_documents"], 1);
+
+    let files_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/courses/legacy-course/files")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_response.status(), http::StatusCode::OK);
+    let files_payload = json_response(files_response).await;
+    assert_eq!(files_payload["files"].as_array().unwrap().len(), 1);
+    assert_eq!(files_payload["files"][0]["name"], "lesson.md");
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1065,8 +8276,10 @@ planner executor critic notes\r\n\
         create_payload["task_id"]
             .as_str()
             .unwrap()
-            .starts_with("task-")
+            .starts_with("kb_init_")
     );
+    assert_eq!(create_payload["name"], "test-course");
+    assert_eq!(create_payload["files"], json!(["notes.txt"]));
 
     let list_response = app
         .clone()
@@ -1080,7 +8293,7 @@ planner executor critic notes\r\n\
         .unwrap();
     let list_payload = json_response(list_response).await;
     assert!(
-        list_payload["knowledge_bases"]
+        list_payload
             .as_array()
             .unwrap()
             .iter()
@@ -1114,6 +8327,7 @@ planner executor critic notes\r\n\
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
     let reindex_payload = json_response(reindex_response).await;
     let task_id = reindex_payload["task_id"].as_str().unwrap();
+    assert!(task_id.starts_with("kb_reindex_"));
 
     let stream_response = app
         .clone()
@@ -1134,7 +8348,35 @@ planner executor critic notes\r\n\
         "text/event-stream"
     );
     let stream_body = text_response(stream_response).await;
+    assert!(stream_body.contains("event: process_log"));
+    assert!(stream_body.contains("\"type\":\"process_log\""));
+    assert!(stream_body.contains("\"level\":\"INFO\""));
+    assert!(stream_body.contains("\"logger\":\"socartes.knowledge.task\""));
+    assert!(stream_body.contains("\"capability\":\"knowledge\""));
+    assert!(stream_body.contains("\"sink\":\"ui\""));
     assert!(stream_body.contains("event: complete"));
+    assert!(stream_body.contains("\"detail\":\"Re-index of 'test-course' complete\""));
+    assert!(!stream_body.contains("\"task_type\""));
+    assert!(!stream_body.contains("\"status\":\"completed\""));
+
+    let unknown_stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/tasks/not-a-real-task/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_stream_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        unknown_stream_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
 
     let delete_response = app
         .oneshot(
@@ -1148,6 +8390,503 @@ planner executor critic notes\r\n\
         .unwrap();
     assert_eq!(delete_response.status(), http::StatusCode::OK);
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_detail_route_matches_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESDETAILBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+detail-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"overview.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+Detailed course notes for the knowledge detail route.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/detail-course")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["name"], "detail-course");
+    assert_eq!(detail["id"], "admin:kb:detail-course");
+    assert_eq!(detail["source"], "admin");
+    assert_eq!(detail["assigned"], false);
+    assert_eq!(detail["read_only"], false);
+    assert_eq!(detail["statistics"]["raw_documents"], 1);
+    assert_eq!(detail["metadata"]["rag_provider"], "llamaindex");
+    assert!(detail["path"].as_str().unwrap().ends_with("detail-course"));
+
+    let missing_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/missing-detail-course")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_response).await["detail"],
+        "Knowledge base 'missing-detail-course' not found"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_progress_ws_streams_initial_reindex_task_update() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let boundary = "SOCARTESPROGRESSWSBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+progress-ws-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+Progress websocket notes for course indexing.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/progress-ws-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/knowledge/progress-ws-course/progress/ws?task_id={task_id}"
+    ))
+    .await
+    .expect("knowledge progress websocket should connect");
+
+    let message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("progress websocket event")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(text) = message else {
+        panic!("expected text progress event");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["type"], "progress");
+    assert_eq!(event["data"]["task_id"], task_id);
+    assert_eq!(event["data"]["stage"], "completed");
+    assert_eq!(event["data"]["percent"], 100);
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_reindex_failure_returns_task_and_failed_sse_like_python_background_task() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let kb_dir = root.join("bases").join("empty-reindex-course");
+    fs::create_dir_all(kb_dir.join("files")).unwrap();
+    fs::write(
+        kb_dir.join("metadata.json"),
+        json!({
+            "name": "empty-reindex-course",
+            "rag_provider": "llamaindex",
+            "needs_reindex": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/empty-reindex-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    assert_eq!(reindex["noop"], false);
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    assert!(task_id.starts_with("kb_reindex_"));
+
+    let progress =
+        wait_for_knowledge_progress_terminal(app.clone(), "empty-reindex-course", task_id).await;
+    assert_eq!(progress["task_id"], task_id);
+    assert_eq!(progress["stage"], "error");
+    assert!(
+        progress["message"]
+            .as_str()
+            .unwrap()
+            .contains("No extractable knowledge content found")
+    );
+
+    let stream_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = text_response(stream_response).await;
+    let stream_events = parse_sse_events(&stream_body);
+    assert!(stream_events.iter().any(|(event, payload)| {
+        event == "process_log"
+            && payload["level"] == "ERROR"
+            && payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Re-index failed: No extractable knowledge content found")
+    }));
+    assert!(stream_events.iter().any(|(event, payload)| {
+        event == "process_log"
+            && payload["level"] == "ERROR"
+            && payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Stack trace:\nTraceback")
+    }));
+    assert!(
+        stream_events
+            .iter()
+            .any(|(event, payload)| event == "progress"
+                && payload["stage"] == "error"
+                && payload["error"] == "No extractable knowledge content found")
+    );
+    let failed = stream_events
+        .iter()
+        .find(|(event, _)| event == "failed")
+        .expect("failed SSE event");
+    assert_eq!(failed.1["detail"], "No extractable knowledge content found");
+    assert_eq!(failed.1["task_id"], task_id);
+    assert!(
+        failed.1["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Traceback (most recent call last):")
+    );
+    assert!(
+        failed.1["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ApiError: No extractable knowledge content found")
+    );
+    assert!(!stream_events.iter().any(|(event, _)| event == "complete"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_reindex_task_stream_replays_queueing_progress_before_terminal_event() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "queued-reindex-course",
+        "lesson.md",
+        "Queued reindex notes for planner executor critic progress.",
+    )
+    .await;
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/queued-reindex-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    assert!(task_id.starts_with("kb_reindex_"));
+
+    let stream_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = text_response(stream_response).await;
+    let queue_position = stream_body
+        .find("\"message\":\"Queueing re-index...\"")
+        .expect("queueing progress should be replayed");
+    let complete_position = stream_body
+        .find("event: complete")
+        .expect("complete event should be replayed");
+    assert!(
+        queue_position < complete_position,
+        "queueing progress should precede the terminal event"
+    );
+    assert!(stream_body.contains("\"stage\":\"starting\""));
+    assert!(stream_body.contains("\"task_id\""));
+    assert!(
+        !stream_body.contains("\"stage\":\"completed\""),
+        "Python reindex task stream terminates with complete instead of a completed progress frame"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_reindex_task_stream_replays_embedding_batch_progress_before_terminal_event() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "batch-reindex-course",
+        "lesson.md",
+        "Batch reindex notes for planner executor critic retrieval progress.",
+    )
+    .await;
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/batch-reindex-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    assert!(task_id.starts_with("kb_reindex_"));
+
+    let stream_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = text_response(stream_response).await;
+    let stream_events = parse_sse_events(&stream_body);
+
+    let queue_position = stream_events
+        .iter()
+        .position(|(event, payload)| {
+            event == "progress"
+                && payload["stage"] == "starting"
+                && payload["message"] == "Queueing re-index..."
+                && payload["task_id"] == task_id
+        })
+        .expect("queueing progress should be replayed");
+    let batch_position = stream_events
+        .iter()
+        .position(|(event, payload)| {
+            event == "progress"
+                && payload["stage"] == "processing_documents"
+                && payload["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Embedding batches:"))
+                && payload["task_id"] == task_id
+                && payload["index_action"] == "reindex"
+                && payload["current"].as_u64().unwrap_or_default() >= 1
+                && payload["total"].as_u64().unwrap_or_default()
+                    >= payload["current"].as_u64().unwrap_or_default()
+        })
+        .expect("embedding batch progress should be replayed");
+    let complete_position = stream_events
+        .iter()
+        .position(|(event, payload)| event == "complete" && payload["task_id"] == task_id)
+        .expect("complete event should be replayed");
+
+    assert!(
+        queue_position < batch_position,
+        "embedding batch progress should follow queueing progress"
+    );
+    assert!(
+        batch_position < complete_position,
+        "embedding batch progress should precede the terminal event"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_reindex_returns_before_slow_embedding_worker_completes_like_background_task() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, _requests, server) = spawn_delayed_request_recorder(
+        json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "index": 0,
+                "embedding": [1.0, 0.0, 0.0]
+            }],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": embedding_test_catalog(&base_url) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "slow-reindex-course",
+        "lesson.md",
+        "Slow embedding reindex notes for background task timing.",
+    )
+    .await;
+
+    let reindex_response = timeout(
+        Duration::from_millis(500),
+        app.clone().oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/slow-reindex-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("reindex response should not wait for the slow embedding worker")
+    .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    assert_eq!(reindex["noop"], false);
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    assert!(task_id.starts_with("kb_reindex_"));
+
+    let progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/slow-reindex-course/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress_response.status(), http::StatusCode::OK);
+    let progress = json_response(progress_response).await;
+    assert_eq!(progress["task_id"], task_id);
+    assert_ne!(progress["status"], "not_started");
+
+    let stream_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = timeout(Duration::from_secs(5), text_response(stream_response))
+        .await
+        .expect("background reindex should eventually complete");
+    assert!(stream_body.contains("\"message\":\"Queueing re-index...\""));
+    assert!(stream_body.contains("event: complete"));
+
+    server.abort();
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1200,12 +8939,10 @@ Index version notes for planner executor critic retrieval.\r\n\
     let signature = reindex["signature"].as_str().expect("signature");
     assert_eq!(signature.len(), 16);
     assert_eq!(reindex["noop"], false);
-    assert!(
-        reindex["task_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("task-reindex-")
-    );
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    assert!(task_id.starts_with("kb_reindex_"));
+    let progress = wait_for_knowledge_progress_terminal(app.clone(), "index-course", task_id).await;
+    assert_eq!(progress["stage"], "completed");
 
     let list_response = app
         .clone()
@@ -1219,7 +8956,7 @@ Index version notes for planner executor critic retrieval.\r\n\
         .unwrap();
     assert_eq!(list_response.status(), http::StatusCode::OK);
     let list = json_response(list_response).await;
-    let course = list["knowledge_bases"]
+    let course = list
         .as_array()
         .unwrap()
         .iter()
@@ -1257,6 +8994,133 @@ Index version notes for planner executor critic retrieval.\r\n\
     assert_eq!(noop["task_id"], Value::Null);
     assert_eq!(noop["noop"], true);
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_create_returns_before_slow_background_indexing_like_python_init() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) =
+        spawn_delayed_dynamic_embedding_recorder(Duration::from_secs(2)).await;
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": embedding_test_catalog(&base_url) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+
+    let boundary = "SOCARTESBACKGROUNDCREATE";
+    let body = format!(
+        "--{boundary}\r\n\
+Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+background-create-course\r\n\
+--{boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"init.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The background create answer is violet ledger and appears only in this init file.\r\n\
+--{boundary}--\r\n"
+    );
+
+    let create_response = timeout(
+        Duration::from_millis(500),
+        app.clone().oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/create")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("create response should not wait for slow background indexing")
+    .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+    let create = json_response(create_response).await;
+    let create_task_id = create["task_id"].as_str().expect("create task id");
+    assert!(create_task_id.starts_with("kb_init_"));
+    assert_eq!(create["name"], "background-create-course");
+    assert_eq!(create["files"], json!(["init.md"]));
+
+    let progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/background-create-course/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress_response.status(), http::StatusCode::OK);
+    let progress = json_response(progress_response).await;
+    assert_eq!(progress["task_id"], create_task_id);
+    assert_eq!(progress["index_action"], "create");
+    assert_ne!(progress["stage"], "completed");
+
+    let stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{create_task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = timeout(Duration::from_secs(5), text_response(stream_response))
+        .await
+        .expect("background create should eventually complete");
+    assert!(stream_body.contains("event: process_log"));
+    assert!(stream_body.contains("event: progress"));
+    assert!(stream_body.contains("event: complete"));
+    assert!(stream_body.contains("initialization complete"));
+
+    assert!(
+        !requests.lock().await.is_empty(),
+        "create background initialization should call the embedding provider"
+    );
+    assert!(
+        root.join("bases")
+            .join("background-create-course")
+            .join("version-1")
+            .join("chunks.json")
+            .exists(),
+        "create background initialization should write an active chunk index"
+    );
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/background-create-course")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    assert_eq!(detail["statistics"]["rag_initialized"], true);
+    assert_eq!(detail["statistics"]["active_match"], true);
+    assert_eq!(detail["statistics"]["needs_reindex"], false);
+
+    server.abort();
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1389,7 +9253,10 @@ New material should wait for reindex.\r\n\
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
-    assert_eq!(json_response(reindex_response).await["noop"], false);
+    let reindex = json_response(reindex_response).await;
+    assert_eq!(reindex["noop"], false);
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "stale-course", task_id).await;
 
     let config_get_response = app
         .clone()
@@ -1430,6 +9297,14 @@ New material can be uploaded after reindex.\r\n\
         .await
         .unwrap();
     assert_eq!(upload_after_reindex_response.status(), http::StatusCode::OK);
+    let upload_after_reindex = json_response(upload_after_reindex_response).await;
+    assert!(
+        upload_after_reindex["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("kb_upload_")
+    );
+    assert_eq!(upload_after_reindex["files"], json!(["extra.md"]));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1652,6 +9527,184 @@ The lantern school rule says students must recite the blue theorem before openin
 }
 
 #[tokio::test]
+async fn chat_rag_uses_legacy_raw_course_files_as_sources() {
+    let root = unique_test_knowledge_root();
+    let raw_dir = root.join("legacy-raw-course").join("raw");
+    fs::create_dir_all(&raw_dir).unwrap();
+    fs::write(
+        raw_dir.join("legacy-notes.md"),
+        "The legacy raw course keyword is jade vector, and this migrated course file names it.",
+    )
+    .unwrap();
+    let app = app_with_knowledge_root(&root);
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": "What is the legacy raw course keyword?",
+                        "language": "en",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["legacy-raw-course"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let session_id = json_response(chat_response).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    let sources_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("sources event");
+    let sources = sources_event["metadata"]["sources"]
+        .as_array()
+        .expect("sources array");
+    assert!(sources.iter().any(|source| {
+        source["source_id"] == "legacy-raw-course/legacy-notes.md"
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("jade vector"))
+    }));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_rag_uses_legacy_llamaindex_docstore_without_raw_files() {
+    let root = unique_test_knowledge_root();
+    let version_dir = root.join("legacy-index-course").join("version-1");
+    fs::create_dir_all(&version_dir).unwrap();
+    fs::write(
+        version_dir.join("meta.json"),
+        json!({
+            "version": "version-1",
+            "signature": "old-python-index-signature",
+            "ready": true,
+            "layout": "llamaindex"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        version_dir.join("docstore.json"),
+        json!({
+            "docstore/data": {
+                "node-1": {
+                    "__type__": "TextNode",
+                    "__data__": {
+                        "id_": "node-1",
+                        "metadata": {
+                            "file_name": "legacy-index-notes.pdf",
+                            "file_path": "/app/data/knowledge_bases/legacy-index-course/raw/legacy-index-notes.pdf"
+                        },
+                        "text": "The legacy LlamaIndex course marker is silver cosine, stored only in docstore text."
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = app_with_knowledge_root(&root);
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": "What is the legacy LlamaIndex course marker?",
+                        "language": "en",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["legacy-index-course"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let session_id = json_response(chat_response).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    let sources_event = assistant["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("sources event");
+    let sources = sources_event["metadata"]["sources"]
+        .as_array()
+        .expect("sources array");
+    assert!(sources.iter().any(|source| {
+        source["source_id"] == "legacy-index-course/legacy-index-notes.pdf"
+            && source["provider"] == "llamaindex"
+            && source["chunk_id"] == "node-1"
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("silver cosine"))
+    }));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn knowledge_reindex_persists_chunk_index_and_rag_uses_indexed_chunks() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -1698,6 +9751,9 @@ The cedar lantern unlock phrase is cobalt spiral, and the archive keeper writes 
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "chunk-course", task_id).await;
 
     let chunk_index_path = root
         .join("bases")
@@ -1917,6 +9973,9 @@ async fn office_documents_upload_reindex_and_rag_extract_text() {
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "office-course", task_id).await;
 
     let chunk_index_path = root
         .join("bases")
@@ -2048,6 +10107,9 @@ async fn corrupt_parser_documents_are_skipped_instead_of_indexing_binary_garbage
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "mixed-parser-course", task_id).await;
 
     let chunk_index_path = root
         .join("bases")
@@ -2140,6 +10202,9 @@ The semantic-only answer says the archive password is amber circuit. This file i
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "semantic-course", task_id).await;
 
     let chunk_index_path = root
         .join("bases")
@@ -2257,6 +10322,9 @@ The seed lesson only mentions planner executor critic setup.\r\n\
         .await
         .unwrap();
     assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "incremental-course", task_id).await;
 
     let upload_boundary = "SOCARTESINCREMENTALUPLOAD";
     let upload_body = format!(
@@ -2282,6 +10350,9 @@ The quartz compass answer is lavender delta, recorded only in this uploaded file
         .await
         .unwrap();
     assert_eq!(upload_response.status(), http::StatusCode::OK);
+    let upload = json_response(upload_response).await;
+    let upload_task_id = upload["task_id"].as_str().expect("upload task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "incremental-course", upload_task_id).await;
 
     let plugin_response = app
         .clone()
@@ -2360,6 +10431,12 @@ The seed lesson only mentions planner executor critic setup.\r\n\
         .await
         .unwrap();
     assert_eq!(duplicate_seed_response.status(), http::StatusCode::OK);
+    let duplicate_seed = json_response(duplicate_seed_response).await;
+    let duplicate_seed_task_id = duplicate_seed["task_id"]
+        .as_str()
+        .expect("duplicate seed upload task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "incremental-course", duplicate_seed_task_id)
+        .await;
 
     let metadata_after_seed_duplicate: Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
@@ -2390,6 +10467,12 @@ The quartz compass answer is lavender delta, recorded only in this uploaded file
         .await
         .unwrap();
     assert_eq!(duplicate_response.status(), http::StatusCode::OK);
+    let duplicate = json_response(duplicate_response).await;
+    let duplicate_task_id = duplicate["task_id"]
+        .as_str()
+        .expect("duplicate upload task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "incremental-course", duplicate_task_id)
+        .await;
 
     let chunk_index_path = root
         .join("bases")
@@ -2430,6 +10513,257 @@ The quartz compass answer is lavender delta, recorded only in this uploaded file
         history_len
     );
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_upload_skips_bad_parser_file_like_python_document_adder() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let created = create_markdown_knowledge_base_at(
+        app.clone(),
+        "/api/v1/knowledge/create",
+        "upload-bad-parser-course",
+        "seed.md",
+        "The upload bad parser seed remains searchable.",
+    )
+    .await;
+    let create_task_id = created["task_id"].as_str().expect("create task id");
+    let create_progress = wait_for_knowledge_progress_terminal(
+        app.clone(),
+        "upload-bad-parser-course",
+        create_task_id,
+    )
+    .await;
+    assert_eq!(create_progress["stage"], "completed");
+
+    let upload_boundary = "SOCARTESBADPARSERUPLOAD";
+    let mut upload_body = Vec::new();
+    push_multipart_file(
+        &mut upload_body,
+        upload_boundary,
+        "files",
+        "broken.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        b"not an Office Open XML document",
+    );
+    finish_multipart(&mut upload_body, upload_boundary);
+
+    let upload_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/upload-bad-parser-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={upload_boundary}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), http::StatusCode::OK);
+    let upload = json_response(upload_response).await;
+    assert_eq!(upload["files"], json!(["broken.docx"]));
+    let upload_task_id = upload["task_id"].as_str().expect("upload task id");
+    let upload_progress = wait_for_knowledge_progress_terminal(
+        app.clone(),
+        "upload-bad-parser-course",
+        upload_task_id,
+    )
+    .await;
+    assert_eq!(upload_progress["stage"], "completed");
+    assert_eq!(
+        upload_progress["message"],
+        "Successfully processed 0 files!"
+    );
+    assert_eq!(upload_progress["indexed_count"], 0);
+    assert_eq!(upload_progress["index_changed"], false);
+
+    let metadata_path = root
+        .join("bases")
+        .join("upload-bad-parser-course")
+        .join("metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata.json"))
+            .expect("valid metadata");
+    assert!(metadata["file_hashes"]["broken.docx"].is_null());
+    assert_ne!(metadata["last_indexed_action"], "upload");
+
+    let copied_file = root
+        .join("bases")
+        .join("upload-bad-parser-course")
+        .join("files")
+        .join("broken.docx");
+    assert!(copied_file.is_file());
+
+    let chunk_index_path = root
+        .join("bases")
+        .join("upload-bad-parser-course")
+        .join("version-1")
+        .join("chunks.json");
+    let chunk_index: Value =
+        serde_json::from_str(&fs::read_to_string(&chunk_index_path).expect("chunks.json"))
+            .expect("valid chunks.json");
+    let chunks = chunk_index["chunks"].as_array().expect("chunks array");
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| chunk["source"].as_str() == Some("broken.docx"))
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn knowledge_upload_returns_before_slow_background_indexing_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) =
+        spawn_delayed_dynamic_embedding_recorder(Duration::from_secs(2)).await;
+
+    let settings_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": embedding_test_catalog(&base_url) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "background-upload-course",
+        "seed.md",
+        "The seed course introduces planner executor critic roles.",
+    )
+    .await;
+
+    let reindex_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/background-upload-course/reindex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reindex_response.status(), http::StatusCode::OK);
+    let reindex = json_response(reindex_response).await;
+    let reindex_task_id = reindex["task_id"].as_str().expect("reindex task id");
+    wait_for_knowledge_progress_terminal(app.clone(), "background-upload-course", reindex_task_id)
+        .await;
+
+    let upload_boundary = "SOCARTESBACKGROUNDUPLOAD";
+    let upload_body = format!(
+        "--{upload_boundary}\r\n\
+Content-Disposition: form-data; name=\"files\"; filename=\"fresh.md\"\r\n\
+Content-Type: text/markdown\r\n\r\n\
+The background upload answer is cobalt lantern and it appears only here.\r\n\
+--{upload_boundary}--\r\n"
+    );
+    let upload_response = timeout(
+        Duration::from_millis(500),
+        app.clone().oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge/background-upload-course/upload")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={upload_boundary}"),
+                )
+                .body(Body::from(upload_body))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("upload response should not wait for slow background indexing")
+    .unwrap();
+    assert_eq!(upload_response.status(), http::StatusCode::OK);
+    let upload = json_response(upload_response).await;
+    let upload_task_id = upload["task_id"].as_str().expect("upload task id");
+    assert!(upload_task_id.starts_with("kb_upload_"));
+    assert_eq!(upload["files"], json!(["fresh.md"]));
+
+    let progress_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/knowledge/background-upload-course/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress_response.status(), http::StatusCode::OK);
+    let progress = json_response(progress_response).await;
+    assert_eq!(progress["task_id"], upload_task_id);
+    assert_ne!(progress["stage"], "completed");
+
+    let stream_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/knowledge/tasks/{upload_task_id}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), http::StatusCode::OK);
+    let stream_body = timeout(Duration::from_secs(5), text_response(stream_response))
+        .await
+        .expect("background upload should eventually complete");
+    assert!(stream_body.contains("event: process_log"));
+    assert!(stream_body.contains("event: progress"));
+    assert!(stream_body.contains("event: complete"));
+    assert!(stream_body.contains("Successfully processed 1 files"));
+
+    let plugin_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/rag/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "params": {
+                            "query": "What is the background upload answer?",
+                            "kb_name": "background-upload-course"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_response.status(), http::StatusCode::OK);
+    let plugin = json_response(plugin_response).await;
+    assert!(plugin["sources"].as_array().unwrap().iter().any(|source| {
+        source["source"].as_str() == Some("fresh.md")
+            && source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("cobalt lantern"))
+    }));
+    assert!(
+        requests.lock().await.len() >= 2,
+        "create/reindex and background upload should both call the embedding mock"
+    );
+
+    server.abort();
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3547,6 +11881,907 @@ async fn plugins_capability_stream_matches_playground_contract() {
 }
 
 #[tokio::test]
+async fn plugins_capability_stream_forwards_config_and_attachments_into_turn_request_snapshot() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_question/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Generate questions from the attached paper.",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "language": "en",
+                        "config": {
+                            "mode": "mimic",
+                            "max_questions": 4
+                        },
+                        "attachments": [{
+                            "id": "paper-1",
+                            "type": "file",
+                            "filename": "paper.txt",
+                            "mime_type": "text/plain",
+                            "text": "The attached paper discusses Socartes retrieval practice."
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let stream = text_response(response).await;
+    assert!(stream.contains("event: result"));
+    assert!(stream.contains("\"success\":true"));
+
+    let events = parse_sse_data_events(&stream);
+    let session_id = events
+        .iter()
+        .find_map(|event| {
+            if event["type"] == "session" {
+                event["session_id"].as_str()
+            } else {
+                None
+            }
+        })
+        .expect("capability stream session id");
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "content"
+                && event["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Question 1"))
+        }),
+        "capability stream should execute the deep_question turn, not only store a snapshot"
+    );
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("persisted user message");
+    let snapshot = &user["metadata"]["request_snapshot"];
+    assert_eq!(snapshot["capability"], "deep_question");
+    assert_eq!(snapshot["config"]["mode"], "mimic");
+    assert_eq!(snapshot["config"]["max_questions"], json!(4));
+    assert_eq!(snapshot["attachments"][0]["filename"], "paper.txt");
+    assert_eq!(snapshot["attachments"][0]["mime_type"], "text/plain");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn deep_question_execute_stream_runs_quiz_pipeline() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_question/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "linear algebra fundamentals",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "language": "en",
+                        "config": {
+                            "mode": "custom",
+                            "num_questions": 2,
+                            "difficulty": "medium",
+                            "question_type": "choice"
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    assert!(stream.contains("event: process_log"));
+    assert!(stream.contains("event: stream"));
+    assert!(stream.contains("event: result"));
+
+    let events = parse_sse_data_events(&stream);
+    assert!(
+        events.iter().any(|event| event["stage"] == "ideation"),
+        "deep_question should emit an ideation stage"
+    );
+    assert!(
+        events.iter().any(|event| event["stage"] == "generation"),
+        "deep_question should emit a generation stage"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("deep_question result event");
+    let result_data = &result["data"]["result"];
+    assert!(
+        result_data["response"]
+            .as_str()
+            .is_some_and(|response| response.contains("Question 1")),
+        "deep_question should return markdown quiz text"
+    );
+    let first_question = &result_data["summary"]["results"][0]["qa_pair"];
+    assert!(
+        first_question["question"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "deep_question should return frontend quiz summary results"
+    );
+    assert_eq!(first_question["question_type"], "choice");
+    assert!(
+        !result_data["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Socartes answers the goal"),
+        "deep_question should not use generic chat fallback content"
+    );
+}
+
+#[tokio::test]
+async fn deep_question_execute_stream_honors_followup_and_answer_now_runtime_contexts() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let followup_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_question/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Why was my answer wrong?",
+                        "tools": [],
+                        "knowledge_bases": [],
+                        "language": "en",
+                        "config": {
+                            "followup_question_context": {
+                                "parent_quiz_session_id": "quiz-session-1",
+                                "question_id": "q_3",
+                                "question": "What does density mean in win-rate comparison?",
+                                "question_type": "choice",
+                                "options": {
+                                    "A": "Coverage",
+                                    "B": "Informative value",
+                                    "C": "Relevant content without redundancy",
+                                    "D": "Credibility"
+                                },
+                                "user_answer": "B",
+                                "is_correct": false,
+                                "correct_answer": "C",
+                                "explanation": "Density is relevant content without redundancy.",
+                                "difficulty": "hard",
+                                "concentration": "density"
+                            }
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(followup_response.status(), http::StatusCode::OK);
+    let followup_stream = text_response(followup_response).await;
+    let followup_events = parse_sse_data_events(&followup_stream);
+    let followup_result = followup_events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("follow-up result event");
+    let followup_data = &followup_result["data"]["result"];
+    assert_eq!(followup_data["mode"], "followup");
+    assert_eq!(followup_data["question_id"], "q_3");
+    assert!(followup_data["summary"].is_null());
+    assert!(
+        followup_data["response"]
+            .as_str()
+            .is_some_and(|response| response.contains("density") && response.contains("wrong"))
+    );
+    assert!(followup_events.iter().any(|event| {
+        event["type"] == "content"
+            && event["content"].as_str().is_some_and(|content| {
+                content.contains("density") && !content.contains("Question 1")
+            })
+    }));
+
+    let answer_now_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_question/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "answer-now-session",
+                        "content": "Generate calc warm-ups",
+                        "tools": [],
+                        "knowledge_bases": [],
+                        "language": "en",
+                        "config": {
+                            "topic": "calculus warm-ups",
+                            "num_questions": 2,
+                            "answer_now_context": {
+                                "original_user_message": "Generate calc warm-ups",
+                                "partial_response": "Planning two derivative questions",
+                                "events": [
+                                    {
+                                        "type": "thinking",
+                                        "stage": "ideation",
+                                        "content": "Drafting derivative templates",
+                                        "metadata": {}
+                                    }
+                                ]
+                            }
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(answer_now_response.status(), http::StatusCode::OK);
+    let answer_now_stream = text_response(answer_now_response).await;
+    let answer_now_events = parse_sse_data_events(&answer_now_stream);
+    let answer_now_result = answer_now_events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("answer-now result event");
+    let answer_now_data = &answer_now_result["data"]["result"];
+    assert_eq!(answer_now_data["mode"], "answer_now");
+    assert_eq!(answer_now_data["metadata"]["answer_now"], true);
+    assert_eq!(answer_now_data["summary"]["mode"], "answer_now");
+    let results = answer_now_data["summary"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .all(|item| item["metadata"]["answer_now"] == true)
+    );
+    assert!(
+        results[0]["qa_pair"]["question"]
+            .as_str()
+            .is_some_and(|question| !question.is_empty())
+    );
+    assert!(answer_now_events.iter().any(|event| {
+        event["type"] == "content"
+            && event["content"].as_str().is_some_and(|content| {
+                content.contains("Skipped") && content.contains("Question 1")
+            })
+    }));
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions/answer-now-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("persisted answer-now user message");
+    let snapshot_config = &user["metadata"]["request_snapshot"]["config"];
+    assert_eq!(snapshot_config["topic"], "calculus warm-ups");
+    assert!(snapshot_config.get("answer_now_context").is_none());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn question_generate_websocket_matches_python_contract() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/generate"))
+        .await
+        .expect("question generate websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "requirement": {
+                    "knowledge_point": "linear algebra fundamentals",
+                    "preference": "focus on conceptual checks",
+                    "difficulty": "medium",
+                    "question_type": "choice"
+                },
+                "kb_name": "socartes-rust-rag",
+                "count": 2
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    assert_eq!(events[0]["type"], "task_id");
+    assert!(
+        events[0]["task_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("question_gen"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "status" && event["content"] == "started")
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "result"
+            && event["question"]["question"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+    }));
+    let summary = events
+        .iter()
+        .find(|event| event["type"] == "batch_summary")
+        .expect("batch summary event");
+    assert_eq!(summary["requested"], 2);
+    assert_eq!(summary["completed"], 2);
+    assert_eq!(events.last().unwrap()["type"], "complete");
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_websocket_matches_python_status_contract() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("sample-exam-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+    fs::write(
+        paper_dir.join("sample_questions.json"),
+        json!({
+            "questions": [
+                {
+                    "question_number": "1",
+                    "question_text": "Which option best describes deterministic contract testing?",
+                    "answer": "A",
+                    "question_type": "multiple_choice",
+                    "images": []
+                },
+                {
+                    "question_number": "2",
+                    "question_text": "What should a compatibility layer preserve?",
+                    "answer": "The observable protocol.",
+                    "question_type": "written",
+                    "images": []
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 2
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    assert_eq!(events[0]["type"], "status");
+    assert_eq!(events[0]["stage"], "init");
+    assert!(events.iter().any(|event| event["type"] == "status"
+        && event["stage"] == "processing"
+        && event["content"] == "Executing question generation workflow..."));
+    assert!(
+        events.iter().any(
+            |event| event["type"] == "result" && event["question"]["question_type"] == "choice"
+        )
+    );
+    assert_eq!(events.last().unwrap()["type"], "complete");
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_parsed_reads_reference_questions_json_like_python() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("parsed-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+    fs::write(
+        paper_dir.join("sample_questions.json"),
+        json!({
+            "questions": [
+                {
+                    "question_number": "1",
+                    "question_text": "Explain why the Nyquist limit constrains sampled signals.",
+                    "answer": "The sampling rate must exceed twice the highest frequency.",
+                    "question_type": "written",
+                    "images": ["figures/nyquist.png"]
+                },
+                {
+                    "question_number": "2",
+                    "question_text": "Which layer is responsible for convolutional feature extraction?",
+                    "answer": "Convolution layer",
+                    "question_type": "multiple_choice",
+                    "images": []
+                },
+                {
+                    "question_number": "3",
+                    "question_text": "This third reference should be trimmed by max_questions.",
+                    "answer": "Trimmed",
+                    "question_type": "short_answer",
+                    "images": []
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 2
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    let templates_ready = events
+        .iter()
+        .find(|event| event["type"] == "templates_ready")
+        .expect("templates_ready event");
+    assert_eq!(templates_ready["requested_total"], 2);
+    assert_eq!(templates_ready["count"], 2);
+    assert_eq!(
+        templates_ready["templates"][0]["reference_question"],
+        "Explain why the Nyquist limit constrains sampled signals."
+    );
+    assert_eq!(
+        templates_ready["templates"][0]["metadata"]["question_number"],
+        "1"
+    );
+    assert_eq!(
+        templates_ready["templates"][0]["metadata"]["images"][0],
+        "figures/nyquist.png"
+    );
+
+    let result_events = events
+        .iter()
+        .filter(|event| event["type"] == "result")
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 2);
+    assert!(
+        result_events[0]["question"]["question"]
+            .as_str()
+            .unwrap()
+            .contains("Nyquist limit")
+    );
+    assert_eq!(
+        result_events[0]["question"]["metadata"]["reference_answer"],
+        "The sampling rate must exceed twice the highest frequency."
+    );
+    assert_eq!(result_events[0]["question"]["question_type"], "written");
+    assert_eq!(result_events[1]["question"]["question_type"], "choice");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.to_string().contains("third reference"))
+    );
+    assert_eq!(events.last().unwrap()["type"], "complete");
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_zero_max_questions_defaults_to_ten_like_python() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("zero-max-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+    let questions = (1..=12)
+        .map(|number| {
+            json!({
+                "question_number": number.to_string(),
+                "question_text": format!("Reference question {number} should follow Python max_questions semantics."),
+                "answer": format!("Reference answer {number}"),
+                "question_type": "written",
+                "images": []
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        paper_dir.join("sample_questions.json"),
+        json!({ "questions": questions }).to_string(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    let templates_ready = events
+        .iter()
+        .find(|event| event["type"] == "templates_ready")
+        .expect("templates_ready event");
+    assert_eq!(templates_ready["requested_total"], 10);
+    assert_eq!(templates_ready["count"], 10);
+    let result_events = events
+        .iter()
+        .filter(|event| event["type"] == "result")
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 10);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.to_string().contains("Reference question 11"))
+    );
+    assert_eq!(events.last().unwrap()["type"], "complete");
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_parsed_without_extracted_questions_errors_like_python() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("empty-parsed-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 10
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    assert_eq!(events[0]["type"], "status");
+    assert_eq!(events[0]["stage"], "init");
+    assert!(events.iter().any(|event| event["type"] == "status"
+        && event["stage"] == "processing"
+        && event["content"] == "Executing question generation workflow..."));
+    assert!(events.iter().any(|event| event["type"] == "progress"
+        && event["stage"] == "extracting"
+        && event["status"] == "running"
+        && event["paper_dir"] == paper_dir.to_string_lossy().to_string()));
+    assert!(
+        !events.iter().any(|event| event["type"] == "result"),
+        "missing parsed question output must not silently emit fallback questions"
+    );
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(
+        events.last().unwrap()["content"],
+        "Failed to extract questions from parsed exam"
+    );
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_parsed_invalid_questions_json_uses_python_error_text() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("invalid-json-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+    fs::write(paper_dir.join("sample_questions.json"), "not json").unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 10
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    assert!(events.iter().any(|event| event["type"] == "progress"
+        && event["stage"] == "extracting"
+        && event["status"] == "running"));
+    assert!(
+        !events.iter().any(|event| event["type"] == "result"),
+        "invalid parsed question output must not emit fallback questions"
+    );
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(
+        events.last().unwrap()["content"],
+        "Expecting value: line 1 column 1 (char 0)"
+    );
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_mimic_parsed_empty_questions_emits_unknown_error_like_python() {
+    let root = unique_test_knowledge_root();
+    let paper_dir = test_data_root(&root).join("empty-questions-paper");
+    fs::create_dir_all(&paper_dir).unwrap();
+    fs::write(
+        paper_dir.join("sample_questions.json"),
+        json!({ "questions": [] }).to_string(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "parsed",
+                "paper_path": paper_dir.to_string_lossy(),
+                "kb_name": "socartes-rust-rag",
+                "max_questions": 10
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "complete").await;
+    assert!(events.iter().any(|event| event["type"] == "progress"
+        && event["stage"] == "extracting"
+        && event["status"] == "complete"
+        && event["templates"] == 0));
+    let templates_ready = events
+        .iter()
+        .find(|event| event["type"] == "templates_ready")
+        .expect("templates_ready event");
+    assert_eq!(templates_ready["count"], 0);
+    assert!(
+        !events.iter().any(|event| event["type"] == "result"),
+        "empty parsed question output must not emit fallback questions"
+    );
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(events.last().unwrap()["content"], "Unknown error");
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn question_websockets_return_python_validation_errors() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut generate_socket, _) = connect_async(format!("ws://{addr}/api/v1/question/generate"))
+        .await
+        .expect("question generate websocket should connect");
+    generate_socket
+        .send(TungsteniteMessage::Text(
+            json!({"kb_name": "socartes-rust-rag"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let generate_events = collect_ws_json_until(&mut generate_socket, "error").await;
+    assert_eq!(generate_events.last().unwrap()["type"], "error");
+    assert_eq!(
+        generate_events.last().unwrap()["content"],
+        "Requirement is required"
+    );
+    let _ = generate_socket.close(None).await;
+
+    for (request, expected) in [
+        (
+            json!({"mode": "parsed", "kb_name": "socartes-rust-rag"}),
+            "paper_path is required for parsed mode",
+        ),
+        (
+            json!({"mode": "upload", "kb_name": "socartes-rust-rag"}),
+            "PDF data is required for upload mode",
+        ),
+        (
+            json!({"mode": "unknown", "kb_name": "socartes-rust-rag"}),
+            "Unknown mode: unknown",
+        ),
+    ] {
+        let (mut mimic_socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+            .await
+            .expect("question mimic websocket should connect");
+        mimic_socket
+            .send(TungsteniteMessage::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let events = collect_ws_json_until(&mut mimic_socket, "error").await;
+        assert_eq!(events.last().unwrap()["type"], "error");
+        assert_eq!(events.last().unwrap()["content"], expected);
+        let _ = mimic_socket.close(None).await;
+    }
+
+    let (mut invalid_pdf_socket, _) = connect_async(format!("ws://{addr}/api/v1/question/mimic"))
+        .await
+        .expect("question mimic websocket should connect");
+    invalid_pdf_socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "mode": "upload",
+                "pdf_data": "not valid base64!",
+                "pdf_name": "exam.pdf",
+                "kb_name": "socartes-rust-rag"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let invalid_pdf_events = collect_ws_json_until(&mut invalid_pdf_socket, "error").await;
+    assert_eq!(invalid_pdf_events.last().unwrap()["type"], "error");
+    assert!(
+        invalid_pdf_events.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid base64 PDF data:")
+    );
+    let _ = invalid_pdf_socket.close(None).await;
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn page_agent_chat_completion_returns_agent_output_tool_call() {
     let response = app()
         .oneshot(
@@ -3623,6 +12858,202 @@ async fn page_agent_chat_completion_returns_agent_output_tool_call() {
             .contains("Page agent")
     );
     assert_eq!(payload["usage"]["total_tokens"], 0);
+}
+
+#[tokio::test]
+async fn page_agent_chat_completion_forwards_openai_compatible_provider_request() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "id": "provider-page-agent",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "provider-chat-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_page_1",
+                    "type": "function",
+                    "function": {
+                        "name": "AgentOutput",
+                        "arguments": "{\"type\":\"click\",\"target\":\"new-chat\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+        }
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/page-agent/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "frontend-request-model",
+                        "messages": [
+                            {"role": "system", "content": "Use AgentOutput for page actions."},
+                            {"role": "user", "content": "Open a new chat."}
+                        ],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "AgentOutput",
+                                "parameters": {
+                                    "type": "object",
+                                    "required": ["type"],
+                                    "properties": {
+                                        "type": {"type": "string"},
+                                        "target": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }],
+                        "tool_choice": {"type": "function", "function": {"name": "AgentOutput"}},
+                        "temperature": 0.2,
+                        "extra_frontend_field": "allowed"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["id"], "provider-page-agent");
+    assert_eq!(payload["object"], "chat.completion");
+    assert_eq!(payload["created"], 123);
+    assert_eq!(payload["model"], "provider-chat-model");
+    assert_eq!(
+        payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "AgentOutput"
+    );
+    assert_eq!(
+        payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"type\":\"click\",\"target\":\"new-chat\"}"
+    );
+    assert_eq!(payload["usage"]["total_tokens"], 8);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    let request = &recorded[0];
+    assert_eq!(request["uri"], "/v1/chat/completions");
+    assert_eq!(request["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(request["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(request["payload"]["model"], "frontend-request-model");
+    assert_eq!(
+        request["payload"]["messages"][1]["content"],
+        "Open a new chat."
+    );
+    assert_eq!(
+        request["payload"]["tools"][0]["function"]["name"],
+        "AgentOutput"
+    );
+    assert_eq!(
+        request["payload"]["tool_choice"]["function"]["name"],
+        "AgentOutput"
+    );
+    assert_eq!(request["payload"]["temperature"], 0.2);
+    assert_eq!(request["payload"]["extra_frontend_field"], "allowed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn page_agent_chat_completion_provider_failure_returns_bad_gateway() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, server) = spawn_status_request_recorder(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        json!({
+            "error": {
+                "message": "mock provider failed"
+            }
+        }),
+    )
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/page-agent/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "messages": [
+                            {"role": "user", "content": "Try to open a new chat."}
+                        ],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "AgentOutput",
+                                "parameters": {"type": "object"}
+                            }
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    let payload = json_response(response).await;
+    let detail = payload["detail"].as_str().unwrap();
+    assert!(detail.contains("Page-agent LLM request failed"));
+    assert!(detail.contains("mock provider failed"));
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    server.abort();
 }
 
 #[tokio::test]
@@ -3797,6 +13228,93 @@ async fn co_writer_documents_crud_matches_frontend_contract() {
         .await
         .unwrap();
     assert_eq!(deleted_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn co_writer_edit_records_history_and_source_tool_call_like_python_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let edit_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/co_writer/edit")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "text": "Course draft paragraph.",
+                        "instruction": "use the course note",
+                        "action": "rewrite",
+                        "source": "rag",
+                        "kb_name": "course-notes"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_response.status(), http::StatusCode::OK);
+    let edit_payload = json_response(edit_response).await;
+    let operation_id = edit_payload["operation_id"].as_str().unwrap();
+    assert!(operation_id.len() > 8);
+
+    let history_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/co_writer/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert_eq!(history["total"], 1);
+    assert_eq!(history["history"][0]["id"], operation_id);
+    assert_eq!(history["history"][0]["action"], "rewrite");
+    assert_eq!(history["history"][0]["source"], "rag");
+    assert_eq!(history["history"][0]["kb_name"], "course-notes");
+    assert_eq!(
+        history["history"][0]["input"]["original_text"],
+        "Course draft paragraph."
+    );
+    assert_eq!(
+        history["history"][0]["input"]["instruction"],
+        "use the course note"
+    );
+    assert_eq!(
+        history["history"][0]["output"]["edited_text"],
+        edit_payload["edited_text"]
+    );
+    assert_eq!(history["history"][0]["model"], "deterministic-co-writer");
+    assert!(
+        history["history"][0]["tool_call_file"]
+            .as_str()
+            .unwrap()
+            .ends_with("_rag.json")
+    );
+
+    let tool_call_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/co_writer/tool_calls/{operation_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool_call_response.status(), http::StatusCode::OK);
+    let tool_call = json_response(tool_call_response).await;
+    assert_eq!(tool_call["type"], "rag");
+    assert_eq!(tool_call["operation_id"], operation_id);
+    assert_eq!(tool_call["query"], "use the course note");
+    assert_eq!(tool_call["kb_name"], "course-notes");
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
@@ -4491,6 +14009,3244 @@ async fn tutorbot_management_profiles_and_souls_match_frontend_contract() {
 }
 
 #[tokio::test]
+async fn tutorbot_ws_runs_selected_provider_tool_loop_and_persists_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "tutorbot-tool-first",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_rag_1",
+                        "type": "function",
+                        "function": {
+                            "name": "rag",
+                            "arguments": "{\"query\":\"What phrase unlocks the violet prism?\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "tutorbot-tool-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "TutorBot final provider answer with silver delta."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "tool-course",
+        "violet-prism.md",
+        "The violet prism unlock phrase is silver delta, and this phrase appears only in the uploaded course file.",
+    )
+    .await;
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "provider-bot",
+                        "name": "Provider TutorBot",
+                        "persona": "# Soul\n\nUse course evidence before answering.",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/provider-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "content": "What phrase unlocks the violet prism?",
+                "chat_id": "web",
+                "tools": ["rag"],
+                "knowledge_bases": ["tool-course"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("TutorBot provider turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        events.iter().any(|event| event["type"] == "thinking"),
+        "Python TutorBot forwards progress as thinking events"
+    );
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "TutorBot final provider answer with silver delta."
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[1]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(recorded[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    assert_eq!(recorded[0]["payload"]["tool_choice"], "auto");
+    assert!(recorded[0]["payload"]["tools"].is_array());
+    assert!(recorded[1]["payload"]["tools"].is_null());
+    assert!(recorded[1]["payload"]["tool_choice"].is_null());
+
+    let first_messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    assert!(first_messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Use course evidence"))
+    }));
+    assert!(first_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("violet prism"))
+    }));
+
+    let second_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let assistant_tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .expect("assistant tool call message");
+    assert_eq!(assistant_tool_message["tool_calls"][0]["id"], "call_rag_1");
+    let tool_message = second_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_rag_1")
+        .expect("tool result message");
+    assert_eq!(tool_message["name"], "rag");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("silver delta"))
+    );
+    drop(recorded);
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/provider-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert!(history.as_array().unwrap().iter().any(|message| {
+        message["role"] == "user" && message["content"] == "What phrase unlocks the violet prism?"
+    }));
+    assert!(history.as_array().unwrap().iter().any(|message| {
+        message["role"] == "assistant"
+            && message["content"] == "TutorBot final provider answer with silver delta."
+    }));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_history_uses_bot_canonical_session_across_chat_ids() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "canonical-bot",
+                        "name": "Canonical Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/canonical-bot/ws"))
+        .await
+        .unwrap();
+    for (chat_id, content) in [
+        ("browser-tab-a", "First canonical TutorBot turn."),
+        ("browser-tab-b", "Second canonical TutorBot turn."),
+    ] {
+        socket
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "content": content,
+                    "chat_id": chat_id
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("TutorBot fallback turn should finish")
+                .expect("socket message")
+                .expect("valid socket message");
+            let TungsteniteMessage::Text(text) = message else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&text).unwrap();
+            if event["type"] == "done" {
+                break;
+            }
+        }
+    }
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/canonical-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert_eq!(history.as_array().unwrap().len(), 4);
+    assert_eq!(history[0]["content"], "First canonical TutorBot turn.");
+    assert_eq!(history[2]["content"], "Second canonical TutorBot turn.");
+
+    let sessions_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("canonical-bot")
+        .join("workspace")
+        .join("sessions");
+    let files = fs::read_dir(&sessions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        files,
+        vec!["bot_canonical-bot.jsonl".to_string()],
+        "Python TutorBot stores web chat turns in the bot canonical session, not per chat_id files"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_help_command_returns_python_help_without_persisting_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "unexpected-help-provider-call",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "provider should not handle slash help"},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "help-bot",
+                        "name": "Help Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/help-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/help", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("help content event");
+    assert!(content.contains("TutorBot commands:"));
+    assert!(content.contains("/new"));
+    assert!(content.contains("/team status"));
+    assert!(content.contains("/btw <instruction>"));
+    assert!(content.contains("/help"));
+
+    assert_eq!(requests.lock().await.len(), 0);
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/help-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+    let sessions_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("help-bot")
+        .join("workspace")
+        .join("sessions");
+    let session_files = fs::read_dir(sessions_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(session_files, 0);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_stop_command_returns_python_idle_message_without_persisting_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "unexpected-stop-provider-call",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "provider should not handle slash stop"},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "stop-bot",
+                        "name": "Stop Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/stop-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/stop", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("stop content event");
+    assert_eq!(content, "No active task to stop.");
+
+    assert_eq!(requests.lock().await.len(), 0);
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/stop-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+    let sessions_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("stop-bot")
+        .join("workspace")
+        .join("sessions");
+    let session_files = fs::read_dir(sessions_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(session_files, 0);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_restart_command_returns_python_message_without_mutating_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "restart-provider-first",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Stored answer before restart."},
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "unexpected-restart-provider-call",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "provider should not handle slash restart"},
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "restart-bot",
+                        "name": "Restart Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/restart-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "Remember this before restart.", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/restart", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("restart content event");
+    assert_eq!(content, "Restarting...");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    drop(recorded);
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/restart-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert!(history.as_array().unwrap().iter().any(|message| {
+        message["role"] == "user" && message["content"] == "Remember this before restart."
+    }));
+    assert!(history.as_array().unwrap().iter().any(|message| {
+        message["role"] == "assistant" && message["content"] == "Stored answer before restart."
+    }));
+
+    let session_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("restart-bot")
+        .join("workspace")
+        .join("sessions")
+        .join("bot_restart-bot.jsonl");
+    let session_text = fs::read_to_string(session_path).unwrap();
+    let lines = session_text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert!(!session_text.contains("/restart"));
+    assert!(!session_text.contains("provider should not handle slash restart"));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_usage_slash_commands_return_python_text_without_provider_or_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "unexpected-usage-provider-call",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "provider should not handle usage slash commands"},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "usage-bot",
+                        "name": "Usage Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/usage-bot/ws"))
+        .await
+        .unwrap();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/btw", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let btw_events = collect_ws_json_until(&mut socket, "done").await;
+    let btw_content = btw_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("btw usage content event");
+    assert_eq!(btw_content, "Usage: /btw <instruction>");
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let team_events = collect_ws_json_until(&mut socket, "done").await;
+    let team_content = team_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("team usage content event");
+    assert_eq!(
+        team_content,
+        "Usage:\n/team <goal>\n/team status\n/team log [n]\n/team approve <task_id>\n/team reject <task_id> <reason>\n/team manual <task_id> <instruction>\n/team stop"
+    );
+
+    assert_eq!(requests.lock().await.len(), 0);
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/usage-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+    let sessions_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("usage-bot")
+        .join("workspace")
+        .join("sessions");
+    let session_files = fs::read_dir(sessions_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(session_files, 0);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_btw_instruction_returns_python_acceptance_without_normal_chat_history() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, _requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "unexpected-btw-provider-call",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "provider should not handle btw instruction"},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "btw-bot",
+                        "name": "BTW Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/btw-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/btw summarize current workspace", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        events.iter().all(|event| event["type"] != "thinking"),
+        "slash /btw instruction must not enter the normal chat loop"
+    );
+    let content = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("btw accepted content event");
+    let expected_prefix = "BTW accepted (id: ";
+    let expected_suffix = "). I'll send the result when it finishes.";
+    assert!(content.starts_with(expected_prefix), "{content}");
+    assert!(content.ends_with(expected_suffix), "{content}");
+    let task_id = content
+        .strip_prefix(expected_prefix)
+        .unwrap()
+        .strip_suffix(expected_suffix)
+        .unwrap();
+    assert_eq!(task_id.len(), 8);
+    assert!(task_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/btw-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+    let sessions_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("btw-bot")
+        .join("workspace")
+        .join("sessions");
+    let session_files = fs::read_dir(sessions_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(session_files, 0);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_btw_instruction_runs_background_provider_and_sends_proactive_result_like_python()
+ {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "btw-subagent-final",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "The background result says amber theorem."},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "btw-proactive-bot",
+                        "name": "BTW Proactive Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/tutorbot/btw-proactive-bot/ws"))
+            .await
+            .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/btw find the amber theorem", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let accepted_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        accepted_events
+            .iter()
+            .all(|event| event["type"] != "thinking"),
+        "slash /btw instruction must not enter the normal chat loop"
+    );
+    let accepted = accepted_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("btw accepted content event");
+    assert!(accepted.starts_with("BTW accepted (id: "), "{accepted}");
+
+    let proactive_event = timeout(Duration::from_secs(3), async {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("proactive websocket message")
+                .expect("valid websocket message");
+            let TungsteniteMessage::Text(text) = message else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&text).expect("json proactive event");
+            if event["type"] == "proactive" || event["type"] == "error" {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("btw background task should emit a proactive websocket event");
+
+    assert_eq!(proactive_event["type"], "proactive");
+    assert!(
+        proactive_event["content"]
+            .as_str()
+            .unwrap()
+            .contains("amber theorem")
+    );
+
+    let recorded = requests.lock().await;
+    assert!(
+        !recorded.is_empty(),
+        "btw background task should call provider"
+    );
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(recorded[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("subagent"))
+    }));
+    assert!(messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("find the amber theorem"))
+    }));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_stop_cancels_active_btw_background_task_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_delayed_request_recorder(
+        json!({
+            "id": "btw-cancelled-subagent-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "This cancelled result must not be pushed."},
+                "finish_reason": "stop"
+            }]
+        }),
+        Duration::from_millis(400),
+    )
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "btw-stop-bot",
+                        "name": "BTW Stop Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/btw-stop-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/btw generate a cancellable side result", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let accepted_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(accepted_events.iter().any(|event| {
+        event["type"] == "content"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("BTW accepted (id: "))
+    }));
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/stop", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let stop_events = collect_ws_json_until(&mut socket, "done").await;
+    let stop_content = stop_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("stop content event");
+    assert_eq!(stop_content, "Stopped 1 task(s).");
+
+    assert!(
+        timeout(Duration::from_millis(650), socket.next())
+            .await
+            .is_err(),
+        "cancelled /btw task must not publish a proactive result"
+    );
+    assert_eq!(requests.lock().await.len(), 1);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_idle_commands_return_python_text_and_metadata_only_session() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "unexpected-team-provider-call",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "provider should not handle idle team slash commands"},
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-idle-bot",
+                        "name": "Team Idle Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/team-idle-bot/ws"))
+        .await
+        .unwrap();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team status", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let status_events = collect_ws_json_until(&mut socket, "done").await;
+    let status_content = status_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("team status content event");
+    assert_eq!(
+        status_content,
+        "No active nano team. Start with `/team <goal>`."
+    );
+
+    let session_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-idle-bot")
+        .join("workspace")
+        .join("sessions")
+        .join("bot_team-idle-bot.jsonl");
+    let status_session_text = fs::read_to_string(&session_path).unwrap();
+    let status_lines = status_session_text.lines().collect::<Vec<_>>();
+    assert_eq!(status_lines.len(), 1);
+    let status_metadata: Value = serde_json::from_str(status_lines[0]).unwrap();
+    assert_eq!(status_metadata["_type"], "metadata");
+    assert_eq!(status_metadata["key"], "bot:team-idle-bot");
+    assert_eq!(status_metadata["metadata"]["nano_team_active"], false);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team stop", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let stop_events = collect_ws_json_until(&mut socket, "done").await;
+    let stop_content = stop_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("team stop content event");
+    assert_eq!(stop_content, "No active team.");
+
+    assert_eq!(requests.lock().await.len(), 0);
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/team-idle-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    let session_text = fs::read_to_string(session_path).unwrap();
+    let lines = session_text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    let metadata: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(metadata["_type"], "metadata");
+    assert_eq!(metadata["key"], "bot:team-idle-bot");
+    assert!(metadata["metadata"]["nano_team_active"].is_null());
+    assert!(!session_text.contains("/team status"));
+    assert!(!session_text.contains("/team stop"));
+    assert!(!session_text.contains("provider should not handle idle team slash commands"));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_approval_commands_update_runtime_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-approval-bot",
+                        "name": "Team Approval Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) =
+        connect_async(format!("ws://{addr}/api/v1/tutorbot/team-approval-bot/ws"))
+            .await
+            .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Review the approval workflow", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-approval-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-approval-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks_path = run_dir.join("tasks.json");
+    let mut tasks: Value = serde_json::from_str(&fs::read_to_string(&tasks_path).unwrap()).unwrap();
+    let tasks_array = tasks.as_array_mut().unwrap();
+    for (index, owner) in ["researcher", "builder"].iter().enumerate() {
+        tasks_array[index]["owner"] = json!(owner);
+        tasks_array[index]["status"] = json!("awaiting_approval");
+        tasks_array[index]["requires_approval"] = json!(true);
+        tasks_array[index]["plan"] = json!(format!("Plan {}", index + 1));
+        tasks_array[index]["result"] = Value::Null;
+    }
+    fs::write(&tasks_path, serde_json::to_vec_pretty(&tasks).unwrap()).unwrap();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team approve", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let usage_events = collect_ws_json_until(&mut socket, "done").await;
+    let usage_event = usage_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("usage content event");
+    assert_eq!(usage_event["content"], "Usage: /team approve <task_id>");
+    assert!(usage_event["metadata"]["team_text"].is_null());
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team status", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let status_events = collect_ws_json_until(&mut socket, "done").await;
+    let status_content = status_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("team status content");
+    assert!(status_content.contains("Tasks: 0/2 completed · 0 active · 2 awaiting approval"));
+    assert!(status_content.contains("Approval queue: t1, t2"));
+    assert!(status_content.contains("Approve with `/team approve <id>`"));
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team approve t1", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let approve_events = collect_ws_json_until(&mut socket, "done").await;
+    let approve_event = approve_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("approve content event");
+    assert_eq!(approve_event["content"], "Updated task t1 to in_progress");
+    assert_eq!(approve_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team reject t2 Needs more evidence", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let reject_events = collect_ws_json_until(&mut socket, "done").await;
+    let reject_event = reject_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("reject content event");
+    assert_eq!(reject_event["content"], "Updated task t2 to planning");
+    assert_eq!(reject_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team manual t2 Add risk table", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let manual_events = collect_ws_json_until(&mut socket, "done").await;
+    let manual_event = manual_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("manual content event");
+    assert_eq!(manual_event["content"], "Requested changes for t2.");
+    assert_eq!(manual_event["metadata"]["team_text"], true);
+
+    let updated_tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    let task = |id: &str| {
+        updated_tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == id)
+            .unwrap()
+    };
+    assert_eq!(task("t1")["status"], "in_progress");
+    assert_eq!(task("t2")["status"], "planning");
+    assert_eq!(task("t2")["result"], "Add risk table");
+
+    let events = fs::read_to_string(run_dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| event["kind"] == "task_approved"
+            && event["message"] == "Approved task t1"));
+    assert!(events.iter().any(|event| event["kind"] == "task_rejected"
+        && event["message"] == "Rejected task t2: Needs more evidence"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "task_change_requested"
+                && event["message"] == "Requested changes on t2: Add risk table")
+    );
+
+    let mailbox_text = fs::read_to_string(run_dir.join("mailbox.jsonl")).unwrap();
+    assert!(mailbox_text.contains("Please revise t2: Add risk table"));
+    assert!(mailbox_text.contains("\"to_agent\":\"builder\""));
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/team-approval-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_natural_language_approval_replies_match_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-natural-approval-bot",
+                        "name": "Team Natural Approval Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-natural-approval-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Natural approval parity", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-natural-approval-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-natural-approval-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks_path = run_dir.join("tasks.json");
+    let mut tasks: Value = serde_json::from_str(&fs::read_to_string(&tasks_path).unwrap()).unwrap();
+    let tasks_array = tasks.as_array_mut().unwrap();
+    for (index, owner) in ["researcher", "builder"].iter().enumerate() {
+        tasks_array[index]["owner"] = json!(owner);
+        tasks_array[index]["status"] = json!("completed");
+        tasks_array[index]["requires_approval"] = json!(false);
+        tasks_array[index]["plan"] = json!(format!("Plan {}", index + 1));
+        tasks_array[index]["result"] = Value::Null;
+    }
+    tasks_array[0]["status"] = json!("awaiting_approval");
+    tasks_array[0]["requires_approval"] = json!(true);
+    fs::write(&tasks_path, serde_json::to_vec_pretty(&tasks).unwrap()).unwrap();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "ok", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let approve_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        approve_events
+            .iter()
+            .all(|event| event["type"] != "thinking"),
+        "natural approval reply must not enter normal chat"
+    );
+    let approve_event = approve_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("approve content event");
+    assert_eq!(approve_event["content"], "Updated task t1 to in_progress");
+    assert_eq!(approve_event["metadata"]["team_text"], true);
+
+    let mut tasks: Value = serde_json::from_str(&fs::read_to_string(&tasks_path).unwrap()).unwrap();
+    let tasks_array = tasks.as_array_mut().unwrap();
+    tasks_array[0]["status"] = json!("awaiting_approval");
+    tasks_array[0]["requires_approval"] = json!(true);
+    tasks_array[0]["result"] = Value::Null;
+    tasks_array[1]["status"] = json!("awaiting_approval");
+    tasks_array[1]["requires_approval"] = json!(true);
+    tasks_array[1]["result"] = Value::Null;
+    fs::write(&tasks_path, serde_json::to_vec_pretty(&tasks).unwrap()).unwrap();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "approve", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ambiguous_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        ambiguous_events
+            .iter()
+            .all(|event| event["type"] != "thinking"),
+        "ambiguous natural approval reply must not enter normal chat"
+    );
+    let ambiguous_event = ambiguous_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("ambiguous content event");
+    assert_eq!(
+        ambiguous_event["content"],
+        "I found pending approvals but couldn't map your reply to a task. Pending: t1, t2. Please mention the task id in natural language."
+    );
+    assert_eq!(ambiguous_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "reject t1 Needs citations", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let reject_events = collect_ws_json_until(&mut socket, "done").await;
+    let reject_event = reject_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("reject content event");
+    assert_eq!(reject_event["content"], "Updated task t1 to planning");
+    assert_eq!(reject_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "change t2 Add risk table", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let manual_events = collect_ws_json_until(&mut socket, "done").await;
+    let manual_event = manual_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("manual content event");
+    assert_eq!(manual_event["content"], "Requested changes for t2.");
+    assert_eq!(manual_event["metadata"]["team_text"], true);
+
+    let updated_tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    let task = |id: &str| {
+        updated_tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == id)
+            .unwrap()
+    };
+    assert_eq!(task("t1")["status"], "planning");
+    assert_eq!(task("t1")["result"], "Needs citations");
+    assert_eq!(task("t2")["status"], "planning");
+    assert_eq!(task("t2")["result"], "Add risk table");
+
+    let events = fs::read_to_string(run_dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| event["kind"] == "task_approved"
+            && event["message"] == "Approved task t1"));
+    assert!(events.iter().any(|event| event["kind"] == "task_rejected"
+        && event["message"] == "Rejected task t1: Needs citations"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "task_change_requested"
+                && event["message"] == "Requested changes on t2: Add risk table")
+    );
+    let mailbox_text = fs::read_to_string(run_dir.join("mailbox.jsonl")).unwrap();
+    assert!(mailbox_text.contains("Please revise t2: Add risk table"));
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/team-natural-approval-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_starts_runtime_status_log_and_stop_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-runtime-bot",
+                        "name": "Team Runtime Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/team-runtime-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Compare planner and critic", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let start_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        start_events.iter().all(|event| event["type"] != "thinking"),
+        "team slash command must not enter the normal chat loop"
+    );
+    let lead_event = start_events
+        .iter()
+        .find(|event| event["type"] == "content" && event["metadata"]["team_event"] == true)
+        .expect("team lead content event");
+    let lead_content = lead_event["content"].as_str().unwrap();
+    assert!(
+        lead_content.starts_with("Team lead: started `"),
+        "{lead_content}"
+    );
+    assert!(
+        lead_content.contains("with 2 workers for `Compare planner and critic`."),
+        "{lead_content}"
+    );
+
+    let start_event = start_events
+        .iter()
+        .find(|event| event["type"] == "content" && event["metadata"]["team_text"] == true)
+        .expect("team start ack content event");
+    let start_content = start_event["content"].as_str().unwrap();
+    assert!(
+        start_content.starts_with("Nano team started: `"),
+        "{start_content}"
+    );
+    assert!(start_content.contains(" workers)."), "{start_content}");
+    assert!(
+        start_content.contains("Use `/team status`, `/team log`, `/team stop`."),
+        "{start_content}"
+    );
+    assert_eq!(start_event["metadata"]["team_text"], true);
+    let team_id = start_content
+        .strip_prefix("Nano team started: `")
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(team_id.starts_with("nano-"));
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-runtime-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-runtime-bot");
+    let run_dirs = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(run_dirs.len(), 1);
+    let run_dir = &run_dirs[0];
+    assert!(run_dir.join("config.json").is_file());
+    assert!(run_dir.join("tasks.json").is_file());
+    assert!(run_dir.join("NOTES.md").is_file());
+    assert!(run_dir.join("events.jsonl").is_file());
+    assert!(run_dir.join("workers").is_dir());
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["team_id"], team_id);
+    assert_eq!(config["mission"], "Compare planner and critic");
+    assert_eq!(config["status"], "active");
+    assert_eq!(config["session_key"], "bot:team-runtime-bot");
+    assert_eq!(config["lead"], "lead");
+    assert!(
+        config["run_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        config["created_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(config["members"].as_array().unwrap().len() >= 2);
+    for member in config["members"].as_array().unwrap() {
+        assert!(
+            member["name"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            member["role"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(member.get("model").is_some());
+        assert!(
+            member["status"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            run_dir
+                .join("workers")
+                .join(member["name"].as_str().unwrap())
+                .is_dir()
+        );
+    }
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    let t1 = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t1")
+        .expect("t1 task");
+    for key in [
+        "id",
+        "title",
+        "description",
+        "owner",
+        "status",
+        "depends_on",
+        "plan",
+        "result",
+        "requires_approval",
+    ] {
+        assert!(t1.get(key).is_some(), "missing task key {key}");
+    }
+    assert_eq!(t1["status"], "pending");
+    assert!(t1["depends_on"].as_array().is_some());
+    let events = fs::read_to_string(run_dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let start_event_json = events
+        .iter()
+        .find(|event| event["kind"] == "team_started")
+        .expect("team_started event");
+    assert!(
+        start_event_json["ts"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        start_event_json["message"],
+        "Started nano team for goal: Compare planner and critic"
+    );
+    assert_eq!(
+        start_event_json["data"]["mission"],
+        "Compare planner and critic"
+    );
+
+    let session_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-runtime-bot")
+        .join("workspace")
+        .join("sessions")
+        .join("bot_team-runtime-bot.jsonl");
+    let session_text = fs::read_to_string(&session_path).unwrap();
+    let session_lines = session_text.lines().collect::<Vec<_>>();
+    assert_eq!(session_lines.len(), 1);
+    let metadata: Value = serde_json::from_str(session_lines[0]).unwrap();
+    assert_eq!(metadata["metadata"]["nano_team_active"], true);
+    assert!(!session_text.contains("/team Compare planner and critic"));
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team status", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let status_events = collect_ws_json_until(&mut socket, "done").await;
+    let status_event = status_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("team status content event");
+    let status_content = status_event["content"].as_str().unwrap();
+    assert!(status_content.contains(&format!("Team `{team_id}` · active")));
+    assert!(status_content.contains("Mission: Compare planner and critic"));
+    assert!(status_content.contains("Members:"));
+    assert!(status_content.contains("Tasks:"));
+    assert_eq!(status_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team log 5", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let log_events = collect_ws_json_until(&mut socket, "done").await;
+    let log_event = log_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("team log content event");
+    let log_content = log_event["content"].as_str().unwrap();
+    assert!(log_content.contains("team_started"));
+    assert!(log_content.contains("Compare planner and critic"));
+    assert_eq!(log_event["metadata"]["team_text"], true);
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team stop", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let stop_events = collect_ws_json_until(&mut socket, "done").await;
+    let stop_event = stop_events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("team stop content event");
+    assert_eq!(
+        stop_event["content"].as_str().unwrap(),
+        format!("Team `{team_id}` stopped.")
+    );
+    assert_eq!(stop_event["metadata"]["team_text"], true);
+    let stopped_config: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(stopped_config["status"], "paused");
+    let stopped_events = fs::read_to_string(run_dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let stop_event_json = stopped_events
+        .iter()
+        .find(|event| event["kind"] == "team_stopped")
+        .expect("team_stopped event");
+    assert!(
+        stop_event_json["ts"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        stop_event_json["message"],
+        "Stopped team with status paused"
+    );
+
+    let final_session_text = fs::read_to_string(session_path).unwrap();
+    let final_metadata: Value =
+        serde_json::from_str(final_session_text.lines().next().unwrap()).unwrap();
+    assert!(final_metadata["metadata"]["nano_team_active"].is_null());
+    assert_eq!(final_session_text.lines().count(), 1);
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/team-runtime-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_uses_provider_generated_plan_when_llm_selected() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "team-plan-provider",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": json!({
+                    "members": [
+                        {"name": "planner", "role": "Planner"},
+                        {"name": "executor", "role": "Executor"},
+                        {"name": "critic", "role": "Critic"}
+                    ],
+                    "tasks": [
+                        {
+                            "id": "t1",
+                            "title": "Collect source evidence",
+                            "description": "Find the primary course facts before drafting.",
+                            "owner": "planner",
+                            "depends_on": [],
+                            "requires_approval": false
+                        },
+                        {
+                            "id": "t2",
+                            "title": "Draft grounded answer",
+                            "description": "Use the collected evidence to write the first answer.",
+                            "owner": "executor",
+                            "depends_on": ["t1"],
+                            "requires_approval": true
+                        },
+                        {
+                            "id": "t3",
+                            "title": "Critic review",
+                            "description": "Check the draft for unsupported claims.",
+                            "owner": "critic",
+                            "depends_on": ["t2"],
+                            "requires_approval": true
+                        }
+                    ]
+                }).to_string()
+            },
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-plan-bot",
+                        "name": "Team Provider Plan Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-plan-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Build a sourced final answer", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let start_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        start_events.iter().all(|event| event["type"] != "thinking"),
+        "team slash command must not enter the normal chat loop"
+    );
+    let start_event = start_events
+        .iter()
+        .find(|event| event["type"] == "content" && event["metadata"]["team_text"] == true)
+        .expect("team start ack content event");
+    assert!(
+        start_event["content"]
+            .as_str()
+            .unwrap()
+            .contains("Nano team started:")
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
+    let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"].as_str().is_some_and(|content| {
+                content.contains("Return only JSON") && content.contains("tasks")
+            })
+    }));
+    assert!(messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Build a sourced final answer"))
+    }));
+    drop(recorded);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-plan-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-plan-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    let tasks_array = tasks.as_array().unwrap();
+    assert_eq!(tasks_array.len(), 3);
+    assert_eq!(tasks_array[0]["title"], "Collect source evidence");
+    assert_eq!(tasks_array[1]["title"], "Draft grounded answer");
+    assert_eq!(tasks_array[1]["status"], "pending");
+    assert_eq!(tasks_array[1]["requires_approval"], true);
+    assert_eq!(tasks_array[1]["depends_on"], json!(["t1"]));
+    assert_eq!(tasks_array[2]["owner"], "critic");
+    assert_ne!(tasks_array[0]["title"], "Plan the work");
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["members"].as_array().unwrap().len(), 3);
+    assert_eq!(config["members"][0]["model"], "provider-chat-model");
+    assert_eq!(config["planning"]["source"], "provider");
+    assert_eq!(config["planning"]["profile_id"], "mock-llm");
+    assert_eq!(config["planning"]["model_id"], "mock-model");
+
+    let events = fs::read_to_string(run_dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let start_event_json = events
+        .iter()
+        .find(|event| event["kind"] == "team_started")
+        .expect("team_started event");
+    assert_eq!(start_event_json["data"]["plan_source"], "provider");
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/team-provider-plan-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_repairs_malformed_provider_plan_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "team-plan-malformed",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "not valid json"
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "team-plan-repaired",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"mission\":\"Provider repaired mission\",\"members\":[{\"name\":\"researcher\",\"role\":\"Research\"},{\"name\":\"builder\",\"role\":\"Build\"}],\"tasks\":[{\"id\":\"t1\",\"title\":\"Repair evidence\",\"description\":\"Recover from the malformed first plan.\",\"owner\":\"researcher\",\"depends_on\":[],\"requires_approval\":false},{\"id\":\"t2\",\"title\":\"Ship repaired plan\",\"description\":\"Use the repaired plan output.\",\"owner\":\"builder\",\"depends_on\":[\"t1\"],\"requires_approval\":true}],\"notes\":\"# Provider Notes\\n- Repair succeeded.\\n\"}\n```"
+                },
+                "finish_reason": "stop"
+            }]
+        })
+    ])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-repair-bot",
+                        "name": "Team Provider Repair Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-repair-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Build a repaired plan", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let start_events = collect_ws_json_until(&mut socket, "done").await;
+    assert!(
+        start_events.iter().all(|event| event["type"] != "thinking"),
+        "team slash command must not enter the normal chat loop"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let first_user = recorded[0]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(first_user.contains("Goal:\nBuild a repaired plan"));
+    assert!(!first_user.contains("Previous output error"));
+    let repair_user = recorded[1]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(repair_user.contains("Previous output error: Malformed JSON."));
+    assert!(repair_user.contains("Fix and output valid JSON only."));
+    drop(recorded);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-repair-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-repair-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["mission"], "Provider repaired mission");
+    assert_eq!(config["members"].as_array().unwrap().len(), 2);
+    assert_eq!(config["planning"]["source"], "provider");
+
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    assert_eq!(tasks[0]["title"], "Repair evidence");
+    assert_eq!(tasks[1]["depends_on"], json!(["t1"]));
+    assert_eq!(tasks[1]["requires_approval"], true);
+    assert_eq!(
+        fs::read_to_string(run_dir.join("NOTES.md")).unwrap(),
+        "# Provider Notes\n- Repair succeeded.\n"
+    );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_falls_back_after_two_invalid_provider_plans_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "team-plan-invalid-1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "not valid json"
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "team-plan-invalid-2",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"members\":[],\"tasks\":[]}"
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-fallback-bot",
+                        "name": "Team Provider Fallback Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-fallback-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Build with fallback", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let start_events = collect_ws_json_until(&mut socket, "done").await;
+    let lead_content = start_events
+        .iter()
+        .find(|event| event["type"] == "content" && event["metadata"]["team_event"] == true)
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(lead_content.contains("with 2 workers for `Build with fallback`."));
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let repair_user = recorded[1]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(repair_user.contains("Previous output error: Malformed JSON."));
+    drop(recorded);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-fallback-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-fallback-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["mission"], "Build with fallback");
+    assert_eq!(config["planning"]["source"], "deterministic");
+    assert_eq!(config["members"].as_array().unwrap().len(), 2);
+    assert_eq!(config["members"][0]["name"], "researcher");
+    assert_eq!(config["members"][0]["role"], "research and analysis");
+    assert!(config["members"][0]["model"].is_null());
+    assert_eq!(config["members"][1]["name"], "builder");
+    assert_eq!(config["members"][1]["role"], "execution and synthesis");
+    assert!(run_dir.join("workers").join("researcher").is_dir());
+    assert!(run_dir.join("workers").join("builder").is_dir());
+
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    let tasks_array = tasks.as_array().unwrap();
+    assert_eq!(tasks_array.len(), 2);
+    assert_eq!(tasks_array[0]["title"], "Analyze the request");
+    assert_eq!(
+        tasks_array[0]["description"],
+        "Break down the objective: Build with fallback"
+    );
+    assert_eq!(tasks_array[0]["owner"], "researcher");
+    assert_eq!(tasks_array[0]["depends_on"], json!([]));
+    assert_eq!(tasks_array[1]["title"], "Execute and report");
+    assert_eq!(tasks_array[1]["owner"], "builder");
+    assert_eq!(tasks_array[1]["depends_on"], json!(["t1"]));
+    assert_eq!(
+        fs::read_to_string(run_dir.join("NOTES.md")).unwrap(),
+        "# Team Notes\n- Keep changes minimal and reliable.\n"
+    );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_normalizes_invalid_owner_and_dependencies_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "team-plan-normalized",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": json!({
+                    "mission": "Normalize team plan",
+                    "members": [
+                        {"name": "researcher", "role": "Research"},
+                        {"name": "builder", "role": "Build"}
+                    ],
+                    "tasks": [
+                        {
+                            "id": "t1",
+                            "title": "Check invalid owner",
+                            "description": "The owner is not a team member.",
+                            "owner": "ghost",
+                            "depends_on": ["missing"],
+                            "requires_approval": false
+                        },
+                        {
+                            "id": "t2",
+                            "title": "Use filtered dependency",
+                            "description": "Only existing task dependencies survive.",
+                            "owner": "builder",
+                            "depends_on": ["missing", "t1"],
+                            "requires_approval": false
+                        }
+                    ],
+                    "notes": "   "
+                }).to_string()
+            },
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-normalize-bot",
+                        "name": "Team Provider Normalize Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-normalize-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Normalize invalid plan fields", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+    assert_eq!(requests.lock().await.len(), 1);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-normalize-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-normalize-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    assert!(tasks[0]["owner"].is_null());
+    assert_eq!(tasks[0]["depends_on"], json!([]));
+    assert_eq!(tasks[1]["owner"], "builder");
+    assert_eq!(tasks[1]["depends_on"], json!(["t1"]));
+    assert_eq!(
+        fs::read_to_string(run_dir.join("NOTES.md")).unwrap(),
+        "# Team Notes\n"
+    );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_repair_prompt_includes_validation_error_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "team-plan-duplicate-task",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json!({
+                        "members": [
+                            {"name": "researcher", "role": "Research"},
+                            {"name": "builder", "role": "Build"}
+                        ],
+                        "tasks": [
+                            {"id": "t1", "title": "First duplicate", "description": "first", "owner": "researcher"},
+                            {"id": "t1", "title": "Second duplicate", "description": "second", "owner": "builder"}
+                        ]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "team-plan-after-validation-repair",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json!({
+                        "members": [
+                            {"name": "researcher", "role": "Research"},
+                            {"name": "builder", "role": "Build"}
+                        ],
+                        "tasks": [
+                            {"id": "t1", "title": "Unique task", "description": "fixed", "owner": "researcher"}
+                        ]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-validation-repair-bot",
+                        "name": "Team Provider Validation Repair Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-validation-repair-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Repair duplicate task ids", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let repair_user = recorded[1]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(repair_user.contains("Previous output error: duplicate task ids"));
+    drop(recorded);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-validation-repair-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-validation-repair-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    assert_eq!(tasks.as_array().unwrap().len(), 1);
+    assert_eq!(tasks[0]["title"], "Unique task");
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_team_goal_retries_cyclic_dependency_graph_like_python() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "team-plan-cycle",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json!({
+                        "members": [
+                            {"name": "researcher", "role": "Research"},
+                            {"name": "builder", "role": "Build"}
+                        ],
+                        "tasks": [
+                            {"id": "t1", "title": "Cycle one", "description": "one", "owner": "researcher", "depends_on": ["t2"]},
+                            {"id": "t2", "title": "Cycle two", "description": "two", "owner": "builder", "depends_on": ["t1"]}
+                        ]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "team-plan-cycle-fixed",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json!({
+                        "members": [
+                            {"name": "researcher", "role": "Research"},
+                            {"name": "builder", "role": "Build"}
+                        ],
+                        "tasks": [
+                            {"id": "t1", "title": "Acyclic one", "description": "one", "owner": "researcher", "depends_on": []},
+                            {"id": "t2", "title": "Acyclic two", "description": "two", "owner": "builder", "depends_on": ["t1"]}
+                        ]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "team-provider-cycle-repair-bot",
+                        "name": "Team Provider Cycle Repair Bot",
+                        "llm_selection": {
+                            "profile_id": "mock-llm",
+                            "model_id": "mock-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/tutorbot/team-provider-cycle-repair-bot/ws"
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/team Repair cyclic task graph", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    let repair_user = recorded[1]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(repair_user.contains("Previous output error: task dependency graph has a cycle"));
+    drop(recorded);
+
+    let teams_dir = test_data_root(&root)
+        .join("tutorbot")
+        .join("team-provider-cycle-repair-bot")
+        .join("workspace")
+        .join("teams")
+        .join("bot_team-provider-cycle-repair-bot");
+    let run_dir = fs::read_dir(&teams_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("tasks.json")).unwrap()).unwrap();
+    assert_eq!(tasks[0]["title"], "Acyclic one");
+    assert_eq!(tasks[1]["depends_on"], json!(["t1"]));
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_history_jsonl_starts_with_python_metadata_header() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "metadata-bot",
+                        "name": "Metadata Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/metadata-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "Store one metadata-header turn.", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+
+    let session_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("metadata-bot")
+        .join("workspace")
+        .join("sessions")
+        .join("bot_metadata-bot.jsonl");
+    let lines = fs::read_to_string(session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0]["_type"], "metadata");
+    assert_eq!(lines[0]["key"], "bot:metadata-bot");
+    assert!(lines[0]["created_at"].is_string());
+    assert!(lines[0]["updated_at"].is_string());
+    assert!(lines[0]["metadata"].is_object());
+    assert_eq!(lines[0]["last_consolidated"], 0);
+    assert_eq!(lines[1]["role"], "user");
+    assert_eq!(lines[2]["role"], "assistant");
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/metadata-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    let history = json_response(history_response).await;
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["_type"].is_null())
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn tutorbot_ws_new_command_clears_canonical_history_and_returns_python_message() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let create_bot_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/tutorbot")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "bot_id": "new-bot",
+                        "name": "New Session Bot",
+                        "llm_selection": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_bot_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/tutorbot/new-bot/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "This turn should disappear after slash new.", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_ws_json_until(&mut socket, "done").await;
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({"content": "/new", "chat_id": "web"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .and_then(|event| event["content"].as_str())
+        .expect("new content event");
+    assert_eq!(content, "New session started.");
+
+    let history_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/tutorbot/new-bot/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(history_response).await, json!([]));
+
+    let session_path = test_data_root(&root)
+        .join("tutorbot")
+        .join("new-bot")
+        .join("workspace")
+        .join("sessions")
+        .join("bot_new-bot.jsonl");
+    let session_text = fs::read_to_string(session_path).unwrap();
+    let lines = session_text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    let metadata: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(metadata["_type"], "metadata");
+    assert_eq!(metadata["key"], "bot:new-bot");
+    assert!(!session_text.contains("/new"));
+    assert!(!session_text.contains("This turn should disappear"));
+
+    let summary_path = test_memory_root(&root).join("SUMMARY.md");
+    let summary = fs::read_to_string(summary_path).expect("/new should archive prior session");
+    assert!(summary.contains("This turn should disappear after slash new."));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn notebook_crud_and_streamed_save_match_frontend_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -5092,8 +17848,11 @@ async fn chat_sessions_are_persisted_and_manageable() {
         )
         .await
         .unwrap();
-    assert_eq!(quiz_response.status(), http::StatusCode::OK);
-    assert_eq!(json_response(quiz_response).await["recorded"], true);
+    assert_eq!(quiz_response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(quiz_response).await["detail"],
+        "Quiz results are required"
+    );
 
     let delete_response = app
         .oneshot(
@@ -5109,6 +17868,221 @@ async fn chat_sessions_are_persisted_and_manageable() {
     assert_eq!(json_response(delete_response).await["deleted"], true);
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn quiz_results_records_deep_question_message_and_upserts_question_notebook_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "quiz-results-session",
+                        "content": "Create a quiz result source session."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+
+    let missing_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/missing-quiz-session/quiz-results")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "answers": [{
+                            "question_id": "q1",
+                            "question": "Missing session question?",
+                            "user_answer": "A",
+                            "correct_answer": "B",
+                            "is_correct": false
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_response).await["detail"],
+        "Session not found"
+    );
+
+    let expected_content = "[Quiz Performance]\n\
+1. [q1] Q: Which agent checks citations? -> Answered: A (Incorrect, correct: B)\n\
+2. [q2] Q: Which agent plans the task? -> Answered: Planner (Correct)\n\
+Score: 1/2 (50%)";
+    let quiz_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/quiz-results-session/quiz-results")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "answers": [
+                            {
+                                "question_id": "q1",
+                                "question": "Which agent checks citations?",
+                                "question_type": "multiple_choice",
+                                "options": { "A": "Planner", "B": "Critic" },
+                                "correct_answer": "B",
+                                "explanation": "The critic checks citation quality.",
+                                "difficulty": "medium",
+                                "user_answer": "A",
+                                "is_correct": false
+                            },
+                            {
+                                "question_id": "q2",
+                                "question": "Which agent plans the task?",
+                                "question_type": "short_answer",
+                                "correct_answer": "Planner",
+                                "user_answer": "Planner",
+                                "is_correct": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(quiz_response.status(), http::StatusCode::OK);
+    let quiz_payload = json_response(quiz_response).await;
+    assert_eq!(quiz_payload["recorded"], true);
+    assert_eq!(quiz_payload["session_id"], "quiz-results-session");
+    assert_eq!(quiz_payload["answer_count"], 2);
+    assert_eq!(quiz_payload["notebook_count"], 2);
+    assert_eq!(quiz_payload["content"], expected_content);
+
+    let session_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions/quiz-results-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), http::StatusCode::OK);
+    let session = json_response(session_response).await;
+    let messages = session["messages"].as_array().unwrap();
+    let quiz_message = messages.last().unwrap();
+    assert_eq!(quiz_message["role"], "user");
+    assert_eq!(quiz_message["capability"], "deep_question");
+    assert_eq!(quiz_message["content"], expected_content);
+    assert_eq!(quiz_message["events"], json!([]));
+    assert_eq!(quiz_message["attachments"], json!([]));
+    assert_eq!(quiz_message["metadata"], json!({}));
+
+    let lookup_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/entries/lookup/by-question?session_id=quiz-results-session&question_id=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lookup_response.status(), http::StatusCode::OK);
+    let first_entry = json_response(lookup_response).await;
+    assert_eq!(first_entry["question"], "Which agent checks citations?");
+    assert_eq!(first_entry["options"]["B"], "Critic");
+    assert_eq!(first_entry["correct_answer"], "B");
+    assert_eq!(first_entry["user_answer"], "A");
+    assert_eq!(first_entry["is_correct"], false);
+    let first_updated_at = first_entry["updated_at"].as_f64().unwrap();
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/quiz-results-session/quiz-results")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "answers": [{
+                            "question_id": "q1",
+                            "question": "A changed question should not overwrite the notebook stem",
+                            "question_type": "multiple_choice",
+                            "options": { "A": "Planner", "B": "Critic", "C": "Executor" },
+                            "correct_answer": "C",
+                            "explanation": "Changed explanation should not overwrite.",
+                            "difficulty": "hard",
+                            "user_answer": "B",
+                            "is_correct": true
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+    let update_payload = json_response(update_response).await;
+    assert_eq!(update_payload["answer_count"], 1);
+    assert_eq!(update_payload["notebook_count"], 1);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/entries?limit=200")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    assert_eq!(json_response(list_response).await["total"], 2);
+
+    let updated_lookup_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/question-notebook/entries/lookup/by-question?session_id=quiz-results-session&question_id=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_lookup_response.status(), http::StatusCode::OK);
+    let updated_entry = json_response(updated_lookup_response).await;
+    assert_eq!(updated_entry["question"], "Which agent checks citations?");
+    assert_eq!(
+        updated_entry["options"],
+        json!({ "A": "Planner", "B": "Critic" })
+    );
+    assert_eq!(updated_entry["correct_answer"], "B");
+    assert_eq!(updated_entry["user_answer"], "B");
+    assert_eq!(updated_entry["is_correct"], true);
+    assert!(
+        updated_entry["updated_at"].as_f64().unwrap() >= first_updated_at,
+        "quiz retry should update the notebook entry timestamp"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]
@@ -5195,6 +18169,766 @@ async fn chat_ws_start_turn_rejects_unknown_llm_selection_without_creating_turn(
     assert_eq!(detail["active_turns"].as_array().unwrap().len(), 0);
     assert_eq!(detail["preferences"], json!({}));
 
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_chat_ws_accepts_python_payload_and_emits_python_events() {
+    let root = unique_test_knowledge_root();
+    create_markdown_knowledge_base(
+        app_with_knowledge_root(&root),
+        "legacy-chat-course",
+        "legacy.md",
+        "The legacy chat course teaches Socartes adapter compatibility.",
+    )
+    .await;
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/chat"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "message": "What does the legacy chat course teach?",
+                "session_id": null,
+                "history": null,
+                "kb_name": "legacy-chat-course",
+                "enable_rag": true,
+                "enable_web_search": false,
+                "language": "en"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..24 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("legacy chat event")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        let terminal = event["type"] == "result" || event["type"] == "error";
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+
+    assert_eq!(events.first().unwrap()["type"], "session");
+    let session_id = events[0]["session_id"].as_str().unwrap();
+    assert!(!session_id.is_empty());
+    assert!(events.iter().any(|event| {
+        event["type"] == "status"
+            && event["stage"] == "rag"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("legacy-chat-course"))
+    }));
+    assert!(events.iter().any(|event| event["type"] == "stream"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "sources"
+            && event["rag"]
+                .as_array()
+                .is_some_and(|sources| !sources.is_empty())
+    }));
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("result event");
+    assert!(
+        result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("legacy chat course"))
+    );
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "message": "",
+                "session_id": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let message = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("empty message error")
+        .expect("socket message")
+        .expect("valid socket message");
+    let TungsteniteMessage::Text(text) = message else {
+        panic!("expected legacy chat error text");
+    };
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        error,
+        json!({"type": "error", "message": "Message is required"})
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_chat_ws_enable_web_search_emits_python_web_status_and_sources() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let (search_base_url, search_requests, search_server) = spawn_duckduckgo_search_mock().await;
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let catalog_response = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/settings/catalog"))
+        .header("content-type", "application/json")
+        .body(
+            json!({ "catalog": search_test_catalog("duckduckgo", "", &search_base_url) })
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), reqwest::StatusCode::OK);
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/chat"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "message": "Find Socartes web compatibility evidence",
+                "session_id": null,
+                "history": null,
+                "kb_name": "",
+                "enable_rag": false,
+                "enable_web_search": true,
+                "language": "en"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "result").await;
+
+    assert_eq!(events.first().unwrap()["type"], "session");
+    assert!(events.iter().any(|event| {
+        event["type"] == "status"
+            && event["stage"] == "web"
+            && event["message"] == "Searching the web..."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "status"
+            && event["stage"] == "generating"
+            && event["message"] == "Generating response..."
+    }));
+    assert!(events.iter().any(|event| event["type"] == "stream"));
+
+    let sources = events
+        .iter()
+        .find(|event| event["type"] == "sources")
+        .expect("web sources event");
+    assert!(
+        sources["rag"]
+            .as_array()
+            .is_some_and(|sources| sources.is_empty())
+    );
+    let web_sources = sources["web"].as_array().expect("web sources array");
+    assert!(!web_sources.is_empty());
+    assert!(web_sources.iter().any(|source| {
+        source["type"] == "web"
+            && source["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("Mock DuckDuckGo Socartes Result"))
+            && source["source"] == "DuckDuckGo"
+    }));
+
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("result event");
+    assert!(
+        result["content"]
+            .as_str()
+            .is_some_and(|content| !content.is_empty())
+    );
+
+    let requests = search_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["query"]["q"],
+        "Find Socartes web compatibility evidence"
+    );
+
+    search_server.abort();
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_solve_ws_accepts_python_payload_emits_result_and_closes() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Explain planner executor critic flow",
+                "tools": ["rag"],
+                "kb_name": "socartes-rust-rag",
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    let mut saw_close = false;
+    for _ in 0..24 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("legacy solve event")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                events.push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            TungsteniteMessage::Close(_) => {
+                saw_close = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(events[0]["type"], "session");
+    let session_id = events[0]["session_id"].as_str().unwrap();
+    assert!(!session_id.is_empty());
+    assert_eq!(events[1]["type"], "task_id");
+    assert!(events[1]["task_id"].as_str().unwrap().starts_with("solve_"));
+    assert_eq!(events[2], json!({"type": "status", "content": "started"}));
+    assert!(events.iter().any(|event| event["type"] == "agent_status"));
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("solve result");
+    assert_eq!(result["session_id"], session_id);
+    assert!(
+        result["final_answer"]
+            .as_str()
+            .is_some_and(|answer| answer.contains("planner"))
+    );
+    assert!(result["metadata"].is_object());
+    assert!(saw_close);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_solve_ws_defaults_to_python_deep_solve_tools_and_ai_textbook() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let created = create_markdown_knowledge_base_at(
+        app.clone(),
+        "/api/v1/knowledge/create",
+        "ai-textbook",
+        "algebra.md",
+        "The ai-textbook default solve course says Socartes solves quadratic equations by factoring.",
+    )
+    .await;
+    let create_task_id = created["task_id"].as_str().expect("create task id");
+    let progress =
+        wait_for_knowledge_progress_terminal(app.clone(), "ai-textbook", create_task_id).await;
+    assert_eq!(progress["stage"], "completed");
+
+    let (search_base_url, search_requests, search_server) = spawn_duckduckgo_search_mock().await;
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let catalog_response = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/settings/catalog"))
+        .header("content-type", "application/json")
+        .body(
+            json!({ "catalog": search_test_catalog("duckduckgo", "", &search_base_url) })
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), reqwest::StatusCode::OK);
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Solve x^2=4 using the default solve context.",
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "result").await;
+    let session_id = events
+        .iter()
+        .find(|event| event["type"] == "session")
+        .and_then(|event| event["session_id"].as_str())
+        .expect("session id");
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("persisted solve user message");
+    let snapshot = &user["metadata"]["request_snapshot"];
+    assert_eq!(snapshot["capability"], "deep_solve");
+    assert_eq!(
+        snapshot["enabledTools"],
+        json!(["rag", "web_search", "code_execution", "reason"])
+    );
+    assert_eq!(snapshot["knowledgeBases"], json!(["ai-textbook"]));
+    assert_eq!(
+        detail["preferences"]["knowledge_bases"],
+        json!(["ai-textbook"])
+    );
+    assert_eq!(search_requests.lock().await.len(), 1);
+
+    search_server.abort();
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_solve_ws_uses_python_task_id_and_provider_token_stats() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-solve-test",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Provider-backed legacy solve answer."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 17,
+            "completion_tokens": 5,
+            "total_tokens": 22
+        }
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Use the selected provider for legacy solve.",
+                "tools": [],
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("legacy solve event")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                events.push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let task_id = events
+        .iter()
+        .find(|event| event["type"] == "task_id")
+        .and_then(|event| event["task_id"].as_str())
+        .expect("task_id event");
+    assert!(
+        task_id.starts_with("solve_"),
+        "legacy solve task id should match Python TaskIDManager format, got {task_id}"
+    );
+
+    let token_stats = events
+        .iter()
+        .filter(|event| event["type"] == "token_stats")
+        .map(|event| &event["stats"])
+        .find(|stats| stats["tokens"].as_i64().unwrap_or_default() > 0)
+        .expect("provider usage token_stats event");
+    assert_eq!(token_stats["tokens"], 22);
+    assert_eq!(token_stats["input_tokens"], 17);
+    assert_eq!(token_stats["output_tokens"], 5);
+
+    let initial_agent_status = events
+        .iter()
+        .find(|event| {
+            event["type"] == "agent_status"
+                && event["agent"] == "all"
+                && event["status"] == "initial"
+        })
+        .expect("Python initial agent_status event");
+    assert_eq!(
+        initial_agent_status["all_agents"]["PlannerAgent"],
+        "pending"
+    );
+    assert_eq!(initial_agent_status["all_agents"]["SolverAgent"], "pending");
+    assert_eq!(initial_agent_status["all_agents"]["WriterAgent"], "pending");
+
+    assert!(events.iter().any(|event| {
+        event["type"] == "agent_status"
+            && event["agent"] == "PlannerAgent"
+            && event["status"] == "running"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "agent_status"
+            && event["agent"] == "SolverAgent"
+            && event["status"] == "running"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "agent_status"
+            && event["agent"] == "WriterAgent"
+            && event["status"] == "running"
+    }));
+
+    assert!(events.iter().any(|event| {
+        event["type"] == "progress"
+            && event["stage"] == "plan"
+            && event["progress"]["status"] == "planning"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "progress"
+            && event["stage"] == "solve"
+            && event["progress"]["status"] == "starting"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "progress"
+            && event["stage"] == "write"
+            && event["progress"]["status"] == "writing"
+    }));
+
+    let final_agent_status = events
+        .iter()
+        .find(|event| {
+            event["type"] == "agent_status"
+                && event["agent"] == "all"
+                && event["status"] == "complete"
+        })
+        .expect("Python final agent_status event");
+    assert_eq!(final_agent_status["all_agents"]["PlannerAgent"], "done");
+    assert_eq!(final_agent_status["all_agents"]["SolverAgent"], "done");
+    assert_eq!(final_agent_status["all_agents"]["WriterAgent"], "done");
+
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("solve result");
+    assert_eq!(
+        result["final_answer"],
+        "Provider-backed legacy solve answer."
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+
+    llm_server.abort();
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_solve_ws_writes_python_style_output_dir_and_final_answer_file() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, _requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-solve-output-test",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Output-backed legacy solve answer."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 4,
+            "total_tokens": 15
+        }
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Write a solve output artifact.",
+                "tools": [],
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "result").await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("solve result");
+    let output_dir = result["output_dir"].as_str().expect("output_dir string");
+    let output_dir_name = result["output_dir_name"]
+        .as_str()
+        .expect("output_dir_name string");
+    assert!(output_dir_name.starts_with("solve_"));
+    assert!(output_dir.ends_with(output_dir_name));
+    let output_path = std::path::PathBuf::from(output_dir);
+    assert!(output_path.is_absolute());
+    assert!(
+        output_path.starts_with(
+            test_user_output_root(&root)
+                .join("workspace")
+                .join("chat")
+                .join("deep_solve")
+        )
+    );
+
+    let answer_path = output_path.join("final_answer.md");
+    assert_eq!(
+        std::fs::read_to_string(&answer_path).expect("final answer markdown"),
+        "Output-backed legacy solve answer."
+    );
+    assert_eq!(result["metadata"]["output_dir"], output_dir);
+    assert_eq!(result["metadata"]["total_steps"], 1);
+    assert_eq!(result["metadata"]["completed_steps"], 1);
+    assert_eq!(result["metadata"]["plan_revisions"], 0);
+
+    llm_server.abort();
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_solve_ws_rewrites_artifact_links_to_public_output_urls_like_python() {
+    let root = unique_test_knowledge_root();
+    let raw_answer = "Artifact-backed legacy solve answer: ![plot](artifacts/plot.png)";
+    let (llm_base_url, _requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "chatcmpl-solve-artifact-test",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": raw_answer
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 6,
+            "total_tokens": 18
+        }
+    }))
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Write an artifact link in the solve answer.",
+                "tools": [],
+                "session_id": null,
+                "detailed_answer": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "result").await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .expect("solve result");
+    let output_dir = result["output_dir"].as_str().expect("output_dir string");
+    let output_dir_name = result["output_dir_name"]
+        .as_str()
+        .expect("output_dir_name string");
+    let public_artifact_url =
+        format!("/api/outputs/workspace/chat/deep_solve/{output_dir_name}/artifacts/plot.png");
+    assert!(
+        result["final_answer"]
+            .as_str()
+            .is_some_and(|answer| answer.contains(&format!("]({public_artifact_url})")))
+    );
+    assert_eq!(
+        std::fs::read_to_string(std::path::PathBuf::from(output_dir).join("final_answer.md"))
+            .expect("raw final answer markdown"),
+        raw_answer
+    );
+
+    llm_server.abort();
     server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
@@ -5469,6 +19203,439 @@ async fn chat_ws_start_turn_preserves_selected_llm_usage_and_reasoning_metadata(
         "Hidden provider reasoning must stay metadata-only."
     );
     assert_eq!(content_event["metadata"]["finish_reason"], "stop");
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_uses_responses_api_for_gpt5_reasoning_selection() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "resp-gpt5-test",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-5.5",
+        "output": [
+            {
+                "type": "reasoning",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": "Hidden Responses reasoning stays metadata-only."
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Visible answer from the Responses API."
+                    }
+                ]
+            }
+        ],
+        "usage": {
+            "input_tokens": 13,
+            "output_tokens": 8,
+            "total_tokens": 21
+        }
+    }))
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("gpt-5.5");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["reasoning_effort"] = json!("medium");
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "Use the selected GPT-5 reasoning provider.",
+        "language": "en",
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+    let chat_result = json_response(chat_response).await;
+    let session_id = chat_result["session_id"].as_str().unwrap();
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/responses");
+    assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(recorded[0]["payload"]["model"], "gpt-5.5");
+    assert_eq!(recorded[0]["payload"]["stream"], false);
+    assert_eq!(recorded[0]["payload"]["store"], false);
+    assert_eq!(recorded[0]["payload"]["reasoning"]["effort"], "medium");
+    assert_eq!(
+        recorded[0]["payload"]["include"],
+        json!(["reasoning.encrypted_content"])
+    );
+    assert!(recorded[0]["payload"]["messages"].is_null());
+    assert!(
+        recorded[0]["payload"]["instructions"]
+            .as_str()
+            .is_some_and(|instructions| instructions.contains("You are Socartes"))
+    );
+    let input = recorded[0]["payload"]["input"].as_array().unwrap();
+    assert!(input.iter().any(|item| {
+        item["role"] == "user"
+            && item["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| {
+                    part["type"] == "input_text"
+                        && part["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Use the selected GPT-5"))
+                })
+            })
+    }));
+    drop(recorded);
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(
+        assistant["content"],
+        "Visible answer from the Responses API."
+    );
+    assert!(
+        !assistant["content"]
+            .as_str()
+            .unwrap()
+            .contains("Hidden Responses reasoning")
+    );
+    assert_eq!(assistant["metadata"]["usage"]["prompt_tokens"], 13);
+    assert_eq!(assistant["metadata"]["usage"]["completion_tokens"], 8);
+    assert_eq!(assistant["metadata"]["usage"]["total_tokens"], 21);
+    assert_eq!(
+        assistant["metadata"]["reasoning_content"],
+        "Hidden Responses reasoning stays metadata-only."
+    );
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_falls_back_from_responses_api_on_unsupported_error() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_status_request_recorder(vec![
+        (
+            http::StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "message": "This model is not supported on the Responses API. Please use /v1/chat/completions instead."
+                }
+            }),
+        ),
+        (
+            http::StatusCode::OK,
+            json!({
+                "id": "chatcmpl-responses-fallback",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Fallback chat completion answer after Responses API rejection."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 9,
+                    "total_tokens": 26
+                }
+            }),
+        ),
+    ])
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("gpt-5.5");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["reasoning_effort"] = json!("medium");
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Use the selected GPT-5 provider even if Responses API is unsupported.",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("Responses fallback turn should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
+    let content_event = events
+        .iter()
+        .find(|event| event["type"] == "content")
+        .expect("content event");
+    assert_eq!(
+        content_event["content"],
+        "Fallback chat completion answer after Responses API rejection."
+    );
+    assert_eq!(content_event["metadata"]["model"], "gpt-5.5");
+    assert_eq!(content_event["metadata"]["usage"]["total_tokens"], 26);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["uri"], "/v1/responses");
+    assert_eq!(recorded[1]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["payload"]["model"], "gpt-5.5");
+    assert_eq!(recorded[1]["payload"]["model"], "gpt-5.5");
+    assert!(recorded[0]["payload"]["input"].is_array());
+    assert!(recorded[1]["payload"]["messages"].is_array());
+    drop(recorded);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_test_llm_uses_responses_api_for_gpt5_reasoning_selection() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_embedding_request_recorder(json!({
+        "id": "resp-system-gpt5-test",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-5.5",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "OK from Responses system probe."
+            }]
+        }],
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 4,
+            "total_tokens": 9
+        }
+    }))
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("gpt-5.5");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["reasoning_effort"] = json!("low");
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/llm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["model"], "gpt-5.5");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/responses");
+    assert_eq!(recorded[0]["payload"]["model"], "gpt-5.5");
+    assert_eq!(recorded[0]["payload"]["reasoning"]["effort"], "low");
+    assert!(recorded[0]["payload"]["messages"].is_null());
+    assert!(
+        recorded[0]["payload"]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["role"] == "user")
+    );
+    drop(recorded);
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_test_llm_falls_back_from_responses_api_on_unsupported_error() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_status_request_recorder(vec![
+        (
+            http::StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "error": {
+                    "message": "Unknown parameter: 'reasoning'. This Responses API request is unsupported by this provider."
+                }
+            }),
+        ),
+        (
+            http::StatusCode::OK,
+            json!({
+                "id": "chatcmpl-system-responses-fallback",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "OK from chat completions fallback."
+                    },
+                    "finish_reason": "stop"
+                }]
+            }),
+        ),
+    ])
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["model"] = json!("gpt-5.5");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["reasoning_effort"] = json!("low");
+
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/llm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["model"], "gpt-5.5");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["uri"], "/v1/responses");
+    assert_eq!(recorded[1]["uri"], "/v1/chat/completions");
+    assert!(recorded[0]["payload"]["input"].is_array());
+    assert!(recorded[1]["payload"]["messages"].is_array());
+    drop(recorded);
 
     llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
@@ -6474,6 +20641,145 @@ async fn chat_ws_subscribe_turn_continues_with_live_events_for_running_turn() {
 }
 
 #[tokio::test]
+async fn chat_ws_streams_rag_thinking_before_slow_llm_finishes() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_delayed_request_recorder(
+        json!({
+            "id": "slow-chat-rag",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The delayed provider answer confirms the saffron matrix key."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        Duration::from_millis(800),
+    )
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    create_markdown_knowledge_base(
+        app.clone(),
+        "slow-rag-course",
+        "slow-rag.md",
+        "The obsidian syllabus key is saffron matrix, and only this course file names it.",
+    )
+    .await;
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "What is the obsidian syllabus key?",
+                "language": "en",
+                "tools": ["rag"],
+                "knowledge_bases": ["slow-rag-course"],
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        let message = timeout(Duration::from_millis(250), socket.next())
+            .await
+            .expect("chat should stream process events before the slow LLM responds")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        events.push(event);
+        if events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("thinking" | "progress" | "tool_call")
+            ) && event["stage"] == "rag"
+        }) {
+            break;
+        }
+    }
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("thinking" | "progress" | "tool_call")
+            ) && event["stage"] == "rag"
+        }),
+        "RAG turns should expose retrieval process events before the final provider answer"
+    );
+
+    events.extend(collect_ws_json_until(&mut socket, "done").await);
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "sources"
+                && event["metadata"]["sources"]
+                    .as_array()
+                    .is_some_and(|sources| {
+                        sources.iter().any(|source| {
+                            source["source_id"]
+                                .as_str()
+                                .is_some_and(|id| id.starts_with("slow-rag-course/slow-rag.md"))
+                                && source["content"]
+                                    .as_str()
+                                    .is_some_and(|content| content.contains("saffron matrix"))
+                        })
+                    })
+        }),
+        "events: {}",
+        serde_json::to_string_pretty(&events).unwrap()
+    );
+    let content = events
+        .iter()
+        .filter(|event| event["type"] == "content")
+        .filter_map(|event| event["content"].as_str())
+        .collect::<String>();
+    assert!(content.contains("saffron matrix key"));
+    assert_eq!(requests.lock().await.len(), 1);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_start_socket_disconnect_does_not_truncate_persisted_turn_events() {
     let root = unique_test_knowledge_root();
     let server_root = root.clone();
@@ -6914,6 +21220,368 @@ async fn chat_ws_cancel_stored_running_turn_appends_terminal_replay_events() {
 }
 
 #[tokio::test]
+async fn chat_ws_start_turn_persists_request_snapshot_for_replay_context() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let payload = json!({
+        "type": "start_turn",
+        "content": "Replay this Socartes context exactly.",
+        "capability": "deep_research",
+        "tools": ["rag", "web_search"],
+        "knowledge_bases": ["socartes-rust-rag"],
+        "language": "zh",
+        "attachments": [{
+            "id": "ctx-note",
+            "type": "file",
+            "filename": "context-note.txt",
+            "mime_type": "text/plain",
+            "text": "Snapshot attachment text."
+        }],
+        "notebook_references": [{
+            "notebook_id": "nb-1",
+            "record_id": "rec-1",
+            "title": "Notebook evidence"
+        }],
+        "history_references": [{
+            "session_id": "history-1",
+            "message_id": 7,
+            "title": "Earlier session"
+        }],
+        "question_notebook_references": [{
+            "entry_id": "q-entry-1",
+            "question_id": "quiz-1"
+        }],
+        "book_references": [{
+            "book_id": "book-1",
+            "page_id": "page-2",
+            "title": "Book page"
+        }],
+        "skills": ["course-coach", "critic"],
+        "memory_references": ["summary", "profile"],
+        "llm_selection": {
+            "profile_id": "socartes-rust",
+            "model_id": "deterministic-agent-loop"
+        },
+        "config": {
+            "mode": "focused",
+            "temperature": 0.2
+        }
+    });
+
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let turn = json_response(turn_response).await;
+    let session_id = turn["session_id"].as_str().unwrap();
+
+    let detail_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("persisted user message");
+    assert!(user["metadata"]["turn_id"].as_str().is_some());
+
+    let snapshot = &user["metadata"]["request_snapshot"];
+    assert_eq!(snapshot["content"], "Replay this Socartes context exactly.");
+    assert_eq!(snapshot["capability"], "deep_research");
+    assert_eq!(snapshot["enabledTools"], json!(["rag", "web_search"]));
+    assert_eq!(snapshot["knowledgeBases"], json!(["socartes-rust-rag"]));
+    assert_eq!(snapshot["language"], "zh");
+    assert_eq!(snapshot["config"]["mode"], "focused");
+    assert_eq!(snapshot["config"]["temperature"], json!(0.2));
+    assert_eq!(snapshot["attachments"][0]["id"], "ctx-note");
+    assert_eq!(snapshot["attachments"][0]["filename"], "context-note.txt");
+    assert_eq!(snapshot["notebookReferences"][0]["notebook_id"], "nb-1");
+    assert_eq!(snapshot["historyReferences"][0]["session_id"], "history-1");
+    assert_eq!(
+        snapshot["questionNotebookReferences"][0]["entry_id"],
+        "q-entry-1"
+    );
+    assert_eq!(snapshot["bookReferences"][0]["book_id"], "book-1");
+    assert_eq!(snapshot["skills"], json!(["course-coach", "critic"]));
+    assert_eq!(snapshot["memoryReferences"], json!(["summary", "profile"]));
+    assert_eq!(
+        snapshot["llmSelection"],
+        json!({
+            "profile_id": "socartes-rust",
+            "model_id": "deterministic-agent-loop"
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_regenerate_replays_llm_selection_and_book_references_from_user_request_snapshot() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "chatcmpl-snapshot-original",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Original snapshot answer."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-snapshot-regenerate",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Regenerated snapshot answer."
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_snapshot_replay_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_regen-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "regen-book",
+            "title": "Snapshot Replay Book",
+            "description": "Book context should survive regenerate through the request snapshot.",
+            "status": "ready",
+            "proposal": null,
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "regen-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Snapshot chapter",
+                "learning_objectives": ["Preserve selected page context"],
+                "content_type": "overview",
+                "source_anchors": [],
+                "prerequisites": [],
+                "page_ids": ["page-1"],
+                "summary": "Snapshot chapter summary",
+                "order": 1
+            }],
+            "version": 1,
+            "updated_at": 2.0,
+            "concept_graph": null,
+            "exploration_summary": "Snapshot source summary"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "regen-book",
+            "chapter_id": "chapter-1",
+            "title": "Snapshot evidence page",
+            "learning_objectives": ["Preserve snapshot-only book context"],
+            "content_type": "overview",
+            "status": "ready",
+            "order": 1,
+            "blocks": [{
+                "id": "block-1",
+                "type": "text",
+                "status": "ready",
+                "title": "Snapshot-only evidence",
+                "params": {},
+                "payload": {
+                    "body": "Snapshot-only page evidence must be present during regenerate."
+                },
+                "source_anchors": [],
+                "metadata": {},
+                "error": "",
+                "created_at": 2.0,
+                "updated_at": 2.0
+            }],
+            "links": [],
+            "parent_page_id": "",
+            "error": "",
+            "created_at": 2.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let original_question = "Use the selected book page when regenerating.";
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": original_question,
+                        "language": "en",
+                        "book_references": [{
+                            "book_id": "regen-book",
+                            "page_ids": ["page-1"]
+                        }],
+                        "llm_selection": {
+                            "profile_id": "snapshot-llm",
+                            "model_id": "snapshot-model"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let first_turn = json_response(turn_response).await;
+    let session_id = first_turn["session_id"].as_str().unwrap().to_string();
+
+    let session_path = test_data_root(&root)
+        .join("sessions")
+        .join(format!("{session_id}.json"));
+    let mut session: Value =
+        serde_json::from_str(&fs::read_to_string(&session_path).unwrap()).expect("session json");
+    session["preferences"]["llm_selection"] = json!({
+        "profile_id": "preference-llm",
+        "model_id": "preference-model"
+    });
+    fs::write(
+        &session_path,
+        serde_json::to_vec_pretty(&session).expect("serialize session"),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate",
+                "session_id": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    loop {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("regenerate should finish")
+            .expect("socket message")
+            .expect("valid socket message");
+        match message {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] == "done" {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0]["payload"]["model"], "snapshot-chat-model");
+    assert_eq!(recorded[1]["payload"]["model"], "snapshot-chat-model");
+    assert_eq!(
+        recorded[1]["headers"]["authorization"],
+        "Bearer snapshot-key"
+    );
+    let provider_messages = recorded[1]["payload"]["messages"].as_array().unwrap();
+    let regenerated_user_content = provider_messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .expect("regenerated provider user message");
+    assert!(regenerated_user_content.contains("[Book Context]"));
+    assert!(regenerated_user_content.contains("Snapshot Replay Book"));
+    assert!(regenerated_user_content.contains("Snapshot evidence page"));
+    assert!(regenerated_user_content.contains("Snapshot-only page evidence"));
+    assert!(regenerated_user_content.contains("[User Question]"));
+    assert!(regenerated_user_content.contains(original_question));
+    drop(recorded);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn chat_ws_regenerate_reuses_last_user_without_duplicating_message() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -7159,6 +21827,221 @@ async fn chat_ws_regenerate_rejects_invalid_llm_selection_without_mutating_histo
 }
 
 #[tokio::test]
+async fn book_ws_create_streams_python_stage_progress_and_result_events() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/book/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "create",
+                "user_intent": "Build a short Socartes book about multi-agent RAG.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"],
+                "chat_session_id": "chat-book-ws-create"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..16 {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("book ws event")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_ne!(
+            event["stage"], "unsupported",
+            "Book WS create must not fall back to the Rust unsupported stub: {event}"
+        );
+        let done = event["type"] == "create_result" || event["type"] == "error";
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "stage_start" && event["stage"] == "ideation"),
+        "missing Python-style ideation stage_start events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "progress"
+                && event["metadata"]["kind"] == "proposal_ready"),
+        "missing Book milestone progress(kind=proposal_ready): {events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "create_result")
+        .expect("create_result event");
+    assert_eq!(result["book"]["status"], "draft");
+    assert_eq!(
+        result["proposal"]["title"],
+        "Build a short Socartes book about multi-agent RAG."
+    );
+    let book_id = result["book"]["id"].as_str().expect("book id");
+    assert!(
+        test_book_root(&root)
+            .join(format!("book_{book_id}"))
+            .join("manifest.json")
+            .is_file()
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_confirm_spine_materializes_python_overview_blocks_for_frontend_renderer() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "user_intent": "Create a concise book about Socartes multi-agent RAG.",
+                        "language": "en",
+                        "knowledge_bases": ["socartes-rust-rag"],
+                        "chat_session_id": "chat-book-overview",
+                        "notebook_refs": ["note-1"],
+                        "question_entries": ["question-1"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), http::StatusCode::OK);
+    let create_payload = json_response(create_response).await;
+    let book_id = create_payload["book"]["id"].as_str().unwrap().to_string();
+
+    let proposal_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/confirm-proposal")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": book_id,
+                        "proposal": {
+                            "title": "Socartes Multi-Agent RAG",
+                            "description": "A book that maps Planner, Executor, Critic, and RAG flow.",
+                            "scope": "short",
+                            "target_level": "intermediate",
+                            "estimated_chapters": 1,
+                            "rationale": "contract test"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal_response.status(), http::StatusCode::OK);
+    let proposal_payload = json_response(proposal_response).await;
+
+    let spine_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/confirm-spine")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": book_id,
+                        "spine": proposal_payload["spine"],
+                        "auto_compile": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spine_response.status(), http::StatusCode::OK);
+    let spine_payload = json_response(spine_response).await;
+    let overview_page = &spine_payload["pages"][0];
+    assert_eq!(overview_page["content_type"], "overview");
+    assert_eq!(overview_page["status"], "ready");
+
+    let blocks = overview_page["blocks"].as_array().expect("overview blocks");
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[1]["type"], "concept_graph");
+    assert_eq!(blocks[2]["type"], "text");
+    assert_eq!(blocks[1]["payload"]["render_type"], "concept_graph");
+    assert_eq!(blocks[1]["payload"]["code"]["language"], "mermaid");
+    assert!(
+        blocks[1]["payload"]["code"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("graph TD")
+    );
+    assert!(
+        blocks[1]["payload"]["graph"]["nodes"]
+            .as_array()
+            .is_some_and(|nodes| !nodes.is_empty())
+    );
+    assert!(
+        blocks[1]["payload"]["index"]["chapters"]
+            .as_array()
+            .is_some_and(|chapters| !chapters.is_empty())
+    );
+    assert_eq!(blocks[2]["params"]["role"], "chapter_index");
+
+    let saved_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/v1/book/books/{}/pages/{}",
+                    book_id,
+                    overview_page["id"].as_str().unwrap()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved_response.status(), http::StatusCode::OK);
+    let saved_payload = json_response(saved_response).await;
+    assert_eq!(saved_payload["page"]["blocks"][1]["type"], "concept_graph");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_frontend_bootstrap_reads_file_backed_books_and_outputs() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -7375,6 +22258,2084 @@ async fn book_frontend_bootstrap_reads_file_backed_books_and_outputs() {
 }
 
 #[tokio::test]
+async fn book_health_detects_kb_drift_and_marks_ready_pages_stale_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let knowledge_files = root.join("bases").join("drift-course").join("files");
+    fs::create_dir_all(&knowledge_files).unwrap();
+    fs::write(
+        knowledge_files.join("lesson.md"),
+        "The drift course now teaches planner, executor, and critic evidence loops.",
+    )
+    .unwrap();
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_drift-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "drift-book",
+            "title": "Drift Book",
+            "description": "Detect changed course fingerprints.",
+            "status": "ready",
+            "knowledge_bases": ["drift-course"],
+            "page_count": 2,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": { "drift-course": "old-fingerprint" },
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (page_id, status) in [("page-ready", "ready"), ("page-pending", "pending")] {
+        fs::write(
+            book_dir.join("pages").join(format!("{page_id}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "id": page_id,
+                "book_id": "drift-book",
+                "chapter_id": "chapter-1",
+                "title": page_id,
+                "content_type": "overview",
+                "status": status,
+                "order": 1,
+                "blocks": [],
+                "links": [],
+                "parent_page_id": "",
+                "error": "",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    let health_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/book/books/drift-book/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_response.status(), http::StatusCode::OK);
+    let health = json_response(health_response).await;
+    let drift = &health["kb_drift"];
+    assert_eq!(drift["book_id"], "drift-book");
+    assert_eq!(drift["has_drift"], true);
+    assert_eq!(drift["new_kbs"], json!([]));
+    assert_eq!(drift["removed_kbs"], json!([]));
+    assert_eq!(drift["changed_kbs"], json!(["drift-course"]));
+    assert_eq!(drift["stale_page_ids"], json!(["page-ready"]));
+    let fingerprint = drift["current_fingerprints"]["drift-course"]
+        .as_str()
+        .expect("current fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_ne!(fingerprint, "old-fingerprint");
+    assert_ne!(fingerprint, "rust-file-drift-course");
+
+    let saved_manifest: Value =
+        serde_json::from_str(&fs::read_to_string(book_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(saved_manifest["stale_page_ids"], json!(["page-ready"]));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_refresh_fingerprints_recomputes_hash_clears_stale_and_appends_log_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let knowledge_files = root.join("bases").join("refresh-course").join("files");
+    fs::create_dir_all(&knowledge_files).unwrap();
+    fs::write(
+        knowledge_files.join("lesson.md"),
+        "The refresh course locks in a fresh fingerprint.",
+    )
+    .unwrap();
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_refresh-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "refresh-book",
+            "title": "Refresh Book",
+            "description": "Refresh fingerprints.",
+            "status": "ready",
+            "knowledge_bases": ["refresh-course"],
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": { "refresh-course": "old-fingerprint" },
+            "stale_page_ids": ["page-1"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(book_dir.join("log.md"), "# Existing log\n").unwrap();
+
+    let refresh_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/refresh-book/refresh-fingerprints")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh_response.status(), http::StatusCode::OK);
+    let refresh = json_response(refresh_response).await;
+    assert_eq!(refresh["book_id"], "refresh-book");
+    assert_eq!(refresh["stale_page_ids"], json!([]));
+    let fingerprint = refresh["kb_fingerprints"]["refresh-course"]
+        .as_str()
+        .expect("refreshed fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_ne!(fingerprint, "old-fingerprint");
+    assert_ne!(fingerprint, "rust-file-refresh-course");
+
+    let saved_manifest: Value =
+        serde_json::from_str(&fs::read_to_string(book_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved_manifest["kb_fingerprints"]["refresh-course"],
+        fingerprint
+    );
+    assert_eq!(saved_manifest["stale_page_ids"], json!([]));
+    let log = fs::read_to_string(book_dir.join("log.md")).unwrap();
+    assert!(log.contains("**kb_health**"));
+    assert!(log.contains("refreshed kb fingerprints (1 kbs)"));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_health_parses_log_failures_and_repeated_signatures_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_log-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "log-book",
+            "title": "Log Book",
+            "description": "Parse Python style book logs.",
+            "status": "ready",
+            "knowledge_bases": [],
+            "page_count": 0,
+            "chapter_count": 0,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("log.md"),
+        [
+            "- `2026-05-29T10:00:00Z` **page_planned** — planned first page",
+            "- `2026-05-29T10:01:00Z` **compile_page** — compiling page-1",
+            "- `2026-05-29T10:02:00Z` **block_error** — failed rendering diagram",
+            "- `2026-05-29T10:03:00Z` **block_error** — failed rendering diagram",
+            "- `2026-05-29T10:04:00Z` **block_error** — failed rendering diagram",
+            "ignored line",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let health_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/book/books/log-book/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health_response.status(), http::StatusCode::OK);
+    let health = json_response(health_response).await;
+    let log_health = &health["log_health"];
+    assert_eq!(log_health["book_id"], "log-book");
+    assert_eq!(log_health["total_entries"], 5);
+    assert_eq!(log_health["error_entries"], 3);
+    assert_eq!(log_health["block_failures"], 3);
+    assert_eq!(log_health["last_compile_at"], "2026-05-29T10:01:00Z");
+    assert_eq!(log_health["last_error_at"], "2026-05-29T10:04:00Z");
+    assert_eq!(
+        log_health["repeated_failures"],
+        json!([{
+            "signature": "block_error:failed rendering diagram",
+            "count": 3
+        }])
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_ws_streams_python_results_for_remaining_generation_actions() {
+    let root = unique_test_knowledge_root();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/book/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "create",
+                "user_intent": "Create a Socartes workflow book.",
+                "language": "en",
+                "knowledge_bases": ["socartes-rust-rag"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let create_events = collect_book_ws_events_until(&mut socket, "create_result").await;
+    let create_result = create_events
+        .iter()
+        .find(|event| event["type"] == "create_result")
+        .expect("create_result");
+    let book_id = create_result["book"]["id"].as_str().unwrap().to_string();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "confirm_proposal",
+                "book_id": book_id,
+                "proposal": {
+                    "title": "WS Rust Agents",
+                    "description": "A WebSocket generated outline",
+                    "scope": "short",
+                    "target_level": "intermediate",
+                    "estimated_chapters": 1,
+                    "rationale": "contract test"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let proposal_events =
+        collect_book_ws_events_until(&mut socket, "confirm_proposal_result").await;
+    assert!(
+        proposal_events
+            .iter()
+            .any(|event| event["type"] == "stage_start" && event["stage"] == "exploration"),
+        "missing exploration stage_start: {proposal_events:?}"
+    );
+    assert!(
+        proposal_events
+            .iter()
+            .any(|event| event["type"] == "progress"
+                && event["metadata"]["kind"] == "exploration_ready"),
+        "missing exploration_ready progress: {proposal_events:?}"
+    );
+    assert!(
+        proposal_events
+            .iter()
+            .any(|event| event["type"] == "progress" && event["metadata"]["kind"] == "spine_ready"),
+        "missing spine_ready progress: {proposal_events:?}"
+    );
+    let proposal_result = proposal_events
+        .iter()
+        .find(|event| event["type"] == "confirm_proposal_result")
+        .expect("confirm_proposal_result");
+    assert_eq!(proposal_result["book"]["status"], "spine_ready");
+    assert_eq!(proposal_result["spine"]["chapters"][0]["id"], "chapter-1");
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "confirm_spine",
+                "book_id": book_id,
+                "spine": proposal_result["spine"],
+                "auto_compile": true
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let spine_events = collect_book_ws_events_until(&mut socket, "confirm_spine_result").await;
+    assert!(
+        spine_events
+            .iter()
+            .any(|event| event["type"] == "stage_start" && event["stage"] == "spine"),
+        "missing spine stage_start: {spine_events:?}"
+    );
+    assert!(
+        spine_events
+            .iter()
+            .any(|event| event["type"] == "progress"
+                && event["metadata"]["kind"] == "overview_ready"),
+        "missing overview_ready progress: {spine_events:?}"
+    );
+    let spine_result = spine_events
+        .iter()
+        .find(|event| event["type"] == "confirm_spine_result")
+        .expect("confirm_spine_result");
+    let page = &spine_result["pages"][0];
+    let page_id = page["id"].as_str().unwrap().to_string();
+    let block_id = page["blocks"][0]["id"].as_str().unwrap().to_string();
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "compile_page",
+                "book_id": book_id,
+                "page_id": page_id,
+                "force": true
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let compile_events = collect_book_ws_events_until(&mut socket, "compile_page_result").await;
+    assert!(
+        compile_events
+            .iter()
+            .any(|event| event["type"] == "progress"
+                && event["metadata"]["kind"] == "page_compile_started"),
+        "missing page_compile_started progress: {compile_events:?}"
+    );
+    assert!(
+        compile_events.iter().any(
+            |event| event["type"] == "progress" && event["metadata"]["kind"] == "page_compiled"
+        ),
+        "missing page_compiled progress: {compile_events:?}"
+    );
+    assert!(
+        compile_events
+            .iter()
+            .any(|event| event["type"] == "compile_page_result"),
+        "missing compile_page_result: {compile_events:?}"
+    );
+
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate_block",
+                "book_id": book_id,
+                "page_id": page_id,
+                "block_id": block_id,
+                "params_override": { "focus": "critic loop" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let regenerate_events =
+        collect_book_ws_events_until(&mut socket, "regenerate_block_result").await;
+    assert!(
+        regenerate_events.iter().any(
+            |event| event["type"] == "progress" && event["metadata"]["kind"] == "block_started"
+        ),
+        "missing block_started progress: {regenerate_events:?}"
+    );
+    assert!(
+        regenerate_events
+            .iter()
+            .any(|event| event["type"] == "progress" && event["metadata"]["kind"] == "block_ready"),
+        "missing block_ready progress: {regenerate_events:?}"
+    );
+    let regenerate_result = regenerate_events
+        .iter()
+        .find(|event| event["type"] == "regenerate_block_result")
+        .expect("regenerate_block_result");
+    assert_eq!(regenerate_result["block"]["metadata"]["regenerated"], true);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_ws_compile_ready_page_without_force_is_idempotent_like_python() {
+    let root = unique_test_knowledge_root();
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_ready-ws-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "ready-ws-book",
+            "title": "Ready WS Book",
+            "description": "Ready pages should not recompile without force.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "ready-ws-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Ready chapter",
+                "summary": "Already compiled.",
+                "content_type": "theory",
+                "learning_objectives": ["Keep ready pages stable"],
+                "source_anchors": [],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ready_page = json!({
+        "id": "page-1",
+        "book_id": "ready-ws-book",
+        "chapter_id": "chapter-1",
+        "title": "Ready chapter",
+        "content_type": "theory",
+        "order": 1,
+        "learning_objectives": ["Keep ready pages stable"],
+        "blocks": [{
+            "id": "block-1",
+            "type": "section",
+            "title": "Stable section",
+            "status": "ready",
+            "payload": {
+                "body": "This page was already compiled."
+            },
+            "params": {},
+            "metadata": {},
+            "source_anchors": [],
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }],
+        "status": "ready",
+        "error": "",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    let page_path = book_dir.join("pages").join("page-1.json");
+    let page_before = serde_json::to_vec_pretty(&ready_page).unwrap();
+    fs::write(&page_path, &page_before).unwrap();
+    fs::write(book_dir.join("log.md"), "# Existing log\n").unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/book/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "compile_page",
+                "book_id": "ready-ws-book",
+                "page_id": "page-1",
+                "force": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_book_ws_events_until(&mut socket, "compile_page_result").await;
+    assert!(
+        !events.iter().any(|event| event["type"] == "progress"),
+        "Python returns ready pages before compiler streaming, so WS must not emit compile progress: {events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "compile_page_result")
+        .expect("compile_page_result");
+    assert_eq!(result["page"], ready_page);
+    let page_after = fs::read(&page_path).unwrap();
+    assert_eq!(page_after, page_before);
+    assert_eq!(
+        fs::read_to_string(book_dir.join("log.md")).unwrap(),
+        "# Existing log\n"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_compile_aggregates_existing_block_failures_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_status-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "status-book",
+            "title": "Status Book",
+            "description": "Block status aggregation.",
+            "status": "spine_ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 2,
+            "chapter_count": 2,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "status-book",
+            "chapters": [
+                {
+                    "id": "chapter-partial",
+                    "title": "Partial chapter",
+                    "summary": "One block failed.",
+                    "content_type": "theory",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 1,
+                    "page_ids": ["partial-page"]
+                },
+                {
+                    "id": "chapter-failed",
+                    "title": "Failed chapter",
+                    "summary": "All blocks failed.",
+                    "content_type": "theory",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 2,
+                    "page_ids": ["failed-page"]
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for page in [
+        json!({
+            "id": "partial-page",
+            "book_id": "status-book",
+            "chapter_id": "chapter-partial",
+            "title": "Partial chapter",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": [],
+            "blocks": [
+                {
+                    "id": "partial-ready",
+                    "type": "section",
+                    "title": "Ready section",
+                    "status": "ready",
+                    "payload": { "body": "Ready content" },
+                    "params": {},
+                    "metadata": {},
+                    "source_anchors": [],
+                    "error": "",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                },
+                {
+                    "id": "partial-error",
+                    "type": "figure",
+                    "title": "Broken figure",
+                    "status": "error",
+                    "payload": {},
+                    "params": {},
+                    "metadata": {},
+                    "source_anchors": [],
+                    "error": "render failed",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "generating",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }),
+        json!({
+            "id": "failed-page",
+            "book_id": "status-book",
+            "chapter_id": "chapter-failed",
+            "title": "Failed chapter",
+            "content_type": "theory",
+            "order": 2,
+            "learning_objectives": [],
+            "blocks": [
+                {
+                    "id": "failed-one",
+                    "type": "section",
+                    "title": "Broken section",
+                    "status": "error",
+                    "payload": {},
+                    "params": {},
+                    "metadata": {},
+                    "source_anchors": [],
+                    "error": "section failed",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                },
+                {
+                    "id": "failed-two",
+                    "type": "quiz",
+                    "title": "Broken quiz",
+                    "status": "error",
+                    "payload": {},
+                    "params": {},
+                    "metadata": {},
+                    "source_anchors": [],
+                    "error": "quiz failed",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "generating",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }),
+    ] {
+        fs::write(
+            book_dir
+                .join("pages")
+                .join(format!("{}.json", page["id"].as_str().unwrap())),
+            serde_json::to_vec_pretty(&page).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let partial_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "status-book",
+                        "page_id": "partial-page",
+                        "force": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(partial_response.status(), http::StatusCode::OK);
+    let partial_page = json_response(partial_response).await["page"].clone();
+    assert_eq!(partial_page["status"], "partial");
+    assert_eq!(partial_page["error"], "1/2 blocks failed.");
+
+    let failed_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "status-book",
+                        "page_id": "failed-page",
+                        "force": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed_response.status(), http::StatusCode::OK);
+    let failed_page = json_response(failed_response).await["page"].clone();
+    assert_eq!(failed_page["status"], "error");
+    assert_eq!(failed_page["error"], "All 2 blocks failed to generate.");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_force_compile_preserves_existing_blocks_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_force-reset-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "force-reset-book",
+            "title": "Force Reset Book",
+            "description": "Force compile should reset generated outputs without replanning existing blocks.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": ["course-a"],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "force-reset-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Force chapter",
+                "summary": "Existing block plan must stay stable.",
+                "content_type": "theory",
+                "learning_objectives": ["Preserve the author-approved page plan"],
+                "source_anchors": [],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let user_note = json!({
+        "id": "note-1",
+        "type": "user_note",
+        "title": "Learner note",
+        "status": "ready",
+        "payload": { "body": "Do not touch this user-authored note." },
+        "params": { "pinned": true },
+        "metadata": { "author": "learner", "color": "yellow" },
+        "source_anchors": [{ "source_id": "note-source" }],
+        "error": "keep-note-error",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "force-reset-book",
+            "chapter_id": "chapter-1",
+            "title": "Existing plan",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": ["Preserve the author-approved page plan"],
+            "blocks": [
+                {
+                    "id": "section-1",
+                    "type": "section",
+                    "title": "Author-approved section",
+                    "status": "ready",
+                    "payload": { "body": "stale generated section" },
+                    "params": {
+                        "role": "custom-section",
+                        "topic": "Stable Topic",
+                        "custom_keep": true
+                    },
+                    "metadata": {
+                        "transition_in": "Bridge into the section",
+                        "deep_dive_page_id": "deep-dive-1",
+                        "generation_ms": 321,
+                        "model": "stale-model"
+                    },
+                    "source_anchors": [{ "source_id": "stale-section-source" }],
+                    "error": "stale section error",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                },
+                user_note,
+                {
+                    "id": "callout-1",
+                    "type": "callout",
+                    "title": "Author-approved callout",
+                    "status": "ready",
+                    "payload": { "body": "stale generated callout" },
+                    "params": {
+                        "role": "custom-callout",
+                        "topic": "Stable Topic",
+                        "variant": "warning"
+                    },
+                    "metadata": {
+                        "transition_in": "Bridge into the callout",
+                        "failure": { "reason": "old failure" },
+                        "latency_ms": 999
+                    },
+                    "source_anchors": [{ "source_id": "stale-callout-source" }],
+                    "error": "stale callout error",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "ready",
+            "error": "stale page error",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "force-reset-book",
+                        "page_id": "page-1",
+                        "force": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let page = json_response(response).await["page"].clone();
+    let blocks = page["blocks"].as_array().expect("blocks");
+    let block_ids = blocks
+        .iter()
+        .map(|block| block["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(block_ids, vec!["section-1", "note-1", "callout-1"]);
+    assert_eq!(blocks[0]["type"], "section");
+    assert_eq!(blocks[0]["title"], "Author-approved section");
+    assert_eq!(
+        blocks[0]["params"],
+        json!({
+            "role": "custom-section",
+            "topic": "Stable Topic",
+            "custom_keep": true
+        })
+    );
+    assert_eq!(blocks[0]["status"], "ready");
+    assert_eq!(blocks[0]["error"], "");
+    assert_eq!(blocks[0]["source_anchors"], json!([]));
+    assert_ne!(
+        blocks[0]["payload"],
+        json!({ "body": "stale generated section" })
+    );
+    assert_eq!(
+        blocks[0]["metadata"]["transition_in"],
+        "Bridge into the section"
+    );
+    assert_eq!(blocks[0]["metadata"]["deep_dive_page_id"], "deep-dive-1");
+    assert!(!json_object_has_key(&blocks[0]["metadata"], "model"));
+
+    assert_eq!(blocks[1], user_note);
+
+    assert_eq!(blocks[2]["type"], "callout");
+    assert_eq!(blocks[2]["title"], "Author-approved callout");
+    assert_eq!(
+        blocks[2]["params"],
+        json!({
+            "role": "custom-callout",
+            "topic": "Stable Topic",
+            "variant": "warning"
+        })
+    );
+    assert_eq!(blocks[2]["status"], "ready");
+    assert_eq!(blocks[2]["error"], "");
+    assert_eq!(blocks[2]["source_anchors"], json!([]));
+    assert_ne!(
+        blocks[2]["payload"],
+        json!({ "body": "stale generated callout" })
+    );
+    assert_eq!(
+        blocks[2]["metadata"]["transition_in"],
+        "Bridge into the callout"
+    );
+    assert!(!json_object_has_key(&blocks[2]["metadata"], "failure"));
+    assert!(!json_object_has_key(&blocks[2]["metadata"], "latency_ms"));
+    assert_eq!(page["status"], "ready");
+    assert_eq!(page["error"], "");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_force_compile_keeps_ready_overview_blocks_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_force-overview-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "force-overview-book",
+            "title": "Force Overview Book",
+            "description": "Force compile should not reset ready overview blocks.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": ["course-a"],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "force-overview-book",
+            "chapters": [{
+                "id": "overview",
+                "title": "Overview",
+                "summary": "Existing overview blocks are already compiled.",
+                "content_type": "overview",
+                "learning_objectives": ["Keep the overview renderer state stable"],
+                "source_anchors": [],
+                "order": 0,
+                "page_ids": ["overview-page"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let overview_blocks = json!([
+        {
+            "id": "overview-text-1",
+            "type": "text",
+            "title": "Custom overview opening",
+            "status": "ready",
+            "payload": {
+                "body": "A carefully edited overview introduction."
+            },
+            "params": {
+                "role": "custom_intro",
+                "tone": "editorial"
+            },
+            "metadata": {
+                "custom": "preserve-me",
+                "transition_in": "Do not strip overview metadata"
+            },
+            "source_anchors": [{ "source_id": "overview-source" }],
+            "error": "preserve-ready-block-error",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        },
+        {
+            "id": "overview-graph-1",
+            "type": "concept_graph",
+            "title": "Custom graph",
+            "status": "ready",
+            "payload": {
+                "render_type": "concept_graph",
+                "graph": {
+                    "nodes": [{ "id": "n1", "label": "Kept node" }],
+                    "edges": []
+                },
+                "code": {
+                    "language": "mermaid",
+                    "content": "graph TD\n  n1[Kept node]"
+                }
+            },
+            "params": {
+                "role": "custom_graph",
+                "layout": "manual"
+            },
+            "metadata": {
+                "custom": "graph-preserved",
+                "generation_ms": 777
+            },
+            "source_anchors": [{ "source_id": "graph-source" }],
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }
+    ]);
+    fs::write(
+        book_dir.join("pages").join("overview-page.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-page",
+            "book_id": "force-overview-book",
+            "chapter_id": "overview",
+            "title": "Overview",
+            "content_type": "overview",
+            "order": 0,
+            "learning_objectives": ["Keep the overview renderer state stable"],
+            "blocks": overview_blocks,
+            "status": "ready",
+            "error": "stale page error should be finalized away",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "force-overview-book",
+                        "page_id": "overview-page",
+                        "force": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let page = json_response(response).await["page"].clone();
+    assert_eq!(page["content_type"], "overview");
+    assert_eq!(page["status"], "ready");
+    assert_eq!(page["error"], "");
+    assert_eq!(page["blocks"], overview_blocks);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_overview_compile_generates_only_non_ready_blocks_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_overview-pending-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-pending-book",
+            "title": "Overview Pending Book",
+            "description": "Existing overview blocks should not be replanned.",
+            "status": "generating",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "overview-pending-book",
+            "concept_graph": {
+                "nodes": [{ "id": "root", "label": "Root", "chapter_id": "chapter-1" }],
+                "edges": []
+            },
+            "chapters": [
+                {
+                    "id": "overview",
+                    "title": "Overview",
+                    "summary": "Overview summary.",
+                    "content_type": "overview",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 0,
+                    "page_ids": ["overview-page"]
+                },
+                {
+                    "id": "chapter-1",
+                    "title": "First chapter",
+                    "summary": "Chapter summary.",
+                    "content_type": "theory",
+                    "learning_objectives": ["Learn the root concept"],
+                    "source_anchors": [],
+                    "order": 1,
+                    "page_ids": ["page-1"]
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ready_text = json!({
+        "id": "overview-text-1",
+        "type": "text",
+        "title": "Stable intro",
+        "status": "ready",
+        "payload": { "body": "This edited intro must not be regenerated." },
+        "params": { "role": "custom_intro" },
+        "metadata": { "custom": "ready-text" },
+        "source_anchors": [{ "source_id": "ready-source" }],
+        "error": "ready block error is preserved because Python skips ready blocks",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    let graph_params = json!({
+        "role": "custom_graph",
+        "concept_graph": {
+            "nodes": [{ "id": "root", "label": "Root", "chapter_id": "chapter-1" }],
+            "edges": []
+        },
+        "chapter_index": [
+            { "id": "chapter-1", "title": "First chapter", "order": 1 }
+        ]
+    });
+    fs::write(
+        book_dir.join("pages").join("overview-page.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-page",
+            "book_id": "overview-pending-book",
+            "chapter_id": "overview",
+            "title": "Overview",
+            "content_type": "overview",
+            "order": 0,
+            "learning_objectives": [],
+            "blocks": [
+                ready_text,
+                {
+                    "id": "overview-graph-1",
+                    "type": "concept_graph",
+                    "title": "Pending graph",
+                    "status": "pending",
+                    "payload": {},
+                    "params": graph_params,
+                    "metadata": { "custom": "pending-graph" },
+                    "source_anchors": [{ "source_id": "existing-graph-anchor" }],
+                    "error": "stale graph error",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "generating",
+            "error": "page still generating",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "overview-pending-book",
+                        "page_id": "overview-page",
+                        "force": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let page = json_response(response).await["page"].clone();
+    let blocks = page["blocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], ready_text);
+    assert_eq!(blocks[1]["id"], "overview-graph-1");
+    assert_eq!(blocks[1]["type"], "concept_graph");
+    assert_eq!(blocks[1]["title"], "Pending graph");
+    assert_eq!(blocks[1]["params"], graph_params);
+    assert_eq!(blocks[1]["status"], "ready");
+    assert_eq!(blocks[1]["error"], "");
+    assert_eq!(
+        blocks[1]["source_anchors"],
+        json!([{ "source_id": "existing-graph-anchor" }])
+    );
+    assert_eq!(blocks[1]["metadata"]["custom"], "pending-graph");
+    assert_eq!(blocks[1]["metadata"]["node_count"], 1);
+    assert_eq!(blocks[1]["metadata"]["edge_count"], 0);
+    assert_eq!(blocks[1]["payload"]["render_type"], "concept_graph");
+    assert_eq!(blocks[1]["payload"]["graph"], graph_params["concept_graph"]);
+    assert_eq!(blocks[1]["payload"]["index"]["chapters"], json!([]));
+    assert!(
+        blocks[1]["payload"]["code"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Root")
+    );
+    assert_eq!(page["status"], "ready");
+    assert_eq!(page["error"], "");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_regenerate_concept_graph_ignores_params_chapter_index_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_regenerate-graph-index-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "regenerate-graph-index-book",
+            "title": "Regenerate Graph Index Book",
+            "description": "Regenerate should match ConceptGraphGenerator context behavior.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "regenerate-graph-index-book",
+            "concept_graph": {
+                "nodes": [{ "id": "root", "label": "Root", "chapter_id": "chapter-1" }],
+                "edges": []
+            },
+            "chapters": [
+                {
+                    "id": "overview",
+                    "title": "Overview",
+                    "summary": "Overview summary.",
+                    "content_type": "overview",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 0,
+                    "page_ids": ["overview-page"]
+                },
+                {
+                    "id": "chapter-1",
+                    "title": "First chapter",
+                    "summary": "Chapter summary.",
+                    "content_type": "theory",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 1,
+                    "page_ids": ["page-1"]
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ready_text = json!({
+        "id": "overview-text-1",
+        "type": "text",
+        "title": "Stable intro",
+        "status": "ready",
+        "payload": { "body": "Already ready text stays ready." },
+        "params": { "role": "custom_intro" },
+        "metadata": { "custom": "ready-text" },
+        "source_anchors": [],
+        "error": "",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    let graph_params = json!({
+        "role": "custom_graph",
+        "concept_graph": {
+            "nodes": [{ "id": "root", "label": "Root", "chapter_id": "chapter-1" }],
+            "edges": []
+        },
+        "chapter_index": [
+            { "id": "chapter-1", "title": "First chapter", "order": 1 }
+        ]
+    });
+    fs::write(
+        book_dir.join("pages").join("overview-page.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-page",
+            "book_id": "regenerate-graph-index-book",
+            "chapter_id": "overview",
+            "title": "Overview",
+            "content_type": "overview",
+            "order": 0,
+            "learning_objectives": [],
+            "blocks": [
+                ready_text,
+                {
+                    "id": "overview-graph-1",
+                    "type": "concept_graph",
+                    "title": "Concept graph",
+                    "status": "ready",
+                    "payload": { "stale": true },
+                    "params": graph_params,
+                    "metadata": {
+                        "custom": "stale-graph",
+                        "failure": { "kind": "old_failure" }
+                    },
+                    "source_anchors": [{ "source_id": "existing-graph-anchor" }],
+                    "error": "old error",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/regenerate-block")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "regenerate-graph-index-book",
+                        "page_id": "overview-page",
+                        "block_id": "overview-graph-1"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let block = json_response(response).await["block"].clone();
+    assert_eq!(block["status"], "ready");
+    assert_eq!(block["error"], "");
+    assert_eq!(block["params"], graph_params);
+    assert_eq!(block["payload"]["render_type"], "concept_graph");
+    assert_eq!(block["payload"]["graph"], graph_params["concept_graph"]);
+    assert_eq!(block["payload"]["index"]["chapters"], json!([]));
+    assert_eq!(
+        block["payload"]["index"]["node_to_chapter"]["root"],
+        "chapter-1"
+    );
+    assert!(
+        block["payload"]["code"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Root")
+    );
+    assert_eq!(
+        block["source_anchors"],
+        json!([{ "source_id": "existing-graph-anchor" }])
+    );
+    assert_eq!(block["metadata"]["custom"], "stale-graph");
+    assert_eq!(block["metadata"]["node_count"], 1);
+    assert_eq!(block["metadata"]["edge_count"], 0);
+    assert_eq!(block["metadata"]["regenerated"], true);
+    assert!(!json_object_has_key(&block["metadata"], "failure"));
+
+    let saved_page: Value = serde_json::from_slice(
+        &fs::read(book_dir.join("pages").join("overview-page.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved_page["blocks"][0], ready_text);
+    assert_eq!(saved_page["blocks"][1], block);
+    assert_eq!(saved_page["status"], "ready");
+    assert_eq!(saved_page["error"], "");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_overview_compile_marks_missing_concept_graph_payload_as_error_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_overview-missing-graph-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-missing-graph-book",
+            "title": "Overview Missing Graph Book",
+            "description": "Existing overview graph failures should match Python.",
+            "status": "generating",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "overview-missing-graph-book",
+            "concept_graph": {
+                "nodes": [{ "id": "root", "label": "Root", "chapter_id": "chapter-1" }],
+                "edges": []
+            },
+            "chapters": [
+                {
+                    "id": "overview",
+                    "title": "Overview",
+                    "summary": "Overview summary.",
+                    "content_type": "overview",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 0,
+                    "page_ids": ["overview-page"]
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ready_text = json!({
+        "id": "overview-text-1",
+        "type": "text",
+        "title": "Stable intro",
+        "status": "ready",
+        "payload": { "body": "This edited intro must not be regenerated." },
+        "params": { "role": "custom_intro" },
+        "metadata": { "custom": "ready-text" },
+        "source_anchors": [{ "source_id": "ready-source" }],
+        "error": "ready block error is preserved because Python skips ready blocks",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    let stale_graph_payload = json!({
+        "render_type": "concept_graph",
+        "graph": { "nodes": [], "edges": [] },
+        "index": { "chapters": [], "node_to_chapter": {} }
+    });
+    fs::write(
+        book_dir.join("pages").join("overview-page.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-page",
+            "book_id": "overview-missing-graph-book",
+            "chapter_id": "overview",
+            "title": "Overview",
+            "content_type": "overview",
+            "order": 0,
+            "learning_objectives": [],
+            "blocks": [
+                ready_text,
+                {
+                    "id": "overview-graph-1",
+                    "type": "concept_graph",
+                    "title": "Missing graph",
+                    "status": "pending",
+                    "payload": stale_graph_payload,
+                    "params": { "role": "custom_graph" },
+                    "metadata": { "custom": "pending-graph" },
+                    "source_anchors": [{ "source_id": "existing-graph-anchor" }],
+                    "error": "stale graph error",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "generating",
+            "error": "page still generating",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/compile-page")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "overview-missing-graph-book",
+                        "page_id": "overview-page",
+                        "force": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let page = json_response(response).await["page"].clone();
+    let blocks = page["blocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], ready_text);
+    assert_eq!(blocks[1]["id"], "overview-graph-1");
+    assert_eq!(blocks[1]["type"], "concept_graph");
+    assert_eq!(blocks[1]["title"], "Missing graph");
+    assert_eq!(blocks[1]["params"], json!({ "role": "custom_graph" }));
+    assert_eq!(blocks[1]["status"], "error");
+    assert_eq!(
+        blocks[1]["error"],
+        "concept_graph payload missing from BlockContext.extra"
+    );
+    assert_eq!(blocks[1]["payload"], stale_graph_payload);
+    assert_eq!(
+        blocks[1]["source_anchors"],
+        json!([{ "source_id": "existing-graph-anchor" }])
+    );
+    assert_eq!(blocks[1]["metadata"]["custom"], "pending-graph");
+    assert_eq!(blocks[1]["metadata"]["failure"]["kind"], "generator_error");
+    assert_eq!(
+        blocks[1]["metadata"]["failure"]["message"],
+        "concept_graph payload missing from BlockContext.extra"
+    );
+    assert_eq!(blocks[1]["metadata"]["failure"]["retryable"], true);
+    assert_eq!(
+        blocks[1]["metadata"]["failure"]["source"],
+        "ConceptGraphGenerator"
+    );
+    assert_eq!(page["status"], "partial");
+    assert_eq!(page["error"], "1/2 blocks failed.");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_regenerate_missing_concept_graph_payload_marks_block_error_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_regenerate-missing-graph-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "regenerate-missing-graph-book",
+            "title": "Regenerate Missing Graph Book",
+            "description": "Regenerate should run the generator failure path.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "regenerate-missing-graph-book",
+            "concept_graph": {
+                "nodes": [{ "id": "root", "label": "Root", "chapter_id": "overview" }],
+                "edges": []
+            },
+            "chapters": [
+                {
+                    "id": "overview",
+                    "title": "Overview",
+                    "summary": "Overview summary.",
+                    "content_type": "overview",
+                    "learning_objectives": [],
+                    "source_anchors": [],
+                    "order": 0,
+                    "page_ids": ["overview-page"]
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ready_text = json!({
+        "id": "overview-text-1",
+        "type": "text",
+        "title": "Stable intro",
+        "status": "ready",
+        "payload": { "body": "Already ready text stays ready." },
+        "params": { "role": "custom_intro" },
+        "metadata": { "custom": "ready-text" },
+        "source_anchors": [],
+        "error": "",
+        "created_at": 1.0,
+        "updated_at": 2.0
+    });
+    let stale_graph_payload = json!({
+        "render_type": "concept_graph",
+        "graph": { "nodes": [], "edges": [] },
+        "index": { "chapters": [], "node_to_chapter": {} }
+    });
+    fs::write(
+        book_dir.join("pages").join("overview-page.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "overview-page",
+            "book_id": "regenerate-missing-graph-book",
+            "chapter_id": "overview",
+            "title": "Overview",
+            "content_type": "overview",
+            "order": 0,
+            "learning_objectives": [],
+            "blocks": [
+                ready_text,
+                {
+                    "id": "overview-graph-1",
+                    "type": "concept_graph",
+                    "title": "Missing graph",
+                    "status": "ready",
+                    "payload": stale_graph_payload,
+                    "params": { "role": "custom_graph" },
+                    "metadata": { "custom": "stale-graph" },
+                    "source_anchors": [{ "source_id": "existing-graph-anchor" }],
+                    "error": "",
+                    "created_at": 1.0,
+                    "updated_at": 2.0
+                }
+            ],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/regenerate-block")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "regenerate-missing-graph-book",
+                        "page_id": "overview-page",
+                        "block_id": "overview-graph-1"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let block = json_response(response).await["block"].clone();
+    assert_eq!(block["id"], "overview-graph-1");
+    assert_eq!(block["status"], "error");
+    assert_eq!(
+        block["error"],
+        "concept_graph payload missing from BlockContext.extra"
+    );
+    assert_eq!(block["payload"], stale_graph_payload);
+    assert_eq!(
+        block["source_anchors"],
+        json!([{ "source_id": "existing-graph-anchor" }])
+    );
+    assert_eq!(block["metadata"]["custom"], "stale-graph");
+    assert_eq!(block["metadata"]["failure"]["kind"], "generator_error");
+    assert_eq!(
+        block["metadata"]["failure"]["message"],
+        "concept_graph payload missing from BlockContext.extra"
+    );
+    assert_eq!(block["metadata"]["failure"]["retryable"], true);
+    assert_eq!(
+        block["metadata"]["failure"]["source"],
+        "ConceptGraphGenerator"
+    );
+
+    let saved_page: Value = serde_json::from_slice(
+        &fs::read(book_dir.join("pages").join("overview-page.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved_page["blocks"][0], ready_text);
+    assert_eq!(saved_page["blocks"][1], block);
+    assert_eq!(saved_page["status"], "partial");
+    assert_eq!(saved_page["error"], "1/2 blocks failed.");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_quiz_attempt_tracks_weak_chapters_and_integer_score_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_quiz-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "quiz-book",
+            "title": "Quiz Progress Book",
+            "description": "",
+            "status": "ready",
+            "proposal": null,
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "quiz-book",
+            "current_page_id": "page-1",
+            "visited_page_ids": [],
+            "bookmarked_page_ids": [],
+            "quiz_attempts": [],
+            "weak_chapters": [],
+            "score": 0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "quiz-book",
+            "chapter_id": "chapter-1",
+            "title": "Weak chapter page",
+            "learning_objectives": [],
+            "content_type": "overview",
+            "status": "ready",
+            "order": 1,
+            "blocks": [],
+            "links": [],
+            "parent_page_id": "",
+            "error": "",
+            "created_at": 2.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let wrong_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/quiz-attempt")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "quiz-book",
+                        "page_id": "page-1",
+                        "block_id": "quiz-block",
+                        "question_id": "q1",
+                        "user_answer": "wrong",
+                        "is_correct": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_response.status(), http::StatusCode::OK);
+    let wrong_progress = json_response(wrong_response).await["progress"].clone();
+    assert_eq!(wrong_progress["score"], 0);
+    assert_eq!(wrong_progress["weak_chapters"], json!(["chapter-1"]));
+
+    for question_id in ["q2", "q3"] {
+        let correct_response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/book/books/quiz-attempt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "book_id": "quiz-book",
+                            "page_id": "page-1",
+                            "block_id": "quiz-block",
+                            "question_id": question_id,
+                            "user_answer": "right",
+                            "is_correct": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(correct_response.status(), http::StatusCode::OK);
+    }
+
+    let progress: Value =
+        serde_json::from_str(&fs::read_to_string(book_dir.join("progress.json")).unwrap())
+            .expect("progress json");
+    assert_eq!(progress["quiz_attempts"].as_array().unwrap().len(), 3);
+    assert_eq!(progress["score"], 2);
+    assert_eq!(progress["weak_chapters"], json!(["chapter-1"]));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_deep_dive_links_child_page_from_parent_block_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let book_dir = test_book_root(&root).join("book_deep-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "deep-book",
+            "title": "Deep Dive Book",
+            "description": "",
+            "status": "ready",
+            "proposal": null,
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "deep-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Parent chapter",
+                "learning_objectives": ["Choose a useful deep dive"],
+                "content_type": "concept",
+                "source_anchors": [],
+                "prerequisites": [],
+                "page_ids": ["page-1"],
+                "summary": "Parent chapter summary",
+                "order": 1
+            }],
+            "version": 1,
+            "updated_at": 2.0,
+            "concept_graph": {"nodes": [], "edges": []},
+            "exploration_summary": "Deep dive fixture"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "deep-book",
+            "chapter_id": "chapter-1",
+            "title": "Parent page",
+            "learning_objectives": [],
+            "content_type": "concept",
+            "status": "ready",
+            "order": 1,
+            "blocks": [{
+                "id": "deep-block",
+                "type": "deep_dive",
+                "status": "ready",
+                "title": "Go deeper",
+                "params": {},
+                "payload": {
+                    "suggestions": [{
+                        "topic": "critic loop",
+                        "rationale": "Clarify reflection"
+                    }]
+                },
+                "source_anchors": [],
+                "metadata": {},
+                "error": "",
+                "created_at": 2.0,
+                "updated_at": 2.0
+            }],
+            "links": [],
+            "parent_page_id": "",
+            "error": "",
+            "created_at": 2.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "deep-book",
+            "current_page_id": "page-1",
+            "visited_page_ids": [],
+            "bookmarked_page_ids": [],
+            "quiz_attempts": [],
+            "weak_chapters": [],
+            "score": 0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/deep-dive")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "deep-book",
+                        "parent_page_id": "page-1",
+                        "block_id": "deep-block",
+                        "topic": "critic loop",
+                        "content_type": "concept"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    let child_id = payload["page"]["id"].as_str().unwrap().to_string();
+    assert_eq!(payload["page"]["parent_page_id"], "page-1");
+
+    let parent_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/book/books/deep-book/pages/page-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent_response.status(), http::StatusCode::OK);
+    let parent = json_response(parent_response).await["page"].clone();
+    assert!(
+        parent["links"].as_array().unwrap().iter().any(|link| {
+            link["target_page_id"] == child_id
+                && link["relation"] == "deepens"
+                && link["label"] == "critic loop"
+        }),
+        "parent page must link to deep-dive child: {parent}"
+    );
+    assert_eq!(
+        parent["blocks"][0]["metadata"]["deep_dive_page_id"],
+        child_id
+    );
+
+    let spine_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/book/books/deep-book/spine")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spine_response.status(), http::StatusCode::OK);
+    let spine = json_response(spine_response).await["spine"].clone();
+    assert!(
+        spine["chapters"].as_array().unwrap().iter().any(|chapter| {
+            chapter["page_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|page_id| page_id == &json!(child_id))
+                && chapter["title"].as_str().unwrap().contains("(deep dive)")
+        }),
+        "spine must include synthetic deep-dive chapter: {spine}"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_creation_and_editing_workflow_matches_frontend_contract() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -7458,15 +24419,16 @@ async fn book_creation_and_editing_workflow_matches_frontend_contract() {
         .unwrap();
     assert_eq!(confirm_spine_response.status(), http::StatusCode::OK);
     let pages_payload = json_response(confirm_spine_response).await;
-    let page_id = pages_payload["pages"][0]["id"]
-        .as_str()
+    let theory_page = pages_payload["pages"]
+        .as_array()
         .unwrap()
-        .to_string();
-    let first_block_id = pages_payload["pages"][0]["blocks"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(pages_payload["pages"][0]["status"], "ready");
+        .iter()
+        .find(|page| page["content_type"] != "overview")
+        .expect("non-overview page")
+        .clone();
+    let page_id = theory_page["id"].as_str().unwrap().to_string();
+    let first_block_id = theory_page["blocks"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(theory_page["status"], "ready");
 
     let compile_response = app
         .clone()
@@ -7483,7 +24445,43 @@ async fn book_creation_and_editing_workflow_matches_frontend_contract() {
         .await
         .unwrap();
     assert_eq!(compile_response.status(), http::StatusCode::OK);
-    assert_eq!(json_response(compile_response).await["page"]["id"], page_id);
+    let compiled_page = json_response(compile_response).await["page"].clone();
+    assert_eq!(compiled_page["id"], page_id);
+    assert_eq!(compiled_page["content_type"], "theory");
+    let compiled_blocks = compiled_page["blocks"].as_array().unwrap();
+    assert!(
+        compiled_blocks.len() > 1,
+        "non-overview compile should plan multiple Python-style blocks, got {compiled_blocks:?}"
+    );
+    assert!(
+        compiled_blocks
+            .iter()
+            .any(|block| block["type"].as_str() == Some("section")),
+        "compiled theory page should include at least one section block: {compiled_blocks:?}"
+    );
+    assert!(
+        compiled_blocks
+            .iter()
+            .any(|block| block["type"].as_str() == Some("quiz")),
+        "compiled theory page should include a quiz block: {compiled_blocks:?}"
+    );
+    assert!(
+        compiled_blocks.iter().all(|block| {
+            block["status"] == "ready"
+                && block["payload"].is_object()
+                && !block["payload"].as_object().unwrap().is_empty()
+        }),
+        "compiled blocks should be ready with generated payloads: {compiled_blocks:?}"
+    );
+    assert!(
+        !compiled_blocks.iter().any(|block| {
+            block["title"] == "Socartes learning trace"
+                || block["payload"]["body"].as_str().is_some_and(|body| {
+                    body.contains("This Rust page is backed by file-backed Book data")
+                })
+        }),
+        "compile-page should replace the Rust placeholder block: {compiled_blocks:?}"
+    );
 
     let regenerate_response = app
         .clone()
@@ -7603,10 +24601,39 @@ async fn book_creation_and_editing_workflow_matches_frontend_contract() {
         .await
         .unwrap();
     assert_eq!(supplement_response.status(), http::StatusCode::OK);
+    let supplement_payload = json_response(supplement_response).await;
     assert_eq!(
-        json_response(supplement_response).await["block"]["type"],
-        "callout"
+        supplement_payload["block"]["type"], "quiz",
+        "Python supplement returns the last appended remediation quiz block"
     );
+    assert_eq!(supplement_payload["block"]["params"]["num_questions"], 2);
+    assert_eq!(supplement_payload["block"]["params"]["difficulty"], "easy");
+
+    let supplemented_page_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/book/books/{book_id}/pages/{page_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(supplemented_page_response.status(), http::StatusCode::OK);
+    let supplemented_page = json_response(supplemented_page_response).await;
+    let blocks = supplemented_page["page"]["blocks"].as_array().unwrap();
+    assert!(blocks.len() >= 3);
+    let last_three = &blocks[blocks.len() - 3..];
+    assert_eq!(last_three[0]["type"], "callout");
+    assert_eq!(last_three[0]["params"]["variant"], "common_pitfall");
+    assert_eq!(last_three[0]["params"]["topic"], "reflection");
+    assert_eq!(last_three[1]["type"], "text");
+    assert_eq!(last_three[1]["params"]["role"], "remediation");
+    assert_eq!(last_three[1]["params"]["topic"], "reflection");
+    assert_eq!(last_three[2]["type"], "quiz");
+    assert_eq!(last_three[2]["params"]["num_questions"], 2);
+    assert_eq!(last_three[2]["params"]["difficulty"], "easy");
+    assert_eq!(last_three[2]["params"]["topic"], "reflection");
 
     let deep_dive_response = app
         .clone()
@@ -7892,6 +24919,1705 @@ async fn settings_and_system_status_match_frontend_contract() {
     assert!(events_body.contains("\"type\":\"capabilities\""));
     assert!(events_body.contains("\"type\":\"completed\""));
 
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_configured_for_duckduckgo_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status =
+        system_status_for_search_catalog(&app, search_test_catalog("duckduckgo", "", "")).await;
+    assert_eq!(status["search"]["status"], "configured");
+    assert_eq!(status["search"]["provider"], "duckduckgo");
+    assert_eq!(status["search"]["testable"], true);
+    assert!(status["search"]["error"].is_null());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_configured_for_tavily_with_key_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status = system_status_for_search_catalog(
+        &app,
+        search_test_catalog("tavily", "tavily-test-key", ""),
+    )
+    .await;
+    assert_eq!(status["search"]["status"], "configured");
+    assert_eq!(status["search"]["provider"], "tavily");
+    assert_eq!(status["search"]["testable"], true);
+    assert!(status["search"]["error"].is_null());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_configured_for_serper_with_key_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status = system_status_for_search_catalog(
+        &app,
+        search_test_catalog("serper", "serper-test-key", ""),
+    )
+    .await;
+    assert_eq!(status["search"]["status"], "configured");
+    assert_eq!(status["search"]["provider"], "serper");
+    assert_eq!(status["search"]["testable"], true);
+    assert!(status["search"]["error"].is_null());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_configured_for_perplexity_with_key_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status = system_status_for_search_catalog(
+        &app,
+        search_test_catalog("perplexity", "perplexity-test-key", ""),
+    )
+    .await;
+    assert_eq!(status["search"]["status"], "configured");
+    assert_eq!(status["search"]["provider"], "perplexity");
+    assert_eq!(status["search"]["testable"], true);
+    assert!(status["search"]["error"].is_null());
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_fallback_to_duckduckgo_when_brave_key_missing() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status = system_status_for_search_catalog(&app, search_test_catalog("brave", "", "")).await;
+    assert_eq!(status["search"]["status"], "fallback");
+    assert_eq!(status["search"]["provider"], "duckduckgo");
+    assert_eq!(status["search"]["testable"], true);
+    assert_eq!(
+        status["search"]["error"],
+        "brave requires api_key, falling back to duckduckgo"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_unsupported_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status =
+        system_status_for_search_catalog(&app, search_test_catalog("openrouter", "", "")).await;
+    assert_eq!(status["search"]["status"], "unsupported");
+    assert_eq!(status["search"]["provider"], "openrouter");
+    assert_eq!(status["search"]["testable"], true);
+    assert_eq!(
+        status["search"]["error"],
+        "openrouter is deprecated/unsupported. Switch to brave/tavily/jina/searxng/duckduckgo/perplexity/serper."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_not_configured_for_perplexity_without_key_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status =
+        system_status_for_search_catalog(&app, search_test_catalog("perplexity", "", "")).await;
+    assert_eq!(status["search"]["status"], "not_configured");
+    assert_eq!(status["search"]["provider"], "perplexity");
+    assert_eq!(status["search"]["testable"], true);
+    assert_eq!(
+        status["search"]["error"],
+        "perplexity requires api_key. Set profile.api_key or PERPLEXITY_API_KEY."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_status_search_reports_not_configured_for_serper_without_key_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let status =
+        system_status_for_search_catalog(&app, search_test_catalog("serper", "", "")).await;
+    assert_eq!(status["search"]["status"], "not_configured");
+    assert_eq!(status["search"]["provider"], "serper");
+    assert_eq!(status["search"]["testable"], true);
+    assert_eq!(
+        status["search"]["error"],
+        "serper requires api_key. Set profile.api_key or SERPER_API_KEY."
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_llm_test_calls_configured_provider_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "id": "system-llm-probe",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "provider-chat-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "OK"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 9,
+            "completion_tokens": 1,
+            "total_tokens": 10
+        }
+    }))
+    .await;
+    let catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/llm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "LLM connection successful");
+    assert_eq!(payload["model"], "provider-chat-model");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/v1/chat/completions");
+    assert_eq!(requests[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(requests[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(requests[0]["payload"]["model"], "provider-chat-model");
+    assert_eq!(requests[0]["payload"]["stream"], false);
+    assert_eq!(requests[0]["payload"]["temperature"], 0.1);
+    assert!(
+        requests[0]["payload"]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Say 'OK' to confirm")
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_llm_test_reports_empty_provider_response_failure() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "id": "system-llm-empty",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "provider-chat-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": ""
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+    .await;
+    let catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/llm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert_eq!(payload["message"], "LLM connection failed: Empty response");
+    assert_eq!(payload["model"], "provider-chat-model");
+    assert_eq!(payload["error"], "Empty response from API");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_searxng_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_searxng_search_mock().await;
+    let catalog = search_test_catalog("searxng", "", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "local mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert!(
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("Mock Socartes Search")
+    );
+    assert!(
+        !payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("compatibility result")
+    );
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(payload["sources"][0]["title"], "Mock Socartes Search");
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/socartes"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock snippet from local SearXNG."
+    );
+    assert_eq!(payload["sources"][0]["source"], "mock-searxng");
+    assert_eq!(payload["metadata"]["provider"], "searxng");
+    assert_eq!(payload["metadata"]["requested_provider"], "searxng");
+    assert_eq!(payload["metadata"]["query"], "local mock query");
+    assert_eq!(payload["metadata"]["model"], "searxng");
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["q"], "local mock query");
+    assert_eq!(requests[0]["format"], "json");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_duckduckgo_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_duckduckgo_search_mock().await;
+    let catalog = search_test_catalog("duckduckgo", "", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "duckduckgo mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    let content = payload["content"].as_str().unwrap();
+    assert!(content.contains("Mock DuckDuckGo Socartes Result"));
+    assert!(!content.contains("compatibility"));
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(
+        payload["sources"][0]["title"],
+        "Mock DuckDuckGo Socartes Result"
+    );
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/duckduckgo-socartes"
+    );
+    assert_eq!(payload["sources"][0]["snippet"], "Mock DuckDuckGo snippet.");
+    assert_eq!(payload["sources"][0]["source"], "DuckDuckGo");
+    assert_eq!(payload["metadata"]["provider"], "duckduckgo");
+    assert_eq!(payload["metadata"]["requested_provider"], "duckduckgo");
+    assert_eq!(payload["metadata"]["query"], "duckduckgo mock query");
+    assert_eq!(payload["metadata"]["model"], "duckduckgo");
+    assert_eq!(payload["metadata"]["citation_count"], 2);
+    assert_eq!(payload["metadata"]["search_result_count"], 2);
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["finish_reason"],
+        "stop"
+    );
+    assert!(payload["metadata"]["provider_metadata"]["compatibility"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["query"]["q"], "duckduckgo mock query");
+    assert_eq!(requests[0]["query"]["max_results"], "5");
+    assert_eq!(
+        requests[0]["headers"]["accept"],
+        "text/html,application/xhtml+xml"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_brave_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_brave_search_mock().await;
+    let catalog = search_test_catalog("brave", "brave-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "brave mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert!(
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("Mock Brave Socartes Result")
+    );
+    assert!(
+        !payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("compatibility")
+    );
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(payload["sources"][0]["title"], "Mock Brave Socartes Result");
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/brave-socartes"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock snippet from local Brave provider."
+    );
+    assert_eq!(payload["sources"][0]["date"], "May 30, 2026");
+    assert_eq!(payload["sources"][0]["source"], "Brave");
+    assert_eq!(payload["metadata"]["provider"], "brave");
+    assert_eq!(payload["metadata"]["requested_provider"], "brave");
+    assert_eq!(payload["metadata"]["query"], "brave mock query");
+    assert_eq!(payload["metadata"]["model"], "brave-search");
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["uri"],
+        "/res/v1/web/search?q=brave+mock+query&count=5"
+    );
+    assert_eq!(requests[0]["query"]["q"], "brave mock query");
+    assert_eq!(requests[0]["query"]["count"], "5");
+    assert_eq!(requests[0]["headers"]["accept"], "application/json");
+    assert_eq!(
+        requests[0]["headers"]["x-subscription-token"],
+        "brave-test-key"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_tavily_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_tavily_search_mock().await;
+    let catalog = search_test_catalog("tavily", "tavily-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "tavily mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["content"],
+        "Mock Tavily answer from local provider."
+    );
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(
+        payload["sources"][0]["title"],
+        "Mock Tavily Socartes Result"
+    );
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/tavily-socartes"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock Tavily content snippet."
+    );
+    assert_eq!(payload["sources"][0]["source"], "mock-tavily-source");
+    assert_eq!(payload["sources"][0]["content"], "Mock Tavily raw content.");
+    assert_eq!(payload["metadata"]["provider"], "tavily");
+    assert_eq!(payload["metadata"]["requested_provider"], "tavily");
+    assert_eq!(payload["metadata"]["query"], "tavily mock query");
+    assert_eq!(payload["metadata"]["model"], "tavily-basic");
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["search_depth"],
+        "basic"
+    );
+    assert_eq!(payload["metadata"]["provider_metadata"]["topic"], "general");
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["images"][0],
+        "https://example.test/tavily-image.png"
+    );
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["response_time"],
+        0.42
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/search");
+    assert_eq!(requests[0]["payload"]["api_key"], "tavily-test-key");
+    assert_eq!(requests[0]["payload"]["query"], "tavily mock query");
+    assert_eq!(requests[0]["payload"]["search_depth"], "basic");
+    assert_eq!(requests[0]["payload"]["topic"], "general");
+    assert_eq!(requests[0]["payload"]["max_results"], 5);
+    assert_eq!(requests[0]["payload"]["include_answer"], true);
+    assert_eq!(requests[0]["payload"]["include_raw_content"], false);
+    assert_eq!(requests[0]["payload"]["include_images"], false);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_serper_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_serper_search_mock().await;
+    let catalog = search_test_catalog("serper", "serper-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "serper mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    let content = payload["content"].as_str().unwrap();
+    assert!(content.contains("Mock Serper answer box."));
+    assert!(content.contains("Mock Serper Socartes Result"));
+    assert!(content.contains("What is Socartes?"));
+    assert!(content.contains("socartes rust backend"));
+    assert!(!content.contains("compatibility"));
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(
+        payload["sources"][0]["title"],
+        "Mock Serper Socartes Result"
+    );
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/serper-socartes"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock Serper organic snippet."
+    );
+    assert_eq!(payload["sources"][0]["date"], "May 30, 2026");
+    assert_eq!(payload["sources"][0]["source"], "Example Test");
+    assert_eq!(
+        payload["sources"][0]["sitelinks"][0]["title"],
+        "Nested Serper Link"
+    );
+    assert_eq!(payload["sources"][0]["attributes"]["category"], "mock");
+    assert_eq!(payload["metadata"]["provider"], "serper");
+    assert_eq!(payload["metadata"]["requested_provider"], "serper");
+    assert_eq!(payload["metadata"]["query"], "serper mock query");
+    assert_eq!(payload["metadata"]["model"], "serper-search");
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+    assert_eq!(payload["metadata"]["provider_metadata"]["mode"], "search");
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["answerBox"]["answer"],
+        "Mock Serper answer box."
+    );
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["knowledgeGraph"]["description"],
+        "Mock Serper knowledge graph description."
+    );
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["peopleAlsoAsk"][0]["question"],
+        "What is Socartes?"
+    );
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["relatedSearches"][0]["query"],
+        "socartes rust backend"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/search");
+    assert_eq!(requests[0]["headers"]["x-api-key"], "serper-test-key");
+    assert_eq!(requests[0]["headers"]["content-type"], "application/json");
+    assert_eq!(requests[0]["payload"]["q"], "serper mock query");
+    assert_eq!(requests[0]["payload"]["num"], 5);
+    assert_eq!(requests[0]["payload"]["gl"], "us");
+    assert_eq!(requests[0]["payload"]["hl"], "en");
+    assert_eq!(requests[0]["payload"]["page"], 1);
+    assert_eq!(requests[0]["payload"]["autocorrect"], true);
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_perplexity_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_perplexity_search_mock().await;
+    let catalog = search_test_catalog("perplexity", "perplexity-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "perplexity mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(
+        payload["content"],
+        "Mock Perplexity answer grounded in web citations."
+    );
+    assert!(
+        !payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("compatibility")
+    );
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(
+        payload["sources"][0]["title"],
+        "Mock Perplexity Socartes Source"
+    );
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/perplexity-source"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock Perplexity search result snippet."
+    );
+    assert_eq!(payload["sources"][0]["date"], "");
+    assert_eq!(payload["sources"][0]["source"], "perplexity");
+    assert_eq!(payload["metadata"]["provider"], "perplexity");
+    assert_eq!(payload["metadata"]["requested_provider"], "perplexity");
+    assert_eq!(payload["metadata"]["query"], "perplexity mock query");
+    assert_eq!(payload["metadata"]["model"], "sonar");
+    assert_eq!(payload["metadata"]["citation_count"], 1);
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+    assert_eq!(payload["metadata"]["usage"]["prompt_tokens"], 11);
+    assert_eq!(payload["metadata"]["usage"]["completion_tokens"], 13);
+    assert_eq!(payload["metadata"]["usage"]["total_tokens"], 24);
+    assert_eq!(payload["metadata"]["usage"]["cost"]["total_cost"], 0.0012);
+    assert_eq!(
+        payload["metadata"]["provider_metadata"]["finish_reason"],
+        "stop"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/chat/completions");
+    assert_eq!(
+        requests[0]["headers"]["authorization"],
+        "Bearer perplexity-test-key"
+    );
+    assert_eq!(requests[0]["headers"]["content-type"], "application/json");
+    assert_eq!(requests[0]["payload"]["model"], "sonar");
+    assert_eq!(requests[0]["payload"]["messages"][0]["role"], "system");
+    assert!(
+        requests[0]["payload"]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Provide detailed and accurate answers")
+    );
+    assert_eq!(requests[0]["payload"]["messages"][1]["role"], "user");
+    assert_eq!(
+        requests[0]["payload"]["messages"][1]["content"],
+        "perplexity mock query"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn plugin_web_search_uses_configured_jina_provider_like_python() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_jina_search_mock().await;
+    let catalog = search_test_catalog("jina", "jina-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/tools/web_search/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"params": {"query": "jina mock query"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert!(
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("Mock Jina Socartes Result")
+    );
+    assert_eq!(payload["sources"][0]["type"], "web");
+    assert_eq!(payload["sources"][0]["title"], "Mock Jina Socartes Result");
+    assert_eq!(
+        payload["sources"][0]["url"],
+        "https://example.test/jina-socartes"
+    );
+    assert_eq!(
+        payload["sources"][0]["snippet"],
+        "Mock Jina description snippet."
+    );
+    assert_eq!(payload["sources"][0]["date"], "2026-05-30");
+    assert_eq!(
+        payload["sources"][0]["content"],
+        "Full content extracted by Jina."
+    );
+    assert_eq!(payload["metadata"]["provider"], "jina");
+    assert_eq!(payload["metadata"]["requested_provider"], "jina");
+    assert_eq!(payload["metadata"]["query"], "jina mock query");
+    assert_eq!(payload["metadata"]["model"], "jina-reader");
+    assert_eq!(payload["metadata"]["search_result_count"], 1);
+    assert_eq!(payload["metadata"]["usage"]["total_tokens"], 321);
+    assert_eq!(payload["metadata"]["provider_metadata"]["code"], 200);
+    assert_eq!(payload["metadata"]["provider_metadata"]["status"], 20000);
+    assert_eq!(
+        payload["sources"][0]["attributes"]["images"][0],
+        "https://example.test/jina-image.png"
+    );
+    assert_eq!(
+        payload["sources"][0]["attributes"]["publishedTime"],
+        "2026-05-30T12:00:00Z"
+    );
+    assert_eq!(
+        payload["sources"][0]["attributes"]["metadata"]["siteName"],
+        "Example Test"
+    );
+    assert_eq!(
+        payload["sources"][0]["attributes"]["external"]["source"],
+        "mock-jina"
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/jina%20mock%20query");
+    assert_eq!(requests[0]["headers"]["accept"], "application/json");
+    assert_eq!(
+        requests[0]["headers"]["authorization"],
+        "Bearer jina-test-key"
+    );
+    assert_eq!(requests[0]["headers"]["x-engine"], "direct");
+    assert_eq!(requests[0]["headers"]["x-timeout"], "60");
+    assert_eq!(requests[0]["headers"]["x-with-images-summary"], "true");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_reports_unsupported_provider_failure() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let catalog = search_test_catalog("openrouter", "", "");
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert_eq!(
+        payload["message"],
+        "Search provider `openrouter` is deprecated/unsupported."
+    );
+    assert_eq!(
+        payload["error"],
+        "Switch to brave/tavily/jina/searxng/duckduckgo/perplexity/serper"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_reports_missing_credentials_for_serper() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let catalog = search_test_catalog("serper", "", "");
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert_eq!(
+        payload["message"],
+        "Search provider `serper` missing credentials."
+    );
+    assert_eq!(payload["error"], "Set profile.api_key or SERPER_API_KEY");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_reports_missing_credentials_for_perplexity() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let catalog = search_test_catalog("perplexity", "", "");
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], false);
+    assert_eq!(
+        payload["message"],
+        "Search provider `perplexity` missing credentials."
+    );
+    assert_eq!(
+        payload["error"],
+        "Set profile.api_key or PERPLEXITY_API_KEY"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_falls_back_to_duckduckgo_when_brave_key_missing() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_duckduckgo_search_mock().await;
+    let catalog = search_test_catalog("brave", "", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "Search connection successful");
+    assert_eq!(payload["model"], "duckduckgo");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["query"]["q"], "Socartes health check");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_calls_duckduckgo_provider_successfully() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_duckduckgo_search_mock().await;
+    let catalog = search_test_catalog("duckduckgo", "", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "Search connection successful");
+    assert_eq!(payload["model"], "duckduckgo");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["query"]["q"], "Socartes health check");
+    assert_eq!(requests[0]["query"]["max_results"], "5");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_calls_tavily_provider_successfully() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_tavily_search_mock().await;
+    let catalog = search_test_catalog("tavily", "tavily-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "Search connection successful");
+    assert_eq!(payload["model"], "tavily");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/search");
+    assert_eq!(requests[0]["payload"]["api_key"], "tavily-test-key");
+    assert_eq!(requests[0]["payload"]["query"], "Socartes health check");
+    assert_eq!(requests[0]["payload"]["search_depth"], "basic");
+    assert_eq!(requests[0]["payload"]["topic"], "general");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_calls_serper_provider_successfully() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_serper_search_mock().await;
+    let catalog = search_test_catalog("serper", "serper-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "Search connection successful");
+    assert_eq!(payload["model"], "serper");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/search");
+    assert_eq!(requests[0]["headers"]["x-api-key"], "serper-test-key");
+    assert_eq!(requests[0]["payload"]["q"], "Socartes health check");
+    assert_eq!(requests[0]["payload"]["num"], 5);
+    assert_eq!(requests[0]["payload"]["gl"], "us");
+    assert_eq!(requests[0]["payload"]["hl"], "en");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn system_search_test_calls_perplexity_provider_successfully() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_perplexity_search_mock().await;
+    let catalog = search_test_catalog("perplexity", "perplexity-test-key", &base_url);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "catalog": catalog }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/test/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["message"], "Search connection successful");
+    assert_eq!(payload["model"], "perplexity");
+    assert!(payload["response_time_ms"].as_f64().unwrap() >= 0.0);
+    assert!(payload["error"].is_null());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/chat/completions");
+    assert_eq!(
+        requests[0]["headers"]["authorization"],
+        "Bearer perplexity-test-key"
+    );
+    assert_eq!(requests[0]["payload"]["model"], "sonar");
+    assert_eq!(
+        requests[0]["payload"]["messages"][1]["content"],
+        "Socartes health check"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_search_test_events_match_python_success_shape() {
+    let _env = SearchEnvGuard::clear().await;
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (base_url, requests, server) = spawn_duckduckgo_search_mock().await;
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/search/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalog": search_test_catalog("duckduckgo", "", &base_url)
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/search/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        events_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    assert_eq!(events.first().unwrap()["type"], "info");
+    assert_eq!(
+        events.first().unwrap()["message"],
+        "Preparing configuration snapshot."
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "info"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("Resolved search provider `duckduckgo`")
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "info"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("Running search query")
+    }));
+    let response = events
+        .iter()
+        .find(|event| event["type"] == "response")
+        .expect("response event");
+    assert_eq!(response["message"], "Search result received.");
+    assert!(
+        response["answer_preview"]
+            .as_str()
+            .unwrap()
+            .contains("Mock DuckDuckGo Socartes Result")
+    );
+    assert_eq!(response["citation_count"], 2);
+    assert_eq!(response["search_result_count"], 2);
+    assert_eq!(
+        events.last().expect("terminal event")["message"],
+        "SEARCH test completed successfully."
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["query"]["q"],
+        "Socartes configuration health check"
+    );
+    assert_eq!(requests[0]["query"]["max_results"], "5");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_search_start_accepts_empty_body_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/search/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert!(payload["run_id"].as_str().unwrap().starts_with("search-"));
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_test_unknown_service_emits_failed_event_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/speech/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run_id.starts_with("speech-"));
+
+    let events_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/speech/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        events_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    assert!(events.iter().any(|event| {
+        event["type"] == "info" && event["message"] == "Preparing configuration snapshot."
+    }));
+    let failed = events
+        .iter()
+        .find(|event| event["type"] == "failed")
+        .expect("failed event");
+    assert_eq!(failed["message"], "Unsupported service: speech");
+    assert!(
+        !events.iter().any(|event| event["type"] == "completed"),
+        "unsupported settings test service must not report completion: {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_tour_complete_restores_masked_catalog_secrets_and_redacts_env_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let mut catalog = llm_test_catalog("https://tour-llm.example/v1");
+    catalog["services"]["llm"]["profiles"][0]["api_key"] = json!("tour-llm-secret");
+    catalog["services"]["embedding"]["profiles"][0]["api_key"] = json!("tour-embedding-secret");
+    catalog["services"]["search"]["profiles"][0]["api_key"] = json!("tour-search-secret");
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    let masked_catalog = json_response(catalog_response).await["catalog"].clone();
+    assert_eq!(
+        masked_catalog["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+
+    let complete_masked_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tour/complete")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"catalog": masked_catalog, "test_results": {"llm": "ok"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete_masked_response.status(), http::StatusCode::OK);
+    let complete_masked_payload = json_response(complete_masked_response).await;
+    assert_eq!(
+        complete_masked_payload["env"]["SOCARTES_LLM_API_KEY"],
+        "********"
+    );
+    assert_eq!(
+        complete_masked_payload["env"]["SOCARTES_EMBEDDING_API_KEY"],
+        "********"
+    );
+    assert_eq!(
+        complete_masked_payload["env"]["SOCARTES_SEARCH_API_KEY"],
+        "********"
+    );
+    let persisted_after_masked =
+        fs::read_to_string(test_data_root(&root).join("settings/catalog.json"))
+            .expect("persisted catalog after masked tour complete");
+    assert!(persisted_after_masked.contains("tour-llm-secret"));
+    assert!(persisted_after_masked.contains("tour-embedding-secret"));
+    assert!(persisted_after_masked.contains("tour-search-secret"));
+    assert!(!persisted_after_masked.contains("\"api_key\": \"********\""));
+
+    let mut direct_catalog = llm_test_catalog("https://tour-direct.example/v1");
+    direct_catalog["services"]["llm"]["profiles"][0]["api_key"] = json!("tour-direct-llm-secret");
+    let complete_direct_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tour/complete")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": direct_catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete_direct_response.status(), http::StatusCode::OK);
+    let complete_direct_payload = json_response(complete_direct_response).await;
+    assert_eq!(
+        complete_direct_payload["env"]["SOCARTES_LLM_API_KEY"], "********",
+        "tour/complete must redact env secrets even when the submitted catalog contains raw keys"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn settings_test_start_restores_masked_catalog_secrets_before_provider_probe_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "id": "settings-masked-probe",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "provider-chat-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "OK - masked catalog secret was restored."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 7,
+            "total_tokens": 17
+        }
+    }))
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["api_key"] = json!("settings-start-real-key");
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), http::StatusCode::OK);
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    let masked_catalog = json_response(catalog_response).await["catalog"].clone();
+    assert_eq!(
+        masked_catalog["services"]["llm"]["profiles"][0]["api_key"],
+        "********"
+    );
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/llm/start")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": masked_catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let events_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/llm/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    assert_eq!(events.last().expect("terminal event")["type"], "completed");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["headers"]["authorization"],
+        "Bearer settings-start-real-key"
+    );
+
+    server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
@@ -8469,6 +27195,147 @@ async fn settings_embedding_test_events_report_empty_vector_failure() {
 }
 
 #[tokio::test]
+async fn settings_llm_test_events_hit_provider_and_persist_context_window() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, server) = spawn_embedding_request_recorder(json!({
+        "id": "settings-llm-probe",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "provider-chat-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "OK - provider-chat-model is responding."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 6,
+            "total_tokens": 17
+        }
+    }))
+    .await;
+    let mut catalog = llm_test_catalog(&format!("{llm_base_url}/v1"));
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["context_window"] = json!("");
+    catalog["services"]["llm"]["profiles"][0]["models"][0]["context_window_source"] = Value::Null;
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings/tests/llm/start")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"catalog": catalog}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_response.status(), http::StatusCode::OK);
+    let run_id = json_response(start_response).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(run_id.len(), "llm-".len() + 10);
+
+    let events_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/settings/tests/llm/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        events_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let events_body = text_response(events_response).await;
+    let events = parse_sse_data_events(&events_body);
+    assert!(events.iter().any(|event| event["type"] == "info"));
+    let response = events
+        .iter()
+        .find(|event| event["type"] == "response")
+        .expect("response event");
+    assert!(
+        response["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("provider-chat-model")
+    );
+    let context_window = events
+        .iter()
+        .find(|event| event["type"] == "context_window")
+        .expect("context_window event");
+    assert_eq!(context_window["context_window"], 8192);
+    assert_eq!(context_window["source"], "catalog_default");
+    assert!(
+        context_window["detected_at"]
+            .as_str()
+            .unwrap()
+            .contains('T')
+    );
+    let catalog_event = events
+        .iter()
+        .find(|event| event["type"] == "catalog")
+        .expect("catalog event");
+    let saved_model = &catalog_event["catalog"]["services"]["llm"]["profiles"][0]["models"][0];
+    assert_eq!(saved_model["context_window"], "8192");
+    assert_eq!(saved_model["context_window_source"], "catalog_default");
+    assert!(
+        saved_model["context_window_detected_at"]
+            .as_str()
+            .unwrap()
+            .contains('T')
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["message"],
+        "LLM test completed successfully."
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["uri"], "/v1/chat/completions");
+    assert_eq!(requests[0]["headers"]["authorization"], "Bearer llm-key");
+    assert_eq!(requests[0]["headers"]["x-socartes-test"], "llm-chat");
+    assert_eq!(requests[0]["payload"]["model"], "provider-chat-model");
+    assert_eq!(requests[0]["payload"]["stream"], false);
+    assert!(
+        requests[0]["payload"]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Say 'OK'")
+    );
+
+    let settings_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/settings/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let settings_catalog = json_response(settings_response).await["catalog"].clone();
+    assert_eq!(
+        settings_catalog["services"]["llm"]["profiles"][0]["models"][0]["context_window"],
+        "8192"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn legacy_settings_dashboard_agent_config_and_solve_routes_match_python_contracts() {
     let root = unique_test_knowledge_root();
     let session_root = test_data_root(&root).join("sessions");
@@ -8728,6 +27595,85 @@ async fn legacy_settings_dashboard_agent_config_and_solve_routes_match_python_co
     assert_eq!(
         json_response(missing_dashboard).await["detail"],
         "Entry not found"
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_chat_and_solve_delete_aliases_match_python_contract() {
+    let root = unique_test_knowledge_root();
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    for session_id in ["legacy-chat-delete", "legacy-solve-delete"] {
+        fs::write(
+            session_root.join(format!("{session_id}.json")),
+            json!({
+                "id": session_id,
+                "session_id": session_id,
+                "title": session_id,
+                "created_at": 10.0,
+                "updated_at": 20.0,
+                "status": "idle",
+                "messages": [],
+                "active_turns": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let app = app_with_knowledge_root(&root);
+
+    let chat_delete = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/chat/sessions/legacy-chat-delete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_delete.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(chat_delete).await,
+        json!({"status": "deleted", "session_id": "legacy-chat-delete"})
+    );
+    assert!(!session_root.join("legacy-chat-delete.json").exists());
+
+    let solve_delete = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/solve/sessions/legacy-solve-delete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(solve_delete.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(solve_delete).await,
+        json!({"status": "deleted", "session_id": "legacy-solve-delete"})
+    );
+    assert!(!session_root.join("legacy-solve-delete.json").exists());
+
+    let missing_delete = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/chat/sessions/missing-delete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_delete.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_response(missing_delete).await["detail"],
+        "Session not found"
     );
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
@@ -9110,6 +28056,253 @@ async fn vision_solve_websocket_streams_metadata_only_image_events() {
     assert_eq!(summary["analysis_mode"], "metadata_only");
     assert_eq!(summary["input_source"], "image_base64");
     assert_eq!(summary["mime_type"], "image/png");
+}
+
+#[tokio::test]
+async fn vision_analyze_and_solve_call_selected_llm_with_multimodal_image_context() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, rest_requests, rest_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "vision-bbox",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"elements":[{"type":"point","label":"A"}]}"#
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "vision-analysis",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"constraints":["A is the circle center"],"geometric_relations":[{"description":"radius AB"}],"image_is_reference":false}"#
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "vision-ggb",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"commands":[{"command":"A=(0,0)","description":"center"},{"command":"Circle(A,1)","description":"unit circle"}]}"#
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({
+            "id": "vision-reflection",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"issues_found":[],"final_commands":["A=(0,0)","Circle(A,1)"]}"#
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/vision/analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "question": "Restore the construction",
+                        "session_id": "vision-provider-rest",
+                        "image_base64": "data:image/png;base64,iVBORw0KGgo="
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["has_image"], true);
+    assert_eq!(payload["analysis_summary"]["analysis_mode"], "provider");
+    assert_eq!(payload["analysis_summary"]["elements_count"], 1);
+    assert_eq!(payload["analysis_summary"]["commands_count"], 2);
+    assert_eq!(
+        payload["final_ggb_commands"],
+        json!(["A=(0,0)", "Circle(A,1)"])
+    );
+    assert!(
+        payload["ggb_script"]
+            .as_str()
+            .is_some_and(|script| script.contains("Circle(A,1)"))
+    );
+
+    let recorded = rest_requests.lock().await.clone();
+    assert_eq!(recorded.len(), 4);
+    assert!(
+        recorded
+            .iter()
+            .all(|request| request["uri"] == "/v1/chat/completions")
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|request| request["payload"]["model"] == "provider-chat-model")
+    );
+    let user_content = recorded[0]["payload"]["messages"][1]["content"]
+        .as_array()
+        .expect("multimodal user content");
+    assert!(user_content.iter().any(|part| {
+        part["type"] == "image_url"
+            && part["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+    }));
+    rest_server.abort();
+
+    let (ws_llm_base_url, ws_requests, ws_llm_server) = spawn_sequential_request_recorder(vec![
+        json!({
+            "id": "vision-ws-bbox",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r#"{"elements":[{"type":"point","label":"A"}]}"#}, "finish_reason": "stop"}]
+        }),
+        json!({
+            "id": "vision-ws-analysis",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r#"{"constraints":["A is the circle center"],"geometric_relations":[{"description":"radius AB"}],"image_is_reference":false}"#}, "finish_reason": "stop"}]
+        }),
+        json!({
+            "id": "vision-ws-ggb",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r#"{"commands":[{"command":"A=(0,0)","description":"center"},{"command":"Circle(A,1)","description":"unit circle"}]}"#}, "finish_reason": "stop"}]
+        }),
+        json!({
+            "id": "vision-ws-reflection",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r#"{"issues_found":[],"final_commands":["A=(0,0)","Circle(A,1)"]}"#}, "finish_reason": "stop"}]
+        }),
+        json!({
+            "id": "vision-ws-tutor",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Use the restored circle commands to explain the construction."}, "finish_reason": "stop"}]
+        }),
+    ])
+    .await;
+    let ws_app = app_with_knowledge_root(&root);
+    let catalog_response = ws_app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{ws_llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/vision/solve"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "question": "Restore the construction",
+                "session_id": "vision-provider-ws",
+                "image_base64": "data:image/png;base64,iVBORw0KGgo="
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Some(message) = socket.next().await {
+        match message.unwrap() {
+            TungsteniteMessage::Text(text) => {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let event_type = event["type"].as_str().unwrap().to_string();
+                events.push(event);
+                if event_type == "done" {
+                    break;
+                }
+            }
+            TungsteniteMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    let types = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types,
+        [
+            "session",
+            "analysis_start",
+            "bbox_complete",
+            "analysis_complete",
+            "ggbscript_complete",
+            "reflection_complete",
+            "analysis_message_complete",
+            "answer_start",
+            "text",
+            "done"
+        ]
+    );
+    assert_eq!(events[2]["data"]["elements_count"], 1);
+    assert_eq!(events[4]["data"]["commands_count"], 2);
+    assert_eq!(
+        events[5]["data"]["final_commands"],
+        json!(["A=(0,0)", "Circle(A,1)"])
+    );
+    assert!(
+        events[6]["data"]["ggb_block"]["content"]
+            .as_str()
+            .is_some_and(|script| script.contains("Circle(A,1)"))
+    );
+    assert_eq!(
+        events[8]["data"]["content"],
+        "Use the restored circle commands to explain the construction."
+    );
+    assert_eq!(ws_requests.lock().await.len(), 5);
+
+    server.abort();
+    ws_llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
 
 #[tokio::test]

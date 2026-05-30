@@ -1,31 +1,41 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    convert::Infallible,
     env, fs,
     io::{Cursor, Read, Write},
-    path::{Path as FsPath, PathBuf},
+    path::{Component, Path as FsPath, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{
-        Multipart, Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        Extension, Multipart, Path, Query, Request, State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{StatusCode, header},
-    response::{Html, IntoResponse},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{SecondsFormat, Utc};
+use futures_util::{Stream, stream};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode as jwt_decode,
+    encode as jwt_encode,
+};
+use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 pub const VERSION: &str = "0.1.0";
 pub const PROJECT_GUTENBERG_HAUNTED_PAJAMAS_URL: &str =
@@ -44,6 +54,20 @@ const KNOWLEDGE_CHUNK_SIZE_WORDS: usize = 160;
 const KNOWLEDGE_CHUNK_OVERLAP_WORDS: usize = 30;
 const MAX_KNOWLEDGE_FILE_SIZE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_KNOWLEDGE_PDF_SIZE_BYTES: usize = 50 * 1024 * 1024;
+const KNOWLEDGE_TASK_BACKLOG_LIMIT: usize = 500;
+const KNOWLEDGE_TASK_SUBSCRIBER_LIMIT: usize = 200;
+const SUPPORTED_SEARCH_PROVIDERS: &[&str] = &[
+    "brave",
+    "tavily",
+    "jina",
+    "searxng",
+    "duckduckgo",
+    "perplexity",
+    "serper",
+];
+const DEPRECATED_SEARCH_PROVIDERS: &[&str] = &["exa", "baidu", "openrouter"];
+const LEGACY_DEEP_SOLVE_DEFAULT_TOOLS: &[&str] = &["rag", "web_search", "code_execution", "reason"];
+const LEGACY_DEEP_SOLVE_DEFAULT_KB: &str = "ai-textbook";
 const PARSER_KNOWLEDGE_EXTENSIONS: &[&str] = &[".pdf", ".docx", ".xlsx", ".pptx"];
 const SUPPORTED_KNOWLEDGE_EXTENSIONS: &[&str] = &[
     ".asciidoc",
@@ -165,6 +189,7 @@ const TUTORBOT_EDITABLE_FILES: &[&str] = &[
     "HEARTBEAT.md",
 ];
 const SECRET_MASK: &str = "***";
+const SETTINGS_SECRET_MASK: &str = "********";
 const INVALID_EMBEDDING_RESPONSE_DETAIL: &str =
     "Embedding response must contain one non-empty vector per input";
 
@@ -583,6 +608,7 @@ struct ValidationError {
 
 #[derive(Debug, Clone)]
 struct AppState {
+    data_root: Arc<PathBuf>,
     knowledge_root: Arc<PathBuf>,
     session_root: Arc<PathBuf>,
     book_root: Arc<PathBuf>,
@@ -595,12 +621,243 @@ struct AppState {
     memory_root: Arc<PathBuf>,
     skills_root: Arc<PathBuf>,
     co_writer_docs_root: Arc<PathBuf>,
+    auth_root: Arc<PathBuf>,
+    auth_enabled: bool,
+    auth_secret: Arc<String>,
+    auth_token_expire_hours: i64,
+    auth_cookie_secure: bool,
+    auth_env_username: Arc<String>,
+    auth_env_password_hash: Arc<String>,
+    auth_pocketbase_url: Arc<String>,
+    auth_pb_token_cache: Arc<std::sync::Mutex<HashMap<String, CachedPocketBaseToken>>>,
     chat_runtime: Arc<ChatRuntimeState>,
+    knowledge_tasks: Arc<KnowledgeTaskRuntimeState>,
+    tutorbot_runtime: Arc<TutorbotRuntimeState>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthRuntimeConfig {
+    enabled: bool,
+    secret: String,
+    token_expire_hours: i64,
+    cookie_secure: bool,
+    env_username: String,
+    env_password_hash: String,
+    pocketbase_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPocketBaseToken {
+    payload: AuthTokenPayload,
+    expires_at: Instant,
+}
+
+impl AuthRuntimeConfig {
+    fn from_env(data_root: &FsPath, auth_root: &FsPath) -> Self {
+        let enabled = env::var("AUTH_ENABLED")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let token_expire_hours = env::var("AUTH_TOKEN_EXPIRE_HOURS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|hours| *hours > 0)
+            .unwrap_or(24);
+        let cookie_secure = env::var("AUTH_COOKIE_SECURE")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let env_username = env::var("AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let env_password_hash = env::var("AUTH_PASSWORD_HASH").unwrap_or_default();
+        let pocketbase_url = env::var("POCKETBASE_URL")
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        let secret = if enabled && pocketbase_url.is_empty() {
+            env::var("AUTH_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| load_or_create_auth_secret(auth_root, data_root))
+        } else {
+            String::new()
+        };
+        Self {
+            enabled,
+            secret,
+            token_expire_hours,
+            cookie_secure,
+            env_username,
+            env_password_hash,
+            pocketbase_url,
+        }
+    }
+
+    fn test(enabled: bool) -> Self {
+        Self {
+            enabled,
+            secret: if enabled {
+                "socartes-test-auth-secret".to_string()
+            } else {
+                String::new()
+            },
+            token_expire_hours: 24,
+            cookie_secure: false,
+            env_username: "admin".to_string(),
+            env_password_hash: String::new(),
+            pocketbase_url: String::new(),
+        }
+    }
+
+    fn stored_auth(data_root: &FsPath, auth_root: &FsPath) -> Self {
+        Self {
+            enabled: true,
+            secret: load_or_create_auth_secret(auth_root, data_root),
+            token_expire_hours: 24,
+            cookie_secure: false,
+            env_username: "admin".to_string(),
+            env_password_hash: String::new(),
+            pocketbase_url: String::new(),
+        }
+    }
+
+    fn test_env_user(username: impl Into<String>, password_hash: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            secret: "socartes-test-auth-secret".to_string(),
+            token_expire_hours: 24,
+            cookie_secure: false,
+            env_username: username.into(),
+            env_password_hash: password_hash.into(),
+            pocketbase_url: String::new(),
+        }
+    }
+
+    fn test_pocketbase(pocketbase_url: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            secret: String::new(),
+            token_expire_hours: 24,
+            cookie_secure: false,
+            env_username: "admin".to_string(),
+            env_password_hash: String::new(),
+            pocketbase_url: pocketbase_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthClaims {
+    sub: String,
+    role: String,
+    uid: String,
+    exp: usize,
+    iat: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AuthTokenPayload {
+    username: String,
+    role: String,
+    user_id: String,
+}
+
+#[derive(Debug, Clone)]
+enum KnowledgeAccess {
+    Builtin,
+    Admin { name: String, assigned: bool },
+    User { name: String, user_id: String },
+}
+
+impl KnowledgeAccess {
+    fn id(&self) -> String {
+        match self {
+            Self::Builtin => format!("admin:kb:{BUILTIN_KNOWLEDGE_BASE}"),
+            Self::Admin { name, .. } => format!("admin:kb:{name}"),
+            Self::User { name, .. } => format!("user:kb:{name}"),
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            Self::Builtin | Self::Admin { .. } => "admin",
+            Self::User { .. } => "user",
+        }
+    }
+
+    fn assigned(&self) -> bool {
+        matches!(self, Self::Admin { assigned: true, .. })
+    }
+
+    fn read_only(&self) -> bool {
+        matches!(self, Self::Builtin | Self::Admin { assigned: true, .. })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthUserRecord {
+    id: String,
+    hash: String,
+    role: String,
+    created_at: String,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthCredentials {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MultiUserSpaceAssignPayload {
+    source: String,
+    target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetAuthRoleRequest {
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnifiedWsAuthQuery {
+    token: Option<String>,
 }
 
 #[derive(Debug)]
 struct ChatRuntimeState {
     turns: Mutex<HashMap<String, LiveChatTurn>>,
+}
+
+#[derive(Debug)]
+struct KnowledgeTaskRuntimeState {
+    tasks: Mutex<HashMap<String, KnowledgeTaskRecord>>,
+}
+
+#[derive(Debug, Clone)]
+struct KnowledgeTaskRecord {
+    events: VecDeque<KnowledgeTaskEvent>,
+    subscribers: Vec<mpsc::Sender<KnowledgeTaskEvent>>,
+}
+
+impl KnowledgeTaskRecord {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(KNOWLEDGE_TASK_BACKLOG_LIMIT),
+            subscribers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KnowledgeTaskEvent {
+    event: String,
+    payload: Value,
+}
+
+#[derive(Debug)]
+struct TutorbotRuntimeState {
+    notifications: Mutex<HashMap<String, broadcast::Sender<Value>>>,
+    btw_tasks: Mutex<HashMap<String, HashMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +866,18 @@ struct LiveChatTurn {
     cancel_requested: Arc<AtomicBool>,
     events: Arc<Mutex<Vec<Value>>>,
     sender: broadcast::Sender<Value>,
+}
+
+impl LiveChatTurn {
+    fn placeholder() -> Self {
+        let (sender, _) = broadcast::channel(1);
+        Self {
+            session_id: String::new(),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            sender,
+        }
+    }
 }
 
 impl ChatRuntimeState {
@@ -645,13 +914,320 @@ impl ChatRuntimeState {
     }
 }
 
+impl KnowledgeTaskRuntimeState {
+    async fn ensure_task(&self, task_id: &str) {
+        self.tasks
+            .lock()
+            .await
+            .entry(task_id.to_string())
+            .or_insert_with(KnowledgeTaskRecord::new);
+    }
+
+    async fn record_completed(
+        &self,
+        task_id: &str,
+        _task_type: &str,
+        message: String,
+        progress: Value,
+    ) {
+        self.emit(
+            task_id,
+            "process_log",
+            json!({
+                "type": "process_log",
+                "level": "INFO",
+                "message": message,
+                "logger": "socartes.knowledge.task",
+                "timestamp": now_seconds(),
+                "context": {
+                    "task_id": task_id,
+                    "capability": "knowledge",
+                    "sink": "ui"
+                }
+            }),
+        )
+        .await;
+        self.emit(task_id, "progress", progress).await;
+        self.emit_complete(task_id, &message).await;
+    }
+
+    async fn record_started(&self, task_id: &str, message: String, progress: Value) {
+        self.emit(
+            task_id,
+            "process_log",
+            json!({
+                "type": "process_log",
+                "level": "INFO",
+                "message": message,
+                "logger": "socartes.knowledge.task",
+                "timestamp": now_seconds(),
+                "context": {
+                    "task_id": task_id,
+                    "capability": "knowledge",
+                    "sink": "ui"
+                }
+            }),
+        )
+        .await;
+        self.emit(task_id, "progress", progress).await;
+    }
+
+    async fn record_completed_terminal_only(&self, task_id: &str, message: String) {
+        self.emit(
+            task_id,
+            "process_log",
+            json!({
+                "type": "process_log",
+                "level": "INFO",
+                "message": message,
+                "logger": "socartes.knowledge.task",
+                "timestamp": now_seconds(),
+                "context": {
+                    "task_id": task_id,
+                    "capability": "knowledge",
+                    "sink": "ui"
+                }
+            }),
+        )
+        .await;
+        self.emit_complete(task_id, &message).await;
+    }
+
+    async fn emit(&self, task_id: &str, event: &str, payload: Value) {
+        let task_event = KnowledgeTaskEvent {
+            event: event.to_string(),
+            payload,
+        };
+        let mut tasks = self.tasks.lock().await;
+        let record = tasks
+            .entry(task_id.to_string())
+            .or_insert_with(KnowledgeTaskRecord::new);
+        if record.events.len() == KNOWLEDGE_TASK_BACKLOG_LIMIT {
+            record.events.pop_front();
+        }
+        record.events.push_back(task_event.clone());
+        record.subscribers.retain(|subscriber| {
+            if subscriber.is_closed() {
+                return false;
+            }
+            match subscriber.try_send(task_event.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+    }
+
+    async fn emit_complete(&self, task_id: &str, detail: &str) {
+        self.emit(
+            task_id,
+            "complete",
+            json!({
+                "detail": detail,
+                "task_id": task_id
+            }),
+        )
+        .await;
+    }
+
+    async fn record_failed_with_detail(
+        &self,
+        task_id: &str,
+        log_message: String,
+        failed_detail: String,
+        progress: Value,
+        details: Option<String>,
+    ) {
+        self.emit(
+            task_id,
+            "process_log",
+            json!({
+                "type": "process_log",
+                "level": "ERROR",
+                "message": log_message,
+                "logger": "socartes.knowledge.task",
+                "timestamp": now_seconds(),
+                "context": {
+                    "task_id": task_id,
+                    "capability": "knowledge",
+                    "sink": "ui"
+                }
+            }),
+        )
+        .await;
+        if let Some(trace) = details.as_ref().filter(|value| !value.is_empty()) {
+            self.emit(
+                task_id,
+                "process_log",
+                json!({
+                    "type": "process_log",
+                    "level": "ERROR",
+                    "message": format!("Stack trace:\n{trace}"),
+                    "logger": "socartes.knowledge.task",
+                    "timestamp": now_seconds(),
+                    "context": {
+                        "task_id": task_id,
+                        "capability": "knowledge",
+                        "sink": "ui"
+                    }
+                }),
+            )
+            .await;
+        }
+        self.emit(task_id, "progress", progress).await;
+        self.emit_failed(task_id, &failed_detail, details).await;
+    }
+
+    async fn emit_failed(&self, task_id: &str, detail: &str, details: Option<String>) {
+        let mut payload = json!({
+            "detail": detail,
+            "task_id": task_id
+        });
+        if let Some(details) = details.filter(|value| !value.is_empty()) {
+            payload["details"] = json!(details);
+        }
+        self.emit(task_id, "failed", payload).await;
+    }
+
+    async fn subscribe(
+        &self,
+        task_id: &str,
+    ) -> (Vec<KnowledgeTaskEvent>, mpsc::Receiver<KnowledgeTaskEvent>) {
+        let (sender, receiver) = mpsc::channel(KNOWLEDGE_TASK_SUBSCRIBER_LIMIT);
+        let mut tasks = self.tasks.lock().await;
+        let record = tasks
+            .entry(task_id.to_string())
+            .or_insert_with(KnowledgeTaskRecord::new);
+        record
+            .subscribers
+            .retain(|subscriber| !subscriber.is_closed());
+        record.subscribers.push(sender);
+        (record.events.iter().cloned().collect(), receiver)
+    }
+
+    async fn sse_stream(
+        &self,
+        task_id: &str,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> {
+        self.ensure_task(task_id).await;
+        let (backlog, receiver) = self.subscribe(task_id).await;
+        Box::pin(stream::unfold(
+            KnowledgeTaskStreamState {
+                backlog,
+                backlog_index: 0,
+                receiver,
+                finished: false,
+            },
+            |mut state| async move {
+                if state.finished {
+                    return None;
+                }
+                if state.backlog_index < state.backlog.len() {
+                    let event = state.backlog[state.backlog_index].clone();
+                    state.backlog_index += 1;
+                    state.finished = event.is_terminal();
+                    return Some((Ok(Bytes::from(event.sse_frame())), state));
+                }
+                match state.receiver.recv().await {
+                    Some(event) => {
+                        state.finished = event.is_terminal();
+                        Some((Ok(Bytes::from(event.sse_frame())), state))
+                    }
+                    None => None,
+                }
+            },
+        ))
+    }
+}
+
+struct KnowledgeTaskStreamState {
+    backlog: Vec<KnowledgeTaskEvent>,
+    backlog_index: usize,
+    receiver: mpsc::Receiver<KnowledgeTaskEvent>,
+    finished: bool,
+}
+
+impl KnowledgeTaskEvent {
+    fn sse_frame(&self) -> String {
+        sse(&self.event, self.payload.clone())
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self.event.as_str(), "complete" | "failed")
+    }
+}
+
+impl TutorbotRuntimeState {
+    async fn register_btw_task(&self, bot_id: &str, task_id: &str) -> Arc<AtomicBool> {
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        self.btw_tasks
+            .lock()
+            .await
+            .entry(bot_id.to_string())
+            .or_default()
+            .insert(task_id.to_string(), cancel_requested.clone());
+        cancel_requested
+    }
+
+    async fn cancel_btw_tasks(&self, bot_id: &str) -> usize {
+        let tasks = self.btw_tasks.lock().await.remove(bot_id);
+        let Some(tasks) = tasks else {
+            return 0;
+        };
+        let count = tasks.len();
+        for cancel_requested in tasks.into_values() {
+            cancel_requested.store(true, Ordering::SeqCst);
+        }
+        count
+    }
+
+    async fn finish_btw_task(&self, bot_id: &str, task_id: &str) {
+        let mut tasks_by_bot = self.btw_tasks.lock().await;
+        let Some(tasks) = tasks_by_bot.get_mut(bot_id) else {
+            return;
+        };
+        tasks.remove(task_id);
+        if tasks.is_empty() {
+            tasks_by_bot.remove(bot_id);
+        }
+    }
+
+    async fn subscribe(&self, bot_id: &str) -> broadcast::Receiver<Value> {
+        let mut notifications = self.notifications.lock().await;
+        notifications
+            .entry(bot_id.to_string())
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(64);
+                sender
+            })
+            .subscribe()
+    }
+
+    async fn publish(&self, bot_id: &str, event: Value) {
+        let sender = {
+            let mut notifications = self.notifications.lock().await;
+            notifications
+                .entry(bot_id.to_string())
+                .or_insert_with(|| {
+                    let (sender, _) = broadcast::channel(64);
+                    sender
+                })
+                .clone()
+        };
+        let _ = sender.send(event);
+    }
+}
+
 impl AppState {
-    fn new(knowledge_root: PathBuf) -> Self {
+    fn new(knowledge_root: PathBuf, auth_config: AuthRuntimeConfig) -> Self {
         let data_root = knowledge_root
             .parent()
             .unwrap_or_else(|| FsPath::new("."))
             .to_path_buf();
         let user_data_root = data_root.join("user");
+        let auth_root = env::var_os("SOCARTES_AUTH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_auth_root_for_data_root(&data_root));
         let session_root = env::var_os("SOCARTES_SESSION_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("sessions"));
@@ -697,6 +1273,7 @@ impl AppState {
                     .join("documents")
             });
         Self {
+            data_root: Arc::new(data_root),
             knowledge_root: Arc::new(knowledge_root),
             session_root: Arc::new(session_root),
             book_root: Arc::new(book_root),
@@ -709,8 +1286,24 @@ impl AppState {
             memory_root: Arc::new(memory_root),
             skills_root: Arc::new(skills_root),
             co_writer_docs_root: Arc::new(co_writer_docs_root),
+            auth_root: Arc::new(auth_root),
+            auth_enabled: auth_config.enabled,
+            auth_secret: Arc::new(auth_config.secret),
+            auth_token_expire_hours: auth_config.token_expire_hours,
+            auth_cookie_secure: auth_config.cookie_secure,
+            auth_env_username: Arc::new(auth_config.env_username),
+            auth_env_password_hash: Arc::new(auth_config.env_password_hash),
+            auth_pocketbase_url: Arc::new(auth_config.pocketbase_url),
+            auth_pb_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chat_runtime: Arc::new(ChatRuntimeState {
                 turns: Mutex::new(HashMap::new()),
+            }),
+            knowledge_tasks: Arc::new(KnowledgeTaskRuntimeState {
+                tasks: Mutex::new(HashMap::new()),
+            }),
+            tutorbot_runtime: Arc::new(TutorbotRuntimeState {
+                notifications: Mutex::new(HashMap::new()),
+                btw_tasks: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -721,13 +1314,67 @@ pub fn app() -> Router {
 }
 
 pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
-    let state = AppState::new(path.into());
+    let knowledge_root = path.into();
+    let data_root = knowledge_root
+        .parent()
+        .unwrap_or_else(|| FsPath::new("."))
+        .to_path_buf();
+    let auth_root = env::var_os("SOCARTES_AUTH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_auth_root_for_data_root(&data_root));
+    let state = AppState::new(
+        knowledge_root,
+        AuthRuntimeConfig::from_env(&data_root, &auth_root),
+    );
+    router_with_state(state)
+}
+
+pub fn app_with_knowledge_root_and_auth(path: impl Into<PathBuf>, auth_enabled: bool) -> Router {
+    let state = AppState::new(path.into(), AuthRuntimeConfig::test(auth_enabled));
+    router_with_state(state)
+}
+
+pub fn app_with_knowledge_root_and_stored_auth(path: impl Into<PathBuf>) -> Router {
+    let knowledge_root = path.into();
+    let data_root = knowledge_root
+        .parent()
+        .unwrap_or_else(|| FsPath::new("."))
+        .to_path_buf();
+    let auth_root = env::var_os("SOCARTES_AUTH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_auth_root_for_data_root(&data_root));
+    let state = AppState::new(
+        knowledge_root,
+        AuthRuntimeConfig::stored_auth(&data_root, &auth_root),
+    );
+    router_with_state(state)
+}
+
+pub fn app_with_knowledge_root_and_auth_env_user(
+    path: impl Into<PathBuf>,
+    username: impl Into<String>,
+    password_hash: impl Into<String>,
+) -> Router {
+    let state = AppState::new(
+        path.into(),
+        AuthRuntimeConfig::test_env_user(username, password_hash),
+    );
+    router_with_state(state)
+}
+
+pub fn app_with_knowledge_root_and_pocketbase_auth(
+    path: impl Into<PathBuf>,
+    pocketbase_url: impl Into<String>,
+) -> Router {
+    let state = AppState::new(
+        path.into(),
+        AuthRuntimeConfig::test_pocketbase(pocketbase_url),
+    );
+    router_with_state(state)
+}
+
+fn router_with_state(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/openapi.json", get(openapi_json))
-        .route("/docs", get(swagger_docs))
-        .route("/docs/oauth2-redirect", get(swagger_oauth2_redirect))
-        .route("/redoc", get(redoc_docs))
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/knowledge/health", get(knowledge_health))
         .route("/api/v1/knowledge/configs", get(get_knowledge_configs))
@@ -756,6 +1403,12 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             get(get_knowledge_config).put(update_knowledge_config),
         )
         .route("/api/v1/knowledge/{name}/files", get(list_knowledge_files))
+        .route("/api/v1/auth/users", get(auth_users).post(auth_create_user))
+        .route("/api/v1/auth/users/{username}", delete(auth_delete_user))
+        .route(
+            "/api/v1/auth/users/{username}/role",
+            put(auth_update_user_role),
+        )
         .route(
             "/api/v1/knowledge/{name}/files/{*file_path}",
             get(read_knowledge_file),
@@ -792,7 +1445,160 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             "/api/v1/knowledge/{name}/reindex",
             post(reindex_knowledge_base),
         )
-        .route("/api/v1/knowledge/{name}", delete(delete_knowledge_base))
+        .route(
+            "/api/v1/knowledge/{name}",
+            get(get_knowledge_base_detail).delete(delete_knowledge_base),
+        )
+        // Legacy course aliases for frontends that predate the knowledge route names.
+        .route(
+            "/api/v1/courses",
+            get(course_knowledge_list).post(create_knowledge_base),
+        )
+        .route(
+            "/api/v1/courses/",
+            get(course_knowledge_list).post(create_knowledge_base),
+        )
+        .route("/api/v1/courses/list", get(course_knowledge_list))
+        .route("/api/v1/courses/health", get(knowledge_health))
+        .route("/api/v1/courses/configs", get(get_knowledge_configs))
+        .route("/api/v1/courses/configs/sync", post(sync_knowledge_configs))
+        .route("/api/v1/courses/default", get(get_default_knowledge_base))
+        .route("/api/v1/courses/rag-providers", get(rag_providers))
+        .route(
+            "/api/v1/courses/supported-file-types",
+            get(supported_file_types),
+        )
+        .route("/api/v1/courses/create", post(create_knowledge_base))
+        .route(
+            "/api/v1/courses/default/{name}",
+            put(set_default_knowledge_base),
+        )
+        .route(
+            "/api/v1/courses/tasks/{task_id}/stream",
+            get(knowledge_task_stream),
+        )
+        .route(
+            "/api/v1/courses/{name}/config",
+            get(get_knowledge_config).put(update_knowledge_config),
+        )
+        .route("/api/v1/courses/{name}/files", get(list_knowledge_files))
+        .route(
+            "/api/v1/courses/{name}/files/{*file_path}",
+            get(read_knowledge_file),
+        )
+        .route(
+            "/api/v1/courses/{name}/progress",
+            get(get_knowledge_progress),
+        )
+        .route(
+            "/api/v1/courses/{name}/progress/ws",
+            get(knowledge_progress_ws),
+        )
+        .route(
+            "/api/v1/courses/{name}/progress/clear",
+            post(clear_knowledge_progress),
+        )
+        .route(
+            "/api/v1/courses/{name}/link-folder",
+            post(link_knowledge_folder),
+        )
+        .route(
+            "/api/v1/courses/{name}/linked-folders",
+            get(list_linked_knowledge_folders),
+        )
+        .route(
+            "/api/v1/courses/{name}/linked-folders/{folder_id}",
+            delete(unlink_knowledge_folder),
+        )
+        .route(
+            "/api/v1/courses/{name}/sync-folder/{folder_id}",
+            post(sync_knowledge_folder),
+        )
+        .route(
+            "/api/v1/courses/{name}/upload",
+            post(upload_knowledge_files),
+        )
+        .route(
+            "/api/v1/courses/{name}/reindex",
+            post(reindex_knowledge_base),
+        )
+        .route(
+            "/api/v1/courses/{name}",
+            get(get_knowledge_base_detail).delete(delete_knowledge_base),
+        )
+        .route(
+            "/api/v1/course",
+            get(course_knowledge_list).post(create_knowledge_base),
+        )
+        .route(
+            "/api/v1/course/",
+            get(course_knowledge_list).post(create_knowledge_base),
+        )
+        .route("/api/v1/course/list", get(course_knowledge_list))
+        .route("/api/v1/course/health", get(knowledge_health))
+        .route("/api/v1/course/configs", get(get_knowledge_configs))
+        .route("/api/v1/course/configs/sync", post(sync_knowledge_configs))
+        .route("/api/v1/course/default", get(get_default_knowledge_base))
+        .route("/api/v1/course/rag-providers", get(rag_providers))
+        .route(
+            "/api/v1/course/supported-file-types",
+            get(supported_file_types),
+        )
+        .route("/api/v1/course/create", post(create_knowledge_base))
+        .route(
+            "/api/v1/course/default/{name}",
+            put(set_default_knowledge_base),
+        )
+        .route(
+            "/api/v1/course/tasks/{task_id}/stream",
+            get(knowledge_task_stream),
+        )
+        .route(
+            "/api/v1/course/{name}/config",
+            get(get_knowledge_config).put(update_knowledge_config),
+        )
+        .route("/api/v1/course/{name}/files", get(list_knowledge_files))
+        .route(
+            "/api/v1/course/{name}/files/{*file_path}",
+            get(read_knowledge_file),
+        )
+        .route(
+            "/api/v1/course/{name}/progress",
+            get(get_knowledge_progress),
+        )
+        .route(
+            "/api/v1/course/{name}/progress/ws",
+            get(knowledge_progress_ws),
+        )
+        .route(
+            "/api/v1/course/{name}/progress/clear",
+            post(clear_knowledge_progress),
+        )
+        .route(
+            "/api/v1/course/{name}/link-folder",
+            post(link_knowledge_folder),
+        )
+        .route(
+            "/api/v1/course/{name}/linked-folders",
+            get(list_linked_knowledge_folders),
+        )
+        .route(
+            "/api/v1/course/{name}/linked-folders/{folder_id}",
+            delete(unlink_knowledge_folder),
+        )
+        .route(
+            "/api/v1/course/{name}/sync-folder/{folder_id}",
+            post(sync_knowledge_folder),
+        )
+        .route("/api/v1/course/{name}/upload", post(upload_knowledge_files))
+        .route(
+            "/api/v1/course/{name}/reindex",
+            post(reindex_knowledge_base),
+        )
+        .route(
+            "/api/v1/course/{name}",
+            get(get_knowledge_base_detail).delete(delete_knowledge_base),
+        )
         .route("/api/v1/settings", get(get_settings))
         .route(
             "/api/v1/settings/catalog",
@@ -832,6 +1638,20 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(cancel_settings_test),
         )
         .route("/api/v1/settings/llm-options", get(llm_options))
+        .route("/api/v1/multi-user/me/access", get(multi_user_my_access))
+        .route(
+            "/api/v1/multi-user/admin/resources",
+            get(multi_user_admin_resources),
+        )
+        .route("/api/v1/multi-user/users", get(multi_user_list_users))
+        .route(
+            "/api/v1/multi-user/users/{user_id}/grants",
+            get(multi_user_get_user_grants).put(multi_user_put_user_grants),
+        )
+        .route(
+            "/api/v1/multi-user/users/{user_id}/spaces/assign",
+            post(multi_user_assign_space_template),
+        )
         .route("/api/v1/system/status", get(system_status))
         .route(
             "/api/v1/system/runtime-topology",
@@ -844,7 +1664,6 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         )
         .route("/api/v1/system/test/search", post(system_test_search))
         .route("/api/v1/vision/analyze", post(vision_analyze))
-        .route("/api/v1/vision/solve", get(vision_solve_ws))
         .route("/api/v1/dashboard/recent", get(dashboard_recent))
         .route("/api/v1/dashboard/{entry_id}", get(dashboard_entry))
         .route("/api/v1/agent-config/agents", get(agent_config_agents))
@@ -855,7 +1674,7 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
         .route("/api/v1/solve/sessions", get(list_solve_sessions))
         .route(
             "/api/v1/solve/sessions/{session_id}",
-            get(get_solve_session),
+            get(get_solve_session).delete(delete_legacy_session),
         )
         .route("/api/v1/tutorbot", get(list_tutorbots).post(start_tutorbot))
         .route("/api/v1/tutorbot/recent", get(recent_tutorbots))
@@ -889,7 +1708,6 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             get(read_tutorbot_file).put(write_tutorbot_file),
         )
         .route("/api/v1/tutorbot/{bot_id}/history", get(tutorbot_history))
-        .route("/api/v1/tutorbot/{bot_id}/ws", get(tutorbot_ws))
         .route("/api/v1/notebook/list", get(list_notebooks_endpoint))
         .route("/api/v1/notebook/statistics", get(notebook_statistics))
         .route("/api/v1/notebook/create", post(create_notebook_endpoint))
@@ -982,7 +1800,10 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             post(record_quiz_results),
         )
         .route("/api/v1/chat/sessions", get(list_sessions))
-        .route("/api/v1/chat/sessions/{session_id}", get(get_session))
+        .route(
+            "/api/v1/chat/sessions/{session_id}",
+            get(get_session).delete(delete_legacy_session),
+        )
         .route("/api/v1/memory", get(get_memory).put(update_memory))
         .route("/api/v1/memory/refresh", post(refresh_memory))
         .route("/api/v1/memory/clear", post(clear_memory))
@@ -1016,7 +1837,6 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             get(get_skill).put(update_skill).delete(delete_skill),
         )
         .route("/api/v1/internal/test-chat-turn", post(run_test_chat_turn))
-        .route("/api/v1/ws", get(chat_ws))
         .route("/api/v1/book/health", get(book_service_health))
         .route("/api/v1/book/books", get(list_books).post(create_book))
         .route(
@@ -1061,15 +1881,63 @@ pub fn app_with_knowledge_root(path: impl Into<PathBuf>) -> Router {
             "/api/v1/book/books/{book_id}/refresh-fingerprints",
             post(refresh_book_fingerprints),
         )
-        .route("/api/v1/book/ws", get(book_ws))
-        .route("/api/outputs/{*file_path}", get(read_output_file))
         .route(
             "/api/attachments/{session_id}/{attachment_id}/{*filename}",
             get(read_attachment_file),
         )
         .route("/api/v1/learn", post(learn))
         .route("/api/v1/story-rag/ask", post(ask_story_rag))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_guard_middleware,
+        ))
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(swagger_docs))
+        .route("/docs/oauth2-redirect", get(swagger_oauth2_redirect))
+        .route("/redoc", get(redoc_docs))
+        .route("/api/v1/auth/status", get(auth_status))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
+        .route("/api/v1/auth/register", post(auth_register))
+        .route("/api/v1/auth/is_first_user", get(auth_is_first_user))
+        .route(
+            "/api/v1/knowledge/{name}/progress/ws",
+            get(knowledge_progress_ws),
+        )
+        .route("/api/v1/vision/solve", get(vision_solve_ws))
+        .route("/api/v1/tutorbot/{bot_id}/ws", get(tutorbot_ws))
+        .route("/api/v1/question/generate", get(question_generate_ws))
+        .route("/api/v1/question/mimic", get(question_mimic_ws))
+        .route("/api/v1/chat", get(legacy_chat_ws))
+        .route("/api/v1/solve", get(legacy_solve_ws))
+        .route("/api/v1/ws", get(chat_ws))
+        .route("/api/v1/book/ws", get(book_ws))
+        .route("/api/outputs/{*file_path}", get(read_output_file))
         .with_state(state)
+}
+
+async fn auth_guard_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match require_auth_async(&state, &headers).await {
+        Ok(payload) => {
+            request.extensions_mut().insert(payload);
+            next.run(request).await
+        }
+        Err(response) => *response,
+    }
+}
+
+fn require_ws_auth_response(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthTokenPayload, Box<Response>> {
+    require_auth(state, headers)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1078,6 +1946,10 @@ async fn health() -> Json<HealthResponse> {
         service: "socartes-backend",
         version: VERSION,
     })
+}
+
+async fn root() -> Json<Value> {
+    Json(json!({ "message": "Welcome to Socartes API" }))
 }
 
 async fn agents() -> Json<AgentsResponse> {
@@ -1110,10 +1982,969 @@ async fn ask_story_rag(Json(request): Json<StoryQuestion>) -> Json<StoryAnswer> 
     Json(haunted_pajamas_index().ask(&request.question))
 }
 
-async fn knowledge_list(State(state): State<AppState>) -> Json<Value> {
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    if !state.auth_enabled {
+        return Json(json!({
+            "enabled": false,
+            "authenticated": true,
+            "user_id": "local-admin",
+            "username": "local",
+            "role": "admin",
+            "is_admin": true
+        }));
+    }
+
+    let payload = match extract_auth_token(&headers) {
+        Some(token) => validate_auth_token(&state, &token).await,
+        None => None,
+    };
     Json(json!({
-        "knowledge_bases": knowledge_base_summaries(&state)
+        "enabled": true,
+        "authenticated": payload.is_some(),
+        "user_id": payload.as_ref().map(|payload| payload.user_id.clone()),
+        "username": payload.as_ref().map(|payload| payload.username.clone()),
+        "role": payload.as_ref().map(|payload| payload.role.clone()),
+        "is_admin": payload
+            .as_ref()
+            .is_some_and(|payload| payload.role == "admin")
     }))
+}
+
+async fn auth_login(State(state): State<AppState>, Json(body): Json<AuthCredentials>) -> Response {
+    if !state.auth_enabled {
+        return Json(json!({
+            "ok": true,
+            "message": "Auth is disabled — no login required."
+        }))
+        .into_response();
+    }
+
+    if auth_pocketbase_enabled(&state) {
+        let Some((payload, token)) =
+            authenticate_pocketbase_user(&state, &body.username, &body.password).await
+        else {
+            return api_error(StatusCode::UNAUTHORIZED, "Incorrect email or password")
+                .into_response();
+        };
+        return (
+            [(header::SET_COOKIE, login_cookie(&state, &token))],
+            Json(json!({
+                "ok": true,
+                "user_id": payload.user_id,
+                "username": payload.username,
+                "role": payload.role,
+                "is_admin": payload.role == "admin"
+            })),
+        )
+            .into_response();
+    }
+
+    let Ok(users) = load_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    let Some(record) = users.get(&body.username) else {
+        return api_error(StatusCode::UNAUTHORIZED, "Incorrect username or password")
+            .into_response();
+    };
+    let verified = bcrypt::verify(&body.password, &record.hash).unwrap_or(false);
+    if !verified {
+        return api_error(StatusCode::UNAUTHORIZED, "Incorrect username or password")
+            .into_response();
+    }
+
+    let payload = AuthTokenPayload {
+        username: body.username,
+        role: record.role.clone(),
+        user_id: record.id.clone(),
+    };
+    let Ok(token) = create_auth_token(&state, &payload) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create auth token",
+        )
+        .into_response();
+    };
+    (
+        [(header::SET_COOKIE, login_cookie(&state, &token))],
+        Json(json!({
+            "ok": true,
+            "user_id": payload.user_id,
+            "username": payload.username,
+            "role": payload.role,
+            "is_admin": payload.role == "admin"
+        })),
+    )
+        .into_response()
+}
+
+async fn auth_logout() -> impl IntoResponse {
+    (
+        [(
+            header::SET_COOKIE,
+            "dt_token=; Max-Age=0; Path=/; SameSite=Lax; HttpOnly",
+        )],
+        Json(json!({ "ok": true })),
+    )
+}
+
+async fn auth_register(
+    State(state): State<AppState>,
+    Json(body): Json<AuthCredentials>,
+) -> Response {
+    if !state.auth_enabled {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Auth is disabled — registration is not available.",
+        )
+        .into_response();
+    }
+    if auth_pocketbase_enabled(&state) {
+        let Ok(users) = load_auth_users(&state) else {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+                .into_response();
+        };
+        if !users.is_empty() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "Self-registration is closed. Ask an administrator to create your account.",
+            )
+            .into_response();
+        }
+        let Some(created) = register_pocketbase_user(&state, &body.username, &body.password).await
+        else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Registration failed — username or email may already be taken.",
+            )
+            .into_response();
+        };
+        return (
+            StatusCode::CREATED,
+            Json(json!({
+                "ok": true,
+                "user_id": created["id"].as_str().unwrap_or(""),
+                "username": body.username,
+                "role": "user",
+                "is_first_user": true,
+                "is_admin": false
+            })),
+        )
+            .into_response();
+    }
+    let Ok(mut users) = load_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    if !users.is_empty() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "Self-registration is closed. Ask an administrator to create your account.",
+        )
+        .into_response();
+    }
+    if users.contains_key(&body.username) {
+        return api_error(StatusCode::CONFLICT, "Username already taken").into_response();
+    }
+
+    let Ok(record) = build_auth_user_record(&body.password, "admin") else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user")
+            .into_response();
+    };
+    users.insert(body.username.clone(), record.clone());
+    if write_auth_users(&state, &users).is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user").into_response();
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "user_id": record.id,
+            "username": body.username,
+            "role": record.role,
+            "is_first_user": true,
+            "is_admin": record.role == "admin"
+        })),
+    )
+        .into_response()
+}
+
+async fn auth_is_first_user(State(state): State<AppState>) -> Json<Value> {
+    if !state.auth_enabled {
+        return Json(json!({ "is_first_user": false }));
+    }
+    let is_first_user = load_auth_users(&state)
+        .map(|users| users.is_empty())
+        .unwrap_or(false);
+    Json(json!({ "is_first_user": is_first_user }))
+}
+
+async fn auth_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth_enabled {
+        return Json(json!([])).into_response();
+    }
+    if let Err(response) = require_admin(&state, &headers) {
+        return *response;
+    }
+    let Ok(users) = load_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    Json(json!(
+        users
+            .into_iter()
+            .map(|(username, record)| json!({
+                "id": record.id,
+                "username": username,
+                "role": record.role,
+                "created_at": record.created_at,
+                "disabled": record.disabled
+            }))
+            .collect::<Vec<_>>()
+    ))
+    .into_response()
+}
+
+async fn auth_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AuthCredentials>,
+) -> Response {
+    if !state.auth_enabled {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Auth is disabled — user creation is not available.",
+        )
+        .into_response();
+    }
+    if let Err(response) = require_admin(&state, &headers) {
+        return *response;
+    }
+    if auth_pocketbase_enabled(&state) {
+        let Some(created) = register_pocketbase_user(&state, &body.username, &body.password).await
+        else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Failed to create user — username may already be taken.",
+            )
+            .into_response();
+        };
+        return (
+            StatusCode::CREATED,
+            Json(json!({
+                "ok": true,
+                "user_id": created["id"].as_str().unwrap_or(""),
+                "username": body.username,
+                "role": "user",
+                "is_admin": false
+            })),
+        )
+            .into_response();
+    }
+    let Ok(read_users) = load_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    if read_users.contains_key(&body.username) {
+        return api_error(StatusCode::CONFLICT, "Username already taken").into_response();
+    }
+    let Ok(mut users) = load_persisted_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    let role = if users.is_empty() { "admin" } else { "user" };
+    let Ok(record) = build_auth_user_record(&body.password, role) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user")
+            .into_response();
+    };
+    users.insert(body.username.clone(), record.clone());
+    if write_auth_users(&state, &users).is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user").into_response();
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "user_id": record.id,
+            "username": body.username,
+            "role": record.role,
+            "is_admin": record.role == "admin"
+        })),
+    )
+        .into_response()
+}
+
+async fn auth_delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    let current = match require_admin(&state, &headers) {
+        Ok(current) => current,
+        Err(response) => return *response,
+    };
+    if username == current.username {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "You cannot delete your own account",
+        )
+        .into_response();
+    }
+    let Ok(mut users) = load_persisted_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    if users.remove(&username).is_none() {
+        return api_error(StatusCode::NOT_FOUND, "User not found").into_response();
+    }
+    if write_auth_users(&state, &users).is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user").into_response();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn auth_update_user_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+    Json(body): Json<SetAuthRoleRequest>,
+) -> Response {
+    let current = match require_admin(&state, &headers) {
+        Ok(current) => current,
+        Err(response) => return *response,
+    };
+    if username == current.username {
+        return api_error(StatusCode::BAD_REQUEST, "You cannot change your own role")
+            .into_response();
+    }
+    if body.role != "admin" && body.role != "user" {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Role must be 'admin' or 'user'",
+        )
+        .into_response();
+    }
+    let Ok(mut users) = load_persisted_auth_users(&state) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users")
+            .into_response();
+    };
+    let Some(record) = users.get_mut(&username) else {
+        return api_error(StatusCode::NOT_FOUND, "User not found").into_response();
+    };
+    record.role = body.role.clone();
+    if write_auth_users(&state, &users).is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user").into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "username": username,
+        "role": body.role
+    }))
+    .into_response()
+}
+
+fn default_auth_root_for_data_root(data_root: &FsPath) -> PathBuf {
+    data_root.join("multi-user").join("_system").join("auth")
+}
+
+fn auth_users_path(state: &AppState) -> PathBuf {
+    state.auth_root.join("users.json")
+}
+
+fn auth_secret_path(auth_root: &FsPath) -> PathBuf {
+    auth_root.join("auth_secret")
+}
+
+fn legacy_auth_users_path(state: &AppState) -> PathBuf {
+    state.data_root.join("user").join("auth_users.json")
+}
+
+fn legacy_auth_secret_path(data_root: &FsPath) -> PathBuf {
+    data_root.join("user").join("auth_secret")
+}
+
+fn load_or_create_auth_secret(auth_root: &FsPath, data_root: &FsPath) -> String {
+    let secret_path = auth_secret_path(auth_root);
+    let canonical_exists = secret_path.exists();
+    if let Ok(existing) = fs::read_to_string(&secret_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if !canonical_exists {
+        let legacy_secret_path = legacy_auth_secret_path(data_root);
+        if let Ok(existing) = fs::read_to_string(&legacy_secret_path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty()
+                && fs::create_dir_all(auth_root).is_ok()
+                && fs::write(&secret_path, trimmed).is_ok()
+            {
+                set_owner_only_file_permissions(&secret_path);
+                return trimmed.to_string();
+            }
+        }
+    }
+    let generated = random_hex_secret();
+    if fs::create_dir_all(auth_root).is_ok() {
+        let _ = fs::write(&secret_path, &generated);
+        set_owner_only_file_permissions(&secret_path);
+    }
+    generated
+}
+
+fn set_owner_only_file_permissions(path: &FsPath) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn random_hex_secret() -> String {
+    let bytes: [u8; 32] = rand::random();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn load_auth_users(state: &AppState) -> Result<BTreeMap<String, AuthUserRecord>, ApiError> {
+    let users = load_persisted_auth_users(state)?;
+    if !users.is_empty() {
+        return Ok(users);
+    }
+    if !state.auth_env_username.trim().is_empty() && !state.auth_env_password_hash.trim().is_empty()
+    {
+        return Ok(BTreeMap::from([(
+            state.auth_env_username.to_string(),
+            AuthUserRecord {
+                id: "env-admin".to_string(),
+                hash: state.auth_env_password_hash.to_string(),
+                role: "admin".to_string(),
+                created_at: String::new(),
+                disabled: false,
+            },
+        )]));
+    }
+    Ok(BTreeMap::new())
+}
+
+fn load_persisted_auth_users(
+    state: &AppState,
+) -> Result<BTreeMap<String, AuthUserRecord>, ApiError> {
+    let path = auth_users_path(state);
+    if !path.exists() {
+        return migrate_legacy_auth_users(state);
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load users"))?;
+    if content.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let (users, changed) = canonicalize_auth_users(object, AuthDefaultRoleMode::ByIndex);
+    if changed {
+        write_auth_users(state, &users)?;
+    }
+    Ok(users)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AuthDefaultRoleMode {
+    ByIndex,
+    FirstValidAdmin,
+}
+
+fn migrate_legacy_auth_users(
+    state: &AppState,
+) -> Result<BTreeMap<String, AuthUserRecord>, ApiError> {
+    let path = legacy_auth_users_path(state);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(BTreeMap::new());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let (users, _) = canonicalize_auth_users(object, AuthDefaultRoleMode::FirstValidAdmin);
+    if !users.is_empty() {
+        write_auth_users(state, &users)?;
+    }
+    Ok(users)
+}
+
+fn canonicalize_auth_users(
+    object: &Map<String, Value>,
+    mode: AuthDefaultRoleMode,
+) -> (BTreeMap<String, AuthUserRecord>, bool) {
+    let mut users = BTreeMap::new();
+    let mut changed = false;
+    for (index, (username, value)) in object.iter().enumerate() {
+        let default_role = match mode {
+            AuthDefaultRoleMode::ByIndex => {
+                if index == 0 {
+                    "admin"
+                } else {
+                    "user"
+                }
+            }
+            AuthDefaultRoleMode::FirstValidAdmin => {
+                if users.is_empty() {
+                    "admin"
+                } else {
+                    "user"
+                }
+            }
+        };
+        let Some(record) = canonical_auth_user_record(value, default_role) else {
+            changed = true;
+            continue;
+        };
+        changed = changed || !auth_user_record_matches_value(&record, value);
+        users.insert(username.to_string(), record);
+    }
+    (users, changed)
+}
+
+fn canonical_auth_user_record(value: &Value, default_role: &str) -> Option<AuthUserRecord> {
+    if let Some(hash) = value.as_str().filter(|hash| !hash.is_empty()) {
+        return Some(AuthUserRecord {
+            id: format!("u_{}", uuid::Uuid::new_v4().simple()),
+            hash: hash.to_string(),
+            role: default_role.to_string(),
+            created_at: now_rfc3339(),
+            disabled: false,
+        });
+    }
+    let object = value.as_object()?;
+    let hash = object
+        .get("hash")
+        .or_else(|| object.get("password_hash"))
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())?
+        .to_string();
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|role| *role == "admin" || *role == "user")
+        .unwrap_or(default_role)
+        .to_string();
+    Some(AuthUserRecord {
+        id: object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("u_{}", uuid::Uuid::new_v4().simple())),
+        hash,
+        role,
+        created_at: object
+            .get("created_at")
+            .and_then(Value::as_str)
+            .filter(|created_at| !created_at.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(now_rfc3339),
+        disabled: object.get("disabled").is_some_and(python_json_truthiness),
+    })
+}
+
+fn auth_user_record_matches_value(record: &AuthUserRecord, value: &Value) -> bool {
+    serde_json::to_value(record)
+        .map(|canonical| canonical == *value)
+        .unwrap_or(false)
+}
+
+fn python_json_truthiness(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value
+            .as_i64()
+            .map(|number| number != 0)
+            .or_else(|| value.as_u64().map(|number| number != 0))
+            .or_else(|| value.as_f64().map(|number| number != 0.0))
+            .unwrap_or(true),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn write_auth_users(
+    state: &AppState,
+    users: &BTreeMap<String, AuthUserRecord>,
+) -> Result<(), ApiError> {
+    let path = auth_users_path(state);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user"))?;
+    }
+    let content = serde_json::to_string_pretty(users)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user"))?;
+    fs::write(path, content)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user"))
+}
+
+fn build_auth_user_record(password: &str, role: &str) -> Result<AuthUserRecord, ApiError> {
+    let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user"))?;
+    Ok(AuthUserRecord {
+        id: format!("u_{}", uuid::Uuid::new_v4().simple()),
+        hash,
+        role: role.to_string(),
+        created_at: now_rfc3339(),
+        disabled: false,
+    })
+}
+
+fn auth_pocketbase_enabled(state: &AppState) -> bool {
+    state.auth_enabled && !state.auth_pocketbase_url.trim().is_empty()
+}
+
+fn pocketbase_url(state: &AppState, path: &str) -> String {
+    format!(
+        "{}{}",
+        state.auth_pocketbase_url.trim_end_matches('/'),
+        path
+    )
+}
+
+async fn validate_auth_token(state: &AppState, token: &str) -> Option<AuthTokenPayload> {
+    if auth_pocketbase_enabled(state) {
+        return validate_pocketbase_token(state, token).await;
+    }
+    decode_auth_token(state, token)
+}
+
+async fn authenticate_pocketbase_user(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> Option<(AuthTokenPayload, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .post(pocketbase_url(
+            state,
+            "/api/collections/users/auth-with-password",
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"identity": username, "password": password}).to_string())
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let value = serde_json::from_str::<Value>(&body).ok()?;
+    let token = value["token"].as_str()?.to_string();
+    let payload = pocketbase_record_auth_payload(&value["record"])?;
+    cache_pocketbase_token(state, &token, payload.clone());
+    Some((payload, token))
+}
+
+async fn register_pocketbase_user(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> Option<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .post(pocketbase_url(state, "/api/collections/users/records"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "username": username,
+                "email": username,
+                "password": password,
+                "passwordConfirm": password
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    serde_json::from_str::<Value>(&body).ok()
+}
+
+async fn validate_pocketbase_token(state: &AppState, token: &str) -> Option<AuthTokenPayload> {
+    if token.trim().is_empty() {
+        return None;
+    }
+    if let Some(payload) = cached_pocketbase_token(state, token) {
+        return Some(payload);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .post(pocketbase_url(state, "/api/collections/users/auth-refresh"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let value = serde_json::from_str::<Value>(&body).ok()?;
+    let payload = pocketbase_record_auth_payload(&value["record"])?;
+    cache_pocketbase_token(state, token, payload.clone());
+    Some(payload)
+}
+
+fn pocketbase_record_auth_payload(record: &Value) -> Option<AuthTokenPayload> {
+    let username = trimmed_json_string(&record["email"])
+        .or_else(|| trimmed_json_string(&record["name"]))
+        .or_else(|| trimmed_json_string(&record["username"]))
+        .or_else(|| trimmed_json_string(&record["id"]))?;
+    let role = trimmed_json_string(&record["role"]).unwrap_or_else(|| "user".to_string());
+    let user_id = trimmed_json_string(&record["id"]).unwrap_or_default();
+    Some(AuthTokenPayload {
+        username,
+        role,
+        user_id,
+    })
+}
+
+fn cached_pocketbase_token(state: &AppState, token: &str) -> Option<AuthTokenPayload> {
+    let now = Instant::now();
+    let cache = state.auth_pb_token_cache.lock().ok()?;
+    let cached = cache.get(token)?;
+    (cached.expires_at > now).then(|| cached.payload.clone())
+}
+
+fn cache_pocketbase_token(state: &AppState, token: &str, payload: AuthTokenPayload) {
+    if let Ok(mut cache) = state.auth_pb_token_cache.lock() {
+        cache.insert(
+            token.to_string(),
+            CachedPocketBaseToken {
+                payload,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+    }
+}
+
+fn create_auth_token(state: &AppState, payload: &AuthTokenPayload) -> Result<String, ApiError> {
+    let now = Utc::now().timestamp();
+    let claims = AuthClaims {
+        sub: payload.username.clone(),
+        role: payload.role.clone(),
+        uid: payload.user_id.clone(),
+        iat: now.max(0) as usize,
+        exp: (now + state.auth_token_expire_hours * 3600).max(0) as usize,
+    };
+    jwt_encode(
+        &JwtHeader::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(state.auth_secret.as_bytes()),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create auth token",
+        )
+    })
+}
+
+fn decode_auth_token(state: &AppState, token: &str) -> Option<AuthTokenPayload> {
+    if auth_pocketbase_enabled(state) {
+        return cached_pocketbase_token(state, token);
+    }
+    if token.trim().is_empty() || state.auth_secret.is_empty() {
+        return None;
+    }
+    let validation = Validation::new(Algorithm::HS256);
+    jwt_decode::<AuthClaims>(
+        token,
+        &DecodingKey::from_secret(state.auth_secret.as_bytes()),
+        &validation,
+    )
+    .ok()
+    .and_then(|data| {
+        if data.claims.sub.is_empty() {
+            None
+        } else {
+            Some(AuthTokenPayload {
+                username: data.claims.sub,
+                role: if data.claims.role.is_empty() {
+                    "user".to_string()
+                } else {
+                    data.claims.role
+                },
+                user_id: data.claims.uid,
+            })
+        }
+    })
+}
+
+fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token_from_header)
+    {
+        return Some(token);
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(cookie_auth_token)
+}
+
+fn extract_unified_ws_token(headers: &HeaderMap, query: &UnifiedWsAuthQuery) -> Option<String> {
+    query
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(cookie_auth_token)
+        })
+}
+
+fn bearer_token_from_header(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn cookie_auth_token(value: &str) -> Option<String> {
+    value.split(';').find_map(|part| {
+        let trimmed = part.trim();
+        let (name, value) = trimmed.split_once('=')?;
+        if name == "dt_token" && !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthTokenPayload, Box<Response>> {
+    let payload = require_auth(state, headers)?;
+    if payload.role != "admin" {
+        return Err(Box::new(
+            api_error(StatusCode::FORBIDDEN, "Admin access required").into_response(),
+        ));
+    }
+    Ok(payload)
+}
+
+async fn require_auth_async(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthTokenPayload, Box<Response>> {
+    if !state.auth_enabled {
+        return Ok(AuthTokenPayload {
+            username: "local".to_string(),
+            role: "admin".to_string(),
+            user_id: "local-admin".to_string(),
+        });
+    }
+    let Some(token) = extract_auth_token(headers) else {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(json!({ "detail": "Not authenticated" })),
+            )
+                .into_response(),
+        ));
+    };
+    validate_auth_token(state, &token).await.ok_or_else(|| {
+        Box::new(api_error(StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response())
+    })
+}
+
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthTokenPayload, Box<Response>> {
+    if !state.auth_enabled {
+        return Ok(AuthTokenPayload {
+            username: "local".to_string(),
+            role: "admin".to_string(),
+            user_id: "local-admin".to_string(),
+        });
+    }
+    let Some(token) = extract_auth_token(headers) else {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(json!({ "detail": "Not authenticated" })),
+            )
+                .into_response(),
+        ));
+    };
+    decode_auth_token(state, &token).ok_or_else(|| {
+        Box::new(api_error(StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response())
+    })
+}
+
+fn login_cookie(state: &AppState, token: &str) -> String {
+    let same_site = if state.auth_cookie_secure {
+        "None"
+    } else {
+        "Lax"
+    };
+    let mut cookie = format!(
+        "dt_token={token}; Max-Age={}; Path=/; SameSite={same_site}; HttpOnly",
+        state.auth_token_expire_hours * 3600
+    );
+    if state.auth_cookie_secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+async fn knowledge_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    Json(scoped_knowledge_base_summaries(&state, &payload)).into_response()
+}
+
+async fn course_knowledge_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    Json(scoped_knowledge_base_summaries(&state, &payload)).into_response()
 }
 
 async fn knowledge_health(State(state): State<AppState>) -> Json<Value> {
@@ -1144,29 +2975,20 @@ async fn sync_knowledge_configs(State(state): State<AppState>) -> impl IntoRespo
         .cloned()
         .unwrap_or_default();
 
-    let bases_dir = state.knowledge_root.join("bases");
-    if let Ok(entries) = fs::read_dir(bases_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
-                continue;
-            };
-            let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
-            let mut config = knowledge_bases
-                .remove(&name)
-                .filter(|value| value.is_object())
-                .unwrap_or_else(|| default_knowledge_base_config(&state, &name));
-            if let Some(description) = metadata["description"].as_str() {
-                config["description"] = json!(description);
-            }
-            if let Some(search_mode) = metadata["search_mode"].as_str() {
-                config["search_mode"] = json!(search_mode);
-            }
-            config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
-            knowledge_bases.insert(name, config);
+    for name in local_knowledge_base_names(&state) {
+        let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
+        let mut config = knowledge_bases
+            .remove(&name)
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| default_knowledge_base_config(&state, &name));
+        if let Some(description) = metadata["description"].as_str() {
+            config["description"] = json!(description);
         }
+        if let Some(search_mode) = metadata["search_mode"].as_str() {
+            config["search_mode"] = json!(search_mode);
+        }
+        config["rag_provider"] = json!(DEFAULT_RAG_PROVIDER);
+        knowledge_bases.insert(name, config);
     }
 
     store["knowledge_bases"] = Value::Object(knowledge_bases);
@@ -1209,6 +3031,21 @@ async fn get_knowledge_config(
         "kb_name": name,
         "config": merged_knowledge_config(&state, &name)
     }))
+}
+
+async fn get_knowledge_base_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    match resolve_knowledge_access(&state, &payload, &name) {
+        Ok(access) => Json(knowledge_summary_for_access(&state, &access)).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn update_knowledge_config(
@@ -1271,36 +3108,246 @@ async fn read_knowledge_file(
         return api_error(StatusCode::NOT_FOUND, "File not found").into_response();
     }
 
-    let Some(filename) = safe_filename(&file_path) else {
-        return api_error(StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+    let relative_path = match safe_relative_file_path(&file_path) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
     };
-    let path = knowledge_files_dir(&state, &name).join(filename);
-    match fs::read(path) {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+    let raw_dir = knowledge_files_dir(&state, &name);
+    let path = raw_dir.join(&relative_path);
+    if !path.exists() || !path.is_file() {
+        return api_error(StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+
+    let raw_resolved = match fs::canonicalize(&raw_dir) {
+        Ok(path) => path,
+        Err(_) => return api_error(StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+    let target_resolved = match fs::canonicalize(&path) {
+        Ok(path) => path,
+        Err(_) => return api_error(StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+    if !target_resolved.starts_with(&raw_resolved) {
+        return api_error(StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+
+    let filename = target_resolved
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    match fs::read(&target_resolved) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, mime_type_for(filename)),
+                (
+                    header::CONTENT_DISPOSITION,
+                    attachment_content_disposition(filename).as_str(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(_) => api_error(StatusCode::NOT_FOUND, "File not found").into_response(),
     }
+}
+
+fn safe_relative_file_path(value: &str) -> Result<PathBuf, ApiError> {
+    let trimmed = value.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid filename"));
+    }
+
+    let mut relative = PathBuf::new();
+    for component in FsPath::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(api_error(StatusCode::BAD_REQUEST, "Invalid filename"));
+                };
+                let Some(part) = safe_storage_component(part) else {
+                    return Err(api_error(StatusCode::BAD_REQUEST, "Invalid filename"));
+                };
+                relative.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(api_error(StatusCode::FORBIDDEN, "Access denied"));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid filename"));
+    }
+    Ok(relative)
 }
 
 async fn get_knowledge_progress(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let path = knowledge_progress_path(&state, &name);
-    match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(progress) => Json(progress).into_response(),
-            Err(error) => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Invalid progress JSON: {error}"),
-            )
-            .into_response(),
-        },
-        Err(_) => Json(json!({
+    match read_knowledge_progress(&state, &name) {
+        Ok(Some(progress)) => Json(progress).into_response(),
+        Ok(None) => Json(json!({
             "status": "not_started",
             "message": "Initialization not started"
         }))
         .into_response(),
+        Err(error) => error.into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeProgressWsQuery {
+    task_id: Option<String>,
+}
+
+async fn knowledge_progress_ws(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<KnowledgeProgressWsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
+    ws.on_upgrade(move |socket| {
+        handle_knowledge_progress_socket(state, name, query.task_id, socket)
+    })
+    .into_response()
+}
+
+async fn handle_knowledge_progress_socket(
+    state: AppState,
+    name: String,
+    expected_task_id: Option<String>,
+    mut socket: WebSocket,
+) {
+    if !knowledge_base_exists(&state, &name) {
+        let _ = socket
+            .send(Message::Text(
+                json!({"type": "error", "message": "Knowledge base not found"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
+    let mut last_payload = None::<String>;
+    let initial_progress = read_knowledge_progress(&state, &name)
+        .ok()
+        .flatten()
+        .filter(|progress| progress_matches_task(progress, expected_task_id.as_deref()))
+        .or_else(|| {
+            expected_task_id
+                .is_none()
+                .then(|| knowledge_idle_progress(&state, &name))
+        });
+
+    if let Some(progress) = initial_progress {
+        last_payload = Some(progress.to_string());
+        if !send_knowledge_progress_event(&mut socket, progress.clone()).await {
+            return;
+        }
+        if expected_task_id.is_none() || progress_is_terminal(&progress) {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                let Some(progress) = read_knowledge_progress(&state, &name)
+                    .ok()
+                    .flatten()
+                    .filter(|progress| progress_matches_task(progress, expected_task_id.as_deref()))
+                else {
+                    continue;
+                };
+                let payload = progress.to_string();
+                if last_payload.as_deref() == Some(payload.as_str()) {
+                    continue;
+                }
+                last_payload = Some(payload);
+                if !send_knowledge_progress_event(&mut socket, progress.clone()).await {
+                    break;
+                }
+                if progress_is_terminal(&progress) {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn read_knowledge_progress(state: &AppState, name: &str) -> Result<Option<Value>, ApiError> {
+    let path = knowledge_progress_path(state, name);
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<Value>(&text)
+        .map(Some)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Invalid progress JSON: {error}"),
+            )
+        })
+}
+
+fn knowledge_idle_progress(state: &AppState, name: &str) -> Value {
+    if knowledge_has_active_index(state, name) {
+        json!({
+            "stage": "completed",
+            "message": "Knowledge base is ready.",
+            "percent": 100,
+            "progress_percent": 100,
+            "current": 1,
+            "total": 1
+        })
+    } else {
+        json!({
+            "stage": "error",
+            "message": "Knowledge base needs reindex or initialization."
+        })
+    }
+}
+
+fn progress_matches_task(progress: &Value, expected_task_id: Option<&str>) -> bool {
+    let Some(expected_task_id) = expected_task_id else {
+        return true;
+    };
+    progress["task_id"]
+        .as_str()
+        .is_none_or(|task_id| task_id == expected_task_id)
+}
+
+fn progress_is_terminal(progress: &Value) -> bool {
+    matches!(
+        progress["stage"].as_str(),
+        Some("completed") | Some("error")
+    )
+}
+
+async fn send_knowledge_progress_event(socket: &mut WebSocket, progress: Value) -> bool {
+    socket
+        .send(Message::Text(
+            json!({"type": "progress", "data": progress})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_ok()
 }
 
 async fn clear_knowledge_progress(
@@ -1405,12 +3452,17 @@ async fn sync_knowledge_folder(
     if !knowledge_base_exists(&state, &name) {
         return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
     }
-    let Some(folder) = load_linked_knowledge_folders(&state, &name)
-        .into_iter()
-        .find(|folder| folder["id"].as_str() == Some(folder_id.as_str()))
+    if knowledge_needs_reindex_for_upload(&state, &name) {
+        return knowledge_needs_reindex_error(&name).into_response();
+    }
+    let folders = load_linked_knowledge_folders(&state, &name);
+    let Some(folder_index) = folders
+        .iter()
+        .position(|folder| folder["id"].as_str() == Some(folder_id.as_str()))
     else {
         return api_error(StatusCode::NOT_FOUND, "Linked folder not found").into_response();
     };
+    let folder = folders[folder_index].clone();
     let Some(folder_path) = folder["path"].as_str() else {
         return api_error(StatusCode::BAD_REQUEST, "Linked folder path is invalid").into_response();
     };
@@ -1419,34 +3471,14 @@ async fn sync_knowledge_folder(
         return api_error(StatusCode::BAD_REQUEST, "Linked folder not found").into_response();
     }
 
-    let mut synced = Vec::new();
-    if let Ok(entries) = fs::read_dir(&source_dir) {
-        let target_dir = knowledge_files_dir(&state, &name);
-        if let Err(error) = fs::create_dir_all(&target_dir) {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to create knowledge file directory: {error}"),
-            )
-            .into_response();
-        }
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(filename) = entry.file_name().to_str().and_then(safe_filename) else {
-                continue;
-            };
-            if !is_supported_knowledge_file(&filename) {
-                continue;
-            }
-            if fs::copy(&path, target_dir.join(&filename)).is_ok() {
-                synced.push(filename);
-            }
-        }
-    }
+    let (new_files, modified_files) = linked_folder_changes(&folder, &source_dir);
+    let files_to_sync = new_files
+        .iter()
+        .chain(modified_files.iter())
+        .cloned()
+        .collect::<Vec<_>>();
 
-    if synced.is_empty() {
+    if files_to_sync.is_empty() {
         return Json(json!({
             "message": "No new or modified files to sync",
             "files": [],
@@ -1455,34 +3487,182 @@ async fn sync_knowledge_folder(
         .into_response();
     }
 
-    let task_id = format!("kb_upload-{}", unique_id());
-    let progress = json!({
-        "task_id": task_id,
-        "stage": "completed",
-        "message": format!("Synced {} files from linked folder", synced.len()),
-        "percent": 100,
-        "current": synced.len(),
-        "total": synced.len(),
-        "timestamp": now_label()
-    });
-    let _ = write_knowledge_progress(&state, &name, &progress);
-    let _ = write_knowledge_metadata(
+    let task_id = knowledge_task_id("kb_upload");
+    record_knowledge_task_start(
         &state,
         &name,
-        DEFAULT_RAG_PROVIDER,
-        Some(json!({ "last_indexed_action": "sync-folder" })),
-    );
+        &task_id,
+        format!("Processing {} files...", files_to_sync.len()),
+        "upload",
+    )
+    .await;
+    tokio::spawn(run_knowledge_sync_folder_task(
+        state.clone(),
+        name.clone(),
+        folder_id.clone(),
+        files_to_sync,
+        task_id.clone(),
+    ));
 
     Json(json!({
-        "message": format!("Syncing {} files from linked folder", synced.len()),
+        "message": format!("Syncing {} files from linked folder", new_files.len() + modified_files.len()),
         "folder_path": folder_path,
-        "new_files": synced.len(),
-        "modified_files": 0,
-        "file_count": synced.len(),
-        "files": synced,
+        "new_files": new_files.len(),
+        "modified_files": modified_files.len(),
+        "file_count": new_files.len() + modified_files.len(),
         "task_id": task_id
     }))
     .into_response()
+}
+
+async fn run_knowledge_sync_folder_task(
+    state: AppState,
+    name: String,
+    folder_id: String,
+    files_to_sync: Vec<PathBuf>,
+    task_id: String,
+) {
+    let result: Result<usize, ApiError> = async {
+        if !knowledge_has_active_index(&state, &name) {
+            let detail = if knowledge_base_dir(&state, &name)
+                .join("rag_storage")
+                .exists()
+            {
+                format!(
+                    "Knowledge base '{name}' uses legacy index format and requires reindex before incremental add"
+                )
+            } else {
+                format!("Knowledge base not initialized (llamaindex): {name}")
+            };
+            return Err(api_error(StatusCode::BAD_REQUEST, &detail));
+        }
+
+        let target_dir = knowledge_files_dir(&state, &name);
+        fs::create_dir_all(&target_dir).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create knowledge file directory: {error}"),
+            )
+        })?;
+
+        let mut synced_paths = Vec::new();
+        let mut synced_saved_files = Vec::new();
+        for path in &files_to_sync {
+            let Some(filename) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(safe_filename)
+            else {
+                continue;
+            };
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            fs::write(target_dir.join(&filename), &bytes).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to write synced file: {error}"),
+                )
+            })?;
+            let hash = sha256_hex(&bytes);
+            synced_paths.push(path.clone());
+            synced_saved_files.push(SavedKnowledgeFile { filename, hash });
+        }
+
+        let processed_files =
+            saved_files_with_extractable_knowledge_content(&state, &name, &synced_saved_files);
+        let processed_filenames = processed_files
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect::<HashSet<_>>();
+        let processed_paths = synced_paths
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(safe_filename)
+                    .is_some_and(|filename| processed_filenames.contains(filename.as_str()))
+            })
+            .collect::<Vec<_>>();
+
+        if !processed_files.is_empty() {
+            if !rewrite_active_knowledge_index(&state, &name).await? {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "Knowledge base '{name}' does not have an active index; reindex before syncing linked folders"
+                    ),
+                ));
+            }
+            write_upload_metadata(&state, &name, &processed_files)?;
+        } else {
+            let _ = write_knowledge_metadata(
+                &state,
+                &name,
+                DEFAULT_RAG_PROVIDER,
+                Some(json!({ "last_indexed_action": "sync-folder" })),
+            );
+        }
+
+        let mut folders = load_linked_knowledge_folders(&state, &name);
+        let Some(folder_index) = folders
+            .iter()
+            .position(|folder| folder["id"].as_str() == Some(folder_id.as_str()))
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "Linked folder not found"));
+        };
+        update_linked_folder_sync_state(&state, &name, &mut folders, folder_index, &processed_paths)?;
+        Ok(processed_files.len())
+    }
+    .await;
+
+    match result {
+        Ok(processed_count) => {
+            let message = format!("Successfully processed {processed_count} files!");
+            let progress = json!({
+                "task_id": task_id,
+                "stage": "completed",
+                "message": message,
+                "percent": 100,
+                "progress_percent": 100,
+                "current": processed_count,
+                "total": processed_count,
+                "indexed_count": processed_count,
+                "index_changed": processed_count > 0,
+                "index_action": "upload",
+                "timestamp": now_label()
+            });
+            let _ = write_knowledge_progress(&state, &name, &progress);
+            state
+                .knowledge_tasks
+                .record_completed(&task_id, "kb_upload", message, progress)
+                .await;
+        }
+        Err(error) => {
+            let detail = api_error_detail(&error);
+            let message = format!("Upload processing failed (KB '{name}'): {detail}");
+            let exception_type = knowledge_upload_failure_exception_type(&detail);
+            let details = knowledge_task_failure_trace_with_exception(
+                "run_knowledge_sync_folder_task",
+                exception_type,
+                &detail,
+            );
+            record_knowledge_task_failure_full(
+                &state,
+                &name,
+                &task_id,
+                KnowledgeTaskFailureReport {
+                    log_message: message.clone(),
+                    progress_message: format!("Processing failed: {message}"),
+                    failed_detail: message,
+                    details: Some(details),
+                    index_action: "upload".to_string(),
+                },
+            )
+            .await;
+        }
+    }
 }
 
 async fn create_knowledge_base(
@@ -1490,29 +3670,55 @@ async fn create_knowledge_base(
     multipart: Multipart,
 ) -> impl IntoResponse {
     match save_knowledge_base_from_multipart(&state, multipart, None).await {
-        Ok((name, task_id)) => Json(json!({
-            "task_id": task_id,
-            "message": format!("Knowledge base {name} created")
-        }))
-        .into_response(),
+        Ok((name, task_id, files)) => {
+            record_knowledge_task_start_with_stage(
+                &state,
+                &name,
+                &task_id,
+                "initializing",
+                format!("Initializing knowledge base '{name}'..."),
+                "create",
+            )
+            .await;
+            tokio::spawn(run_knowledge_create_task(
+                state.clone(),
+                name.clone(),
+                task_id.clone(),
+            ));
+            Json(json!({
+                "task_id": task_id,
+                "name": name,
+                "files": files,
+                "message": format!("Knowledge base '{name}' created. Processing in background.")
+            }))
+            .into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
 
 async fn upload_knowledge_files(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     multipart: Multipart,
 ) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let access = match resolve_knowledge_access(&state, &payload, &name) {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = ensure_knowledge_access_writable(&access) {
+        return error.into_response();
+    }
     if !knowledge_base_exists(&state, &name) {
         return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
     }
     if knowledge_needs_reindex_for_upload(&state, &name) {
-        return api_error(
-            StatusCode::CONFLICT,
-            &format!("Knowledge base '{name}' needs reindex before uploading new files"),
-        )
-        .into_response();
+        return knowledge_needs_reindex_error(&name).into_response();
     }
     if !knowledge_has_active_index(&state, &name) {
         return api_error(
@@ -1521,12 +3727,34 @@ async fn upload_knowledge_files(
         )
         .into_response();
     }
-    match save_knowledge_base_from_multipart(&state, multipart, Some(name)).await {
-        Ok((name, task_id)) => Json(json!({
+    match save_knowledge_upload_files_from_multipart(&state, &name, multipart).await {
+        Ok(saved_files) => {
+            let task_id = knowledge_task_id("kb_upload");
+            let files = saved_files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect::<Vec<_>>();
+            record_knowledge_task_start(
+                &state,
+                &name,
+                &task_id,
+                format!("Processing {} files...", files.len()),
+                "upload",
+            )
+            .await;
+            tokio::spawn(run_knowledge_upload_task(
+                state.clone(),
+                name.clone(),
+                task_id.clone(),
+                saved_files,
+            ));
+            Json(json!({
             "task_id": task_id,
+            "files": files,
             "message": format!("Files uploaded to {name}")
-        }))
-        .into_response(),
+            }))
+            .into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -1538,6 +3766,15 @@ fn knowledge_needs_reindex_for_upload(state: &AppState, name: &str) -> bool {
         || read_knowledge_metadata(state, name)
             .and_then(|metadata| metadata["needs_reindex"].as_bool())
             .unwrap_or(false)
+}
+
+fn knowledge_needs_reindex_error(name: &str) -> ApiError {
+    api_error(
+        StatusCode::CONFLICT,
+        &format!(
+            "Knowledge base '{name}' uses legacy index format and needs reindex before accepting incremental uploads."
+        ),
+    )
 }
 
 fn knowledge_has_active_index(state: &AppState, name: &str) -> bool {
@@ -1572,8 +3809,20 @@ async fn set_default_knowledge_base(
 
 async fn reindex_knowledge_base(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let access = match resolve_knowledge_access(&state, &payload, &name) {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = ensure_knowledge_access_writable(&access) {
+        return error.into_response();
+    }
     if !knowledge_base_exists(&state, &name) {
         return api_error(StatusCode::NOT_FOUND, "Knowledge base not found").into_response();
     }
@@ -1597,29 +3846,22 @@ async fn reindex_knowledge_base(
         }))
         .into_response();
     }
-    let task_id = format!("task-reindex-{}", unique_id());
-    let version = match write_active_knowledge_index_version(&state, &name, &versions).await {
-        Ok(version) => version,
-        Err(error) => return error.into_response(),
-    };
-    let updated_versions = {
-        let mut values = versions;
-        values.push(version);
-        values
-    };
-    let metadata = json!({
-        "last_indexed_at": now_seconds(),
-        "last_indexed_action": "reindex",
-        "last_indexed_count": knowledge_files(&state, &name).unwrap_or_default().len(),
-        "embedding_signature": signature.clone(),
-        "index_versions": updated_versions,
-        "needs_reindex": false,
-        "embedding_mismatch": false
-    });
-    let _ = write_knowledge_metadata(&state, &name, DEFAULT_RAG_PROVIDER, Some(metadata));
-    if let Err(error) = clear_knowledge_reindex_flags(&state, &name) {
-        return error.into_response();
-    }
+    let task_id = knowledge_task_id("kb_reindex");
+    record_knowledge_task_start(
+        &state,
+        &name,
+        &task_id,
+        "Queueing re-index...".to_string(),
+        "reindex",
+    )
+    .await;
+    tokio::spawn(run_knowledge_reindex_task(
+        state.clone(),
+        name.clone(),
+        task_id.clone(),
+        signature.clone(),
+        versions,
+    ));
     Json(json!({
         "task_id": task_id,
         "signature": signature,
@@ -1627,6 +3869,390 @@ async fn reindex_knowledge_base(
         "message": format!("Re-indexing '{name}' in the background.")
     }))
     .into_response()
+}
+
+async fn run_knowledge_reindex_task(
+    state: AppState,
+    name: String,
+    task_id: String,
+    signature: String,
+    versions: Vec<Value>,
+) {
+    let result: Result<(), ApiError> = async {
+        let indexed_count = knowledge_files(&state, &name).unwrap_or_default().len();
+        record_knowledge_task_processing_progress(
+            &state,
+            &name,
+            &task_id,
+            format!("Re-indexing {indexed_count} document(s) with the active embedding model..."),
+            0,
+            indexed_count,
+            "reindex",
+        )
+        .await;
+        if indexed_count > 0 {
+            record_knowledge_task_processing_progress(
+                &state,
+                &name,
+                &task_id,
+                "Embedding batches: 1/1".to_string(),
+                1,
+                1,
+                "reindex",
+            )
+            .await;
+        }
+        let version = write_active_knowledge_index_version(&state, &name, &versions).await?;
+        let updated_versions = {
+            let mut values = versions;
+            values.push(version);
+            values
+        };
+        let metadata = json!({
+            "last_indexed_at": now_seconds(),
+            "last_indexed_action": "reindex",
+            "last_indexed_count": indexed_count,
+            "embedding_signature": signature,
+            "index_versions": updated_versions,
+            "needs_reindex": false,
+            "embedding_mismatch": false
+        });
+        let _ = write_knowledge_metadata(&state, &name, DEFAULT_RAG_PROVIDER, Some(metadata));
+        clear_knowledge_reindex_flags(&state, &name)?;
+        let progress = json!({
+            "task_id": task_id,
+            "stage": "completed",
+            "message": format!("Re-index of '{name}' complete"),
+            "percent": 100,
+            "progress_percent": 100,
+            "current": indexed_count,
+            "total": indexed_count,
+            "indexed_count": indexed_count,
+            "index_action": "reindex",
+            "timestamp": now_label()
+        });
+        write_knowledge_progress(&state, &name, &progress)?;
+        state
+            .knowledge_tasks
+            .record_completed_terminal_only(&task_id, format!("Re-index of '{name}' complete"))
+            .await;
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        let detail = api_error_detail(&error);
+        let message = format!("Re-index failed: {detail}");
+        let details = knowledge_task_failure_trace("run_knowledge_reindex_task", &detail);
+        record_knowledge_task_failure_with_detail(
+            &state,
+            &name,
+            &task_id,
+            message,
+            detail,
+            Some(details),
+            "reindex",
+        )
+        .await;
+    }
+}
+
+async fn run_knowledge_create_task(state: AppState, name: String, task_id: String) {
+    let result: Result<usize, ApiError> = async {
+        let metadata = read_knowledge_metadata(&state, &name).unwrap_or_else(|| json!({}));
+        let versions = knowledge_index_versions(&knowledge_base_dir(&state, &name), &metadata);
+        let version = write_active_knowledge_index_version(&state, &name, &versions).await?;
+        let indexed_count = knowledge_files(&state, &name).unwrap_or_default().len();
+        let updated_versions = {
+            let mut values = versions;
+            values.push(version);
+            values
+        };
+        let metadata = json!({
+            "last_indexed_at": now_seconds(),
+            "last_indexed_action": "create",
+            "last_indexed_count": indexed_count,
+            "embedding_signature": active_knowledge_signature(&state),
+            "index_versions": updated_versions,
+            "needs_reindex": false,
+            "embedding_mismatch": false
+        });
+        let _ = write_knowledge_metadata(&state, &name, DEFAULT_RAG_PROVIDER, Some(metadata));
+        clear_knowledge_reindex_flags(&state, &name)?;
+        Ok(indexed_count)
+    }
+    .await;
+
+    match result {
+        Ok(indexed_count) => {
+            let message = format!("Knowledge base '{name}' initialization complete");
+            let progress = json!({
+                "task_id": task_id,
+                "stage": "completed",
+                "message": message,
+                "percent": 100,
+                "progress_percent": 100,
+                "current": indexed_count,
+                "total": indexed_count,
+                "indexed_count": indexed_count,
+                "index_changed": true,
+                "index_action": "create",
+                "timestamp": now_label()
+            });
+            let _ = write_knowledge_progress(&state, &name, &progress);
+            state
+                .knowledge_tasks
+                .record_completed(&task_id, "kb_init", message, progress)
+                .await;
+        }
+        Err(error) => {
+            let detail = api_error_detail(&error);
+            let message = format!("Initialization failed: {detail}");
+            let details = knowledge_task_failure_trace("run_knowledge_create_task", &detail);
+            record_knowledge_task_failure_with_detail(
+                &state,
+                &name,
+                &task_id,
+                message,
+                detail,
+                Some(details),
+                "create",
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_knowledge_upload_task(
+    state: AppState,
+    name: String,
+    task_id: String,
+    saved_files: Vec<SavedKnowledgeFile>,
+) {
+    let result: Result<usize, ApiError> = async {
+        if saved_files.is_empty() {
+            return Ok(0);
+        }
+        let processed_files =
+            saved_files_with_extractable_knowledge_content(&state, &name, &saved_files);
+        if processed_files.is_empty() {
+            return Ok(0);
+        }
+        if !rewrite_active_knowledge_index(&state, &name).await? {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "Knowledge base '{name}' does not have an active index; reindex before uploading new files"
+                ),
+            ));
+        }
+        write_upload_metadata(&state, &name, &processed_files)?;
+        Ok(processed_files.len())
+    }
+    .await;
+
+    match result {
+        Ok(processed_count) => {
+            let message = format!("Successfully processed {processed_count} files!");
+            let progress = json!({
+                "task_id": task_id,
+                "stage": "completed",
+                "message": message,
+                "percent": 100,
+                "progress_percent": 100,
+                "current": processed_count,
+                "total": processed_count,
+                "indexed_count": processed_count,
+                "index_changed": processed_count > 0,
+                "index_action": "upload",
+                "timestamp": now_label()
+            });
+            let _ = write_knowledge_progress(&state, &name, &progress);
+            state
+                .knowledge_tasks
+                .record_completed(&task_id, "kb_upload", message, progress)
+                .await;
+        }
+        Err(error) => {
+            let detail = api_error_detail(&error);
+            let message = format!("Upload processing failed (KB '{name}'): {detail}");
+            let details = knowledge_task_failure_trace("run_knowledge_upload_task", &detail);
+            record_knowledge_task_failure_full(
+                &state,
+                &name,
+                &task_id,
+                KnowledgeTaskFailureReport {
+                    log_message: message.clone(),
+                    progress_message: format!("Processing failed: {message}"),
+                    failed_detail: message,
+                    details: Some(details),
+                    index_action: "upload".to_string(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn record_knowledge_task_start(
+    state: &AppState,
+    name: &str,
+    task_id: &str,
+    message: String,
+    index_action: &str,
+) -> Value {
+    record_knowledge_task_start_with_stage(state, name, task_id, "starting", message, index_action)
+        .await
+}
+
+async fn record_knowledge_task_start_with_stage(
+    state: &AppState,
+    name: &str,
+    task_id: &str,
+    stage: &str,
+    message: String,
+    index_action: &str,
+) -> Value {
+    let progress = json!({
+        "task_id": task_id,
+        "stage": stage,
+        "message": message,
+        "percent": 0,
+        "progress_percent": 0,
+        "current": 0,
+        "total": 0,
+        "index_action": index_action,
+        "timestamp": now_label()
+    });
+    let _ = write_knowledge_progress(state, name, &progress);
+    state
+        .knowledge_tasks
+        .record_started(task_id, message, progress.clone())
+        .await;
+    progress
+}
+
+async fn record_knowledge_task_processing_progress(
+    state: &AppState,
+    name: &str,
+    task_id: &str,
+    message: String,
+    current: usize,
+    total: usize,
+    index_action: &str,
+) -> Value {
+    let percent = if total == 0 {
+        0
+    } else {
+        ((current.min(total) * 100) / total).min(99)
+    };
+    let progress = json!({
+        "task_id": task_id,
+        "stage": "processing_documents",
+        "message": message,
+        "percent": percent,
+        "progress_percent": percent,
+        "current": current,
+        "total": total,
+        "index_action": index_action,
+        "timestamp": now_label()
+    });
+    let _ = write_knowledge_progress(state, name, &progress);
+    state
+        .knowledge_tasks
+        .emit(task_id, "progress", progress.clone())
+        .await;
+    progress
+}
+
+async fn record_knowledge_task_failure_with_detail(
+    state: &AppState,
+    name: &str,
+    task_id: &str,
+    message: String,
+    failed_detail: String,
+    details: Option<String>,
+    index_action: &str,
+) -> Value {
+    record_knowledge_task_failure_full(
+        state,
+        name,
+        task_id,
+        KnowledgeTaskFailureReport {
+            log_message: message.clone(),
+            progress_message: message,
+            failed_detail,
+            details,
+            index_action: index_action.to_string(),
+        },
+    )
+    .await
+}
+
+struct KnowledgeTaskFailureReport {
+    log_message: String,
+    progress_message: String,
+    failed_detail: String,
+    details: Option<String>,
+    index_action: String,
+}
+
+async fn record_knowledge_task_failure_full(
+    state: &AppState,
+    name: &str,
+    task_id: &str,
+    report: KnowledgeTaskFailureReport,
+) -> Value {
+    let progress = json!({
+        "task_id": task_id,
+        "stage": "error",
+        "message": report.progress_message,
+        "percent": 0,
+        "progress_percent": 0,
+        "current": 0,
+        "total": 0,
+        "error": report.failed_detail,
+        "index_action": report.index_action,
+        "timestamp": now_label()
+    });
+    let _ = write_knowledge_progress(state, name, &progress);
+    state
+        .knowledge_tasks
+        .record_failed_with_detail(
+            task_id,
+            report.log_message,
+            report.failed_detail,
+            progress.clone(),
+            report.details,
+        )
+        .await;
+    progress
+}
+
+fn knowledge_task_failure_trace(context: &str, detail: &str) -> String {
+    knowledge_task_failure_trace_with_exception(context, "ApiError", detail)
+}
+
+fn knowledge_task_failure_trace_with_exception(
+    context: &str,
+    exception_type: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "Traceback (most recent call last):\n  File \"socartes-rust/backend/src/lib.rs\", in {context}\n{exception_type}: {detail}"
+    )
+}
+
+fn knowledge_upload_failure_exception_type(detail: &str) -> &'static str {
+    if detail.starts_with("Knowledge base not initialized (llamaindex):")
+        || (detail.starts_with("Knowledge base '")
+            && detail
+                .contains("uses legacy index format and requires reindex before incremental add"))
+    {
+        "ValueError"
+    } else {
+        "ApiError"
+    }
 }
 
 fn clear_knowledge_reindex_flags(state: &AppState, name: &str) -> Result<(), ApiError> {
@@ -1643,19 +4269,30 @@ fn clear_knowledge_reindex_flags(state: &AppState, name: &str) -> Result<(), Api
     write_knowledge_config_store(state, &store)
 }
 
-async fn knowledge_task_stream(Path(task_id): Path<String>) -> impl IntoResponse {
-    let body = format!(
-        "event: process_log\ndata: {{\"message\":\"Socartes Rust task {task_id} started\"}}\n\n\
-event: progress\ndata: {{\"task_id\":\"{task_id}\",\"stage\":\"completed\",\"message\":\"Task completed\",\"current\":1,\"total\":1,\"progress_percent\":100}}\n\n\
-event: complete\ndata: {{\"task_id\":\"{task_id}\",\"status\":\"completed\"}}\n\n"
-    );
-    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+async fn knowledge_task_stream(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> axum::response::Response {
+    let stream = state.knowledge_tasks.sse_stream(&task_id).await;
+    sse_stream_response(stream)
 }
 
 async fn delete_knowledge_base(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let access = match resolve_knowledge_access(&state, &payload, &name) {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = ensure_knowledge_access_writable(&access) {
+        return error.into_response();
+    }
     if name == BUILTIN_KNOWLEDGE_BASE {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1775,11 +4412,14 @@ async fn compile_book_page(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    match with_book_page_mut(&state, &request, |page| {
-        page["status"] = json!("ready");
-        page["updated_at"] = json!(now_seconds());
-        Ok(page.clone())
-    }) {
+    let Some(book_id) = request["book_id"].as_str() else {
+        return api_error(StatusCode::BAD_REQUEST, "book_id is required").into_response();
+    };
+    let Some(page_id) = request["page_id"].as_str() else {
+        return api_error(StatusCode::BAD_REQUEST, "page_id is required").into_response();
+    };
+    let force = request["force"].as_bool().unwrap_or(false);
+    match compile_book_page_record(&state, book_id, page_id, force) {
         Ok(page) => Json(json!({ "page": page })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1789,18 +4429,7 @@ async fn regenerate_book_block(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    match with_book_block_mut(&state, &request, |block| {
-        block["status"] = json!("ready");
-        block["updated_at"] = json!(now_seconds());
-        block["metadata"]["regenerated"] = json!(true);
-        if let Some(params) = request
-            .get("params_override")
-            .filter(|value| value.is_object())
-        {
-            merge_object_value(&mut block["params"], params);
-        }
-        Ok(block.clone())
-    }) {
+    match regenerate_book_block_record(&state, &request) {
         Ok(block) => Json(json!({ "block": block })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1897,21 +4526,103 @@ async fn book_deep_dive(
     if !book_exists(&state, book_id) {
         return api_error(StatusCode::NOT_FOUND, "Book not found").into_response();
     }
+    let mut spine = match load_book_json(&state, book_id, "spine.json") {
+        Ok(spine) => spine,
+        Err(error) => return error.into_response(),
+    };
+    if load_book_page(&state, book_id, parent_page_id).is_err() {
+        return api_error(StatusCode::NOT_FOUND, "Parent page not found").into_response();
+    }
+    let page_id = format!("deep-dive-{}", unique_id());
+    let chapter_id = format!("chapter-{page_id}");
+    let content_type = request["content_type"].as_str().unwrap_or("concept");
     let page = new_book_page(
         book_id,
-        &format!("deep-dive-{}", unique_id()),
-        "deep-dive",
+        &page_id,
+        &chapter_id,
         topic,
-        request["content_type"].as_str().unwrap_or("concept"),
+        content_type,
         10_000,
         parent_page_id,
     );
-    match write_book_page(&state, book_id, &page)
+    append_deep_dive_chapter(&mut spine, &chapter_id, &page_id, topic, content_type);
+    match write_book_json(&state, book_id, "spine.json", &spine)
+        .and_then(|()| write_book_page(&state, book_id, &page))
+        .and_then(|()| {
+            update_parent_for_deep_dive(
+                &state,
+                book_id,
+                parent_page_id,
+                request["block_id"].as_str(),
+                &page_id,
+                topic,
+            )
+        })
         .and_then(|()| refresh_book_counts(&state, book_id))
     {
         Ok(()) => Json(json!({ "page": page })).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn append_deep_dive_chapter(
+    spine: &mut Value,
+    chapter_id: &str,
+    page_id: &str,
+    topic: &str,
+    content_type: &str,
+) {
+    let order = spine["chapters"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default() as i64;
+    let chapter = json!({
+        "id": chapter_id,
+        "title": format!("{topic} (deep dive)"),
+        "learning_objectives": [format!("Go deeper into {topic}")],
+        "content_type": content_type,
+        "source_anchors": [],
+        "prerequisites": [],
+        "page_ids": [page_id],
+        "summary": format!("Sub-chapter spawned from parent page for {topic}."),
+        "order": order
+    });
+    if let Some(chapters) = spine["chapters"].as_array_mut() {
+        chapters.push(chapter);
+    } else {
+        spine["chapters"] = json!([chapter]);
+    }
+    spine["updated_at"] = json!(now_seconds());
+}
+
+fn update_parent_for_deep_dive(
+    state: &AppState,
+    book_id: &str,
+    parent_page_id: &str,
+    block_id: Option<&str>,
+    child_page_id: &str,
+    topic: &str,
+) -> Result<(), ApiError> {
+    let mut parent = load_book_page(state, book_id, parent_page_id)?;
+    let link = json!({
+        "target_page_id": child_page_id,
+        "relation": "deepens",
+        "label": topic
+    });
+    if let Some(links) = parent["links"].as_array_mut() {
+        links.push(link);
+    } else {
+        parent["links"] = json!([link]);
+    }
+    if let Some(block_id) = block_id
+        && let Some(blocks) = parent["blocks"].as_array_mut()
+        && let Some(block) = blocks.iter_mut().find(|block| block["id"] == block_id)
+    {
+        ensure_object(&mut block["metadata"]);
+        block["metadata"]["deep_dive_page_id"] = json!(child_page_id);
+    }
+    parent["updated_at"] = json!(now_seconds());
+    write_book_page(state, book_id, &parent)
 }
 
 async fn record_book_quiz_attempt(
@@ -1923,12 +4634,14 @@ async fn record_book_quiz_attempt(
     };
     let mut progress =
         load_book_progress(&state, book_id).unwrap_or_else(|_| default_progress(book_id));
+    let page_id = request["page_id"].as_str().unwrap_or_default();
+    let is_correct = request["is_correct"].as_bool().unwrap_or(false);
     let attempt = json!({
         "block_id": request["block_id"].as_str().unwrap_or_default(),
-        "page_id": request["page_id"].as_str().unwrap_or_default(),
+        "page_id": page_id,
         "question_id": request["question_id"].as_str().unwrap_or_default(),
         "user_answer": request["user_answer"].as_str().unwrap_or_default(),
-        "is_correct": request["is_correct"].as_bool().unwrap_or(false),
+        "is_correct": is_correct,
         "timestamp": now_seconds()
     });
     if let Some(attempts) = progress["quiz_attempts"].as_array_mut() {
@@ -1936,19 +4649,33 @@ async fn record_book_quiz_attempt(
     } else {
         progress["quiz_attempts"] = json!([attempt]);
     }
-    let attempts = progress["quiz_attempts"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let correct = attempts
-        .iter()
-        .filter(|attempt| attempt["is_correct"].as_bool().unwrap_or(false))
-        .count();
-    progress["score"] = if attempts.is_empty() {
-        json!(0.0)
+    if is_correct {
+        let current_score = progress["score"]
+            .as_i64()
+            .or_else(|| progress["score"].as_f64().map(|value| value as i64))
+            .unwrap_or_default();
+        progress["score"] = json!(current_score + 1);
     } else {
-        json!(correct as f64 / attempts.len() as f64)
-    };
+        let chapter_id = load_book_page(&state, book_id, page_id)
+            .ok()
+            .and_then(|page| page["chapter_id"].as_str().map(ToString::to_string))
+            .unwrap_or_default();
+        if !chapter_id.is_empty() {
+            if let Some(weak_chapters) = progress["weak_chapters"].as_array_mut() {
+                if !weak_chapters
+                    .iter()
+                    .any(|chapter| chapter.as_str() == Some(chapter_id.as_str()))
+                {
+                    weak_chapters.push(json!(chapter_id));
+                }
+            } else {
+                progress["weak_chapters"] = json!([chapter_id]);
+            }
+        }
+        if progress["score"].is_null() {
+            progress["score"] = json!(0);
+        }
+    }
     progress["updated_at"] = json!(now_seconds());
     match write_book_json(&state, book_id, "progress.json", &progress) {
         Ok(()) => Json(json!({ "progress": progress })).into_response(),
@@ -1961,10 +4688,22 @@ async fn supplement_book(
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
     let topic = request["topic"].as_str().unwrap_or("Supplement");
-    let params = json!({ "topic": topic, "role": "supplement" });
-    let block = new_book_block("callout", &format!("Supplement: {topic}"), &params, true);
-    match append_book_block(&state, &request, block.clone()) {
-        Ok(()) => Json(json!({ "block": block })).into_response(),
+    let callout_params = json!({ "variant": "common_pitfall", "topic": topic });
+    let text_params = json!({ "role": "remediation", "topic": topic });
+    let quiz_params = json!({ "num_questions": 2, "difficulty": "easy", "topic": topic });
+    let callout = new_book_block(
+        "callout",
+        &format!("Common pitfall: {topic}"),
+        &callout_params,
+        true,
+    );
+    let text = new_book_block("text", &format!("Remediation: {topic}"), &text_params, true);
+    let quiz = new_book_block("quiz", &format!("Practice: {topic}"), &quiz_params, true);
+    match append_book_block(&state, &request, callout)
+        .and_then(|_| append_book_block(&state, &request, text))
+        .and_then(|_| append_book_block(&state, &request, quiz.clone()))
+    {
+        Ok(()) => Json(json!({ "block": quiz })).into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -2009,28 +4748,17 @@ async fn book_health(
     State(state): State<AppState>,
     Path(book_id): Path<String>,
 ) -> impl IntoResponse {
-    if !book_exists(&state, &book_id) {
-        return api_error(StatusCode::NOT_FOUND, "Book not found").into_response();
-    }
-    let pages = load_book_pages(&state, &book_id).unwrap_or_default();
+    let mut book = match load_book_manifest(&state, &book_id) {
+        Ok(book) => book,
+        Err(error) => return error.into_response(),
+    };
+    let kb_drift = match book_kb_drift_report(&state, &book_id, &mut book) {
+        Ok(report) => report,
+        Err(error) => return error.into_response(),
+    };
     Json(json!({
-        "kb_drift": {
-            "book_id": book_id,
-            "has_drift": false,
-            "new_kbs": [],
-            "removed_kbs": [],
-            "changed_kbs": [],
-            "stale_page_ids": []
-        },
-        "log_health": {
-            "book_id": book_id,
-            "total_entries": pages.len(),
-            "error_entries": 0,
-            "block_failures": 0,
-            "last_compile_at": null,
-            "last_error_at": null,
-            "repeated_failures": []
-        }
+        "kb_drift": kb_drift,
+        "log_health": scan_book_log_health(&state, &book_id)
     }))
     .into_response()
 }
@@ -2043,35 +4771,778 @@ async fn refresh_book_fingerprints(
         Ok(book) => book,
         Err(error) => return error.into_response(),
     };
-    let fingerprints = book["knowledge_bases"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(|name| (name.to_string(), json!(format!("rust-file-{name}"))))
-                .collect::<serde_json::Map<_, _>>()
-        })
-        .unwrap_or_default();
+    let knowledge_bases = as_string_array(&book["knowledge_bases"]);
+    let fingerprints = book_kb_fingerprints(&state, &knowledge_bases);
     book["kb_fingerprints"] = Value::Object(fingerprints.clone());
     book["stale_page_ids"] = json!([]);
     book["updated_at"] = json!(now_seconds());
     match write_book_manifest(&state, &book_id, &book) {
-        Ok(()) => Json(json!({
-            "book_id": book_id,
-            "kb_fingerprints": fingerprints,
-            "stale_page_ids": []
-        }))
-        .into_response(),
+        Ok(()) => match append_book_log(
+            &state,
+            &book_id,
+            "kb_health",
+            &format!("refreshed kb fingerprints ({} kbs)", fingerprints.len()),
+        ) {
+            Ok(()) => Json(json!({
+                "book_id": book_id,
+                "kb_fingerprints": fingerprints,
+                "stale_page_ids": []
+            }))
+            .into_response(),
+            Err(error) => error.into_response(),
+        },
         Err(error) => error.into_response(),
     }
 }
 
-async fn book_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_book_ws)
+async fn book_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
+    ws.on_upgrade(move |socket| handle_book_ws(state, socket))
+        .into_response()
 }
 
-async fn handle_book_ws(mut socket: WebSocket) {
+async fn send_book_ws_json(socket: &mut WebSocket, value: Value) -> bool {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .is_ok()
+}
+
+fn book_ws_stage_event(event_type: &str, stage: &str, content: &str, metadata: Value) -> Value {
+    json!({
+        "type": event_type,
+        "source": "book_engine",
+        "stage": stage,
+        "content": content,
+        "metadata": metadata
+    })
+}
+
+fn book_ws_progress_event(stage: &str, kind: &str, metadata: Value) -> Value {
+    let mut event_metadata = json!({ "kind": kind });
+    merge_object_value(&mut event_metadata, &metadata);
+    book_ws_stage_event("progress", stage, kind, event_metadata)
+}
+
+async fn send_book_ws_api_error(socket: &mut WebSocket, fallback: &str, error: ApiError) -> bool {
+    let (_, Json(body)) = error;
+    send_book_ws_json(
+        socket,
+        json!({
+            "type": "error",
+            "content": body["detail"].as_str().unwrap_or(fallback)
+        }),
+    )
+    .await
+}
+
+async fn question_generate_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
+    ws.on_upgrade(move |socket| handle_question_generate_socket(state, socket))
+        .into_response()
+}
+
+async fn question_mimic_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
+    ws.on_upgrade(move |socket| handle_question_mimic_socket(state, socket))
+        .into_response()
+}
+
+async fn send_question_ws_json(socket: &mut WebSocket, value: Value) -> bool {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .is_ok()
+}
+
+async fn receive_question_ws_json(socket: &mut WebSocket) -> Option<Value> {
+    let message = socket.recv().await?;
+    let Ok(Message::Text(text)) = message else {
+        let _ = send_question_ws_json(
+            socket,
+            json!({"type": "error", "content": "Invalid WebSocket JSON message."}),
+        )
+        .await;
+        return None;
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            let _ = send_question_ws_json(
+                socket,
+                json!({"type": "error", "content": "Invalid WebSocket JSON message."}),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+fn empty_legacy_question_requirement(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+fn legacy_requirement_string(value: &Value) -> String {
+    value
+        .get("knowledge_point")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn legacy_requirement_field(value: &Value, field: &str) -> String {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn legacy_question_count_value(payload: &Value, field: &str) -> Value {
+    payload.get(field).cloned().unwrap_or_else(|| json!(1))
+}
+
+fn legacy_mimic_requested_count(payload: &Value) -> i64 {
+    fn python_default_zero(value: i64) -> i64 {
+        if value == 0 { 10 } else { value }
+    }
+
+    match payload.get("max_questions") {
+        Some(Value::Number(number)) => number.as_i64().map(python_default_zero).unwrap_or(10),
+        Some(Value::String(text)) => text
+            .trim()
+            .parse::<i64>()
+            .map(python_default_zero)
+            .unwrap_or(10),
+        Some(Value::Bool(false)) | Some(Value::Null) | None => 10,
+        _ => 10,
+    }
+}
+
+fn legacy_question_result_items(result: &Value) -> Vec<Value> {
+    result["summary"]["results"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("qa_pair").cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn legacy_question_template(qa_pair: &Value, index: usize, source: &str) -> Value {
+    let question_id = qa_pair["question_id"]
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("q_{index}"));
+    json!({
+        "question_id": question_id,
+        "concentration": qa_pair["concentration"].as_str().unwrap_or_default(),
+        "question_type": qa_pair["question_type"].as_str().unwrap_or("choice"),
+        "difficulty": qa_pair["difficulty"].as_str().unwrap_or("medium"),
+        "source": source,
+        "reference_question": qa_pair
+            .get("reference_question")
+            .or_else(|| qa_pair.get("metadata").and_then(|metadata| metadata.get("reference_question")))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "reference_answer": qa_pair
+            .get("reference_answer")
+            .or_else(|| qa_pair.get("metadata").and_then(|metadata| metadata.get("reference_answer")))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "metadata": qa_pair["metadata"].clone()
+    })
+}
+
+fn is_mimic_questions_json(path: &FsPath) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_questions.json"))
+}
+
+fn find_mimic_questions_json(paper_context: &str) -> Option<PathBuf> {
+    let path = FsPath::new(paper_context);
+    if path.is_file() && is_mimic_questions_json(path) {
+        return Some(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut candidates = fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|entry_path| entry_path.is_file() && is_mimic_questions_json(entry_path))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn mimic_question_limit(requested: i64) -> Option<usize> {
+    if requested > 0 {
+        Some(requested as usize)
+    } else {
+        None
+    }
+}
+
+fn build_mimic_result_from_reference_questions(
+    paper_context: &str,
+    requested: i64,
+) -> Result<Option<Value>, String> {
+    let Some(question_file) = find_mimic_questions_json(paper_context) else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(&question_file).map_err(|error| error.to_string())?;
+    let payload: Value =
+        serde_json::from_str(&text).map_err(|error| python_json_decode_error(&text, &error))?;
+    let questions = payload["questions"].as_array().cloned().unwrap_or_default();
+    let limit = mimic_question_limit(requested).unwrap_or(questions.len());
+    let mut results = Vec::new();
+    let mut templates = Vec::new();
+    let mut response_sections = Vec::new();
+
+    for (source_index, item) in questions.iter().take(limit).enumerate() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let question_text = object
+            .get("question_text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let Some(question_text) = question_text else {
+            continue;
+        };
+        let number = source_index + 1;
+        let question_id = format!("q_{number}");
+        let raw_type = object
+            .get("question_type")
+            .and_then(Value::as_str)
+            .unwrap_or("written")
+            .trim()
+            .to_ascii_lowercase();
+        let question_type = normalize_deep_question_type(&raw_type);
+        let reference_answer = object
+            .get("answer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let reference_answer_value = reference_answer
+            .map(|answer| json!(answer))
+            .unwrap_or(Value::Null);
+        let question_number = object
+            .get("question_number")
+            .cloned()
+            .unwrap_or_else(|| json!(number.to_string()));
+        let images = object
+            .get("images")
+            .filter(|value| value.is_array())
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let concentration = truncate_for_prompt(question_text, 240);
+        let metadata = json!({
+            "question_number": question_number,
+            "images": images,
+            "reference_question": question_text,
+            "reference_answer": reference_answer_value.clone(),
+            "knowledge_context": question_text,
+            "original_question_type": raw_type
+        });
+        let qa_pair = json!({
+            "question_id": question_id,
+            "question": question_text,
+            "options": Value::Null,
+            "correct_answer": reference_answer.unwrap_or("N/A"),
+            "explanation": reference_answer
+                .map(|answer| format!("Reference answer: {answer}"))
+                .unwrap_or_else(|| "Generated from the reference exam question.".to_string()),
+            "question_type": question_type,
+            "difficulty": "medium",
+            "concentration": concentration,
+            "knowledge_context": question_text,
+            "reference_question": question_text,
+            "reference_answer": reference_answer_value,
+            "metadata": metadata
+        });
+        templates.push(legacy_question_template(&qa_pair, number, "mimic"));
+        response_sections.push(format!(
+            "### Question {number}\n{question_text}\n\n**Reference answer:** {}",
+            reference_answer.unwrap_or("N/A")
+        ));
+        results.push(json!({
+            "template": templates.last().cloned().unwrap_or_else(|| json!({})),
+            "qa_pair": qa_pair,
+            "success": true
+        }));
+    }
+
+    let completed = results.len();
+    let response = response_sections.join("\n\n");
+    Ok(Some(json!({
+        "response": response,
+        "content": response,
+        "mode": "mimic",
+        "summary": {
+            "success": completed > 0,
+            "source": "exam",
+            "requested": requested,
+            "template_count": templates.len(),
+            "completed": completed,
+            "failed": 0,
+            "templates": templates,
+            "results": results,
+            "trace": {
+                "paper_dir": paper_context,
+                "question_file": question_file.to_string_lossy(),
+                "template_count": completed
+            }
+        }
+    })))
+}
+
+fn python_json_decode_error(text: &str, error: &serde_json::Error) -> String {
+    let first_non_ws = text.char_indices().find(|(_, ch)| !ch.is_whitespace());
+    let Some((index, ch)) = first_non_ws else {
+        return "Expecting value: line 1 column 1 (char 0)".to_string();
+    };
+    let error_text = error.to_string();
+    if !matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n')
+        || error_text.starts_with("expected ident")
+    {
+        let (line, column) = line_column_for_char_index(text, index);
+        return format!("Expecting value: line {line} column {column} (char {index})");
+    }
+    error_text
+}
+
+fn line_column_for_char_index(text: &str, index: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for (position, ch) in text.char_indices() {
+        if position >= index {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+async fn stream_legacy_question_generation_events(
+    socket: &mut WebSocket,
+    result: &Value,
+    source: &str,
+    include_ideation_progress: bool,
+) -> bool {
+    let questions = legacy_question_result_items(result);
+    let total = questions.len();
+    if include_ideation_progress
+        && !send_question_ws_json(
+            socket,
+            json!({
+                "type": "progress",
+                "stage": "ideation",
+                "status": "running",
+                "batch": 1,
+                "current": 0,
+                "total": total,
+                "batch_size": total
+            }),
+        )
+        .await
+    {
+        return false;
+    }
+
+    let templates = questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| legacy_question_template(question, index + 1, source))
+        .collect::<Vec<_>>();
+    let mut templates_ready = json!({
+        "type": "templates_ready",
+        "stage": "ideation",
+        "count": total,
+        "generated_total": total,
+        "requested_total": result["summary"]["requested"].as_u64().unwrap_or(total as u64),
+        "templates": templates
+    });
+    if include_ideation_progress {
+        templates_ready["batch"] = json!(1);
+    }
+    if !send_question_ws_json(socket, templates_ready).await {
+        return false;
+    }
+
+    if include_ideation_progress
+        && !send_question_ws_json(
+            socket,
+            json!({
+                "type": "progress",
+                "stage": "ideation",
+                "status": "complete",
+                "current": total,
+                "total": result["summary"]["requested"].as_u64().unwrap_or(total as u64),
+                "batches": 1
+            }),
+        )
+        .await
+    {
+        return false;
+    }
+
+    for (index, question) in questions.iter().enumerate() {
+        let current = index + 1;
+        let question_id = question["question_id"]
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("q_{current}"));
+        if !send_question_ws_json(
+            socket,
+            json!({
+                "type": "question_update",
+                "question_id": question_id.clone(),
+                "status": "generating",
+                "current": current,
+                "total": total
+            }),
+        )
+        .await
+        {
+            return false;
+        }
+        if !send_question_ws_json(
+            socket,
+            json!({
+                "type": "result",
+                "question_id": question_id.clone(),
+                "index": index,
+                "question": question,
+                "success": true
+            }),
+        )
+        .await
+        {
+            return false;
+        }
+        if !send_question_ws_json(
+            socket,
+            json!({
+                "type": "progress",
+                "stage": "generation",
+                "status": "running",
+                "current": current,
+                "total": total,
+                "question_id": question_id
+            }),
+        )
+        .await
+        {
+            return false;
+        }
+    }
+
+    send_question_ws_json(
+        socket,
+        json!({
+            "type": "progress",
+            "stage": "complete",
+            "completed": total,
+            "total": total
+        }),
+    )
+    .await
+}
+
+async fn handle_question_generate_socket(_state: AppState, mut socket: WebSocket) {
+    let Some(payload) = receive_question_ws_json(&mut socket).await else {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let requirement = &payload["requirement"];
+    if empty_legacy_question_requirement(requirement) {
+        let _ = send_question_ws_json(
+            &mut socket,
+            json!({"type": "error", "content": "Requirement is required"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
+    let count = legacy_question_count_value(&payload, "count");
+    let topic = legacy_requirement_string(requirement);
+    let config = json!({
+        "mode": "custom",
+        "topic": topic.clone(),
+        "count": count.clone(),
+        "num_questions": count,
+        "preference": legacy_requirement_field(requirement, "preference"),
+        "difficulty": legacy_requirement_field(requirement, "difficulty"),
+        "question_type": legacy_requirement_field(requirement, "question_type")
+    });
+    let result = build_deep_question_result(&topic, &config);
+    let task_id = format!("question_gen_{}", unique_id());
+
+    if !send_question_ws_json(&mut socket, json!({"type": "task_id", "task_id": task_id})).await {
+        return;
+    }
+    if !send_question_ws_json(&mut socket, json!({"type": "status", "content": "started"})).await {
+        return;
+    }
+    if !stream_legacy_question_generation_events(&mut socket, &result, "topic", true).await {
+        return;
+    }
+    let _ = send_question_ws_json(
+        &mut socket,
+        json!({
+            "type": "batch_summary",
+            "requested": result["summary"]["requested"].clone(),
+            "completed": result["summary"]["completed"].clone(),
+            "failed": result["summary"]["failed"].clone()
+        }),
+    )
+    .await;
+    let _ = send_question_ws_json(&mut socket, json!({"type": "complete"})).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn save_uploaded_mimic_pdf(state: &AppState, pdf_name: &str, bytes: &[u8]) -> Result<(), String> {
+    let safe_name = pdf_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("exam.pdf")
+        .trim();
+    let safe_name = if safe_name.is_empty() {
+        "exam.pdf"
+    } else {
+        safe_name
+    };
+    let target_dir = state
+        .output_root
+        .join("question")
+        .join("mimic_papers")
+        .join(format!("mimic_{}", unique_id()));
+    fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
+    fs::write(target_dir.join(safe_name), bytes).map_err(|error| error.to_string())
+}
+
+async fn handle_question_mimic_socket(state: AppState, mut socket: WebSocket) {
+    let Some(payload) = receive_question_ws_json(&mut socket).await else {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    if !send_question_ws_json(
+        &mut socket,
+        json!({"type": "status", "stage": "init", "content": "Initializing..."}),
+    )
+    .await
+    {
+        return;
+    }
+
+    let mode = payload["mode"].as_str().unwrap_or("parsed");
+    let paper_context = match mode {
+        "upload" => {
+            let Some(pdf_data) = payload["pdf_data"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                let _ = send_question_ws_json(
+                    &mut socket,
+                    json!({"type": "error", "content": "PDF data is required for upload mode"}),
+                )
+                .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            };
+            let pdf_bytes = match general_purpose::STANDARD.decode(pdf_data) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = send_question_ws_json(
+                        &mut socket,
+                        json!({"type": "error", "content": format!("Invalid base64 PDF data: {error}")}),
+                    )
+                    .await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+            };
+            let pdf_name = payload["pdf_name"].as_str().unwrap_or("exam.pdf");
+            if !send_question_ws_json(
+                &mut socket,
+                json!({"type": "status", "stage": "upload", "content": format!("Saving PDF: {pdf_name}")}),
+            )
+            .await
+            {
+                return;
+            }
+            if let Err(error) = save_uploaded_mimic_pdf(&state, pdf_name, &pdf_bytes) {
+                let _ =
+                    send_question_ws_json(&mut socket, json!({"type": "error", "content": error}))
+                        .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            if !send_question_ws_json(
+                &mut socket,
+                json!({"type": "status", "stage": "parsing", "content": "Parsing PDF exam paper (MinerU)..."}),
+            )
+            .await
+            {
+                return;
+            }
+            pdf_name.to_string()
+        }
+        "parsed" => {
+            let Some(paper_path) = payload["paper_path"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                let _ = send_question_ws_json(
+                    &mut socket,
+                    json!({"type": "error", "content": "paper_path is required for parsed mode"}),
+                )
+                .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            };
+            paper_path.to_string()
+        }
+        other => {
+            let _ = send_question_ws_json(
+                &mut socket,
+                json!({"type": "error", "content": format!("Unknown mode: {other}")}),
+            )
+            .await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    if !send_question_ws_json(
+        &mut socket,
+        json!({
+            "type": "status",
+            "stage": "processing",
+            "content": "Executing question generation workflow..."
+        }),
+    )
+    .await
+    {
+        return;
+    }
+    let _ = send_question_ws_json(
+        &mut socket,
+        json!({"type": "progress", "stage": "parsing", "status": "running"}),
+    )
+    .await;
+    let _ = send_question_ws_json(
+        &mut socket,
+        json!({
+            "type": "progress",
+            "stage": "extracting",
+            "status": "running",
+            "paper_dir": paper_context.clone()
+        }),
+    )
+    .await;
+
+    let requested_questions = legacy_mimic_requested_count(&payload);
+    let config = json!({
+        "mode": "mimic",
+        "paper_path": paper_context.clone(),
+        "max_questions": requested_questions,
+        "question_type": payload["question_type"].as_str().unwrap_or("choice")
+    });
+    let result = if mode == "parsed" {
+        match build_mimic_result_from_reference_questions(&paper_context, requested_questions) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                let _ = send_question_ws_json(
+                    &mut socket,
+                    json!({"type": "error", "content": "Failed to extract questions from parsed exam"}),
+                )
+                .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            Err(error) => {
+                let _ =
+                    send_question_ws_json(&mut socket, json!({"type": "error", "content": error}))
+                        .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+        }
+    } else {
+        build_deep_question_result(&paper_context, &config)
+    };
+    let total = result["summary"]["completed"].as_u64().unwrap_or_default();
+    let _ = send_question_ws_json(
+        &mut socket,
+        json!({
+            "type": "progress",
+            "stage": "extracting",
+            "status": "complete",
+            "templates": total
+        }),
+    )
+    .await;
+    if !stream_legacy_question_generation_events(&mut socket, &result, "mimic", false).await {
+        return;
+    }
+    if !result["summary"]["success"].as_bool().unwrap_or(true) {
+        let _ = send_question_ws_json(
+            &mut socket,
+            json!({"type": "error", "content": "Unknown error"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    let _ = send_question_ws_json(&mut socket, json!({"type": "complete"})).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn handle_book_ws(state: AppState, mut socket: WebSocket) {
     let connected = json!({
         "type": "connected",
         "source": "book",
@@ -2079,34 +5550,436 @@ async fn handle_book_ws(mut socket: WebSocket) {
         "content": "Socartes Rust book stream connected",
         "metadata": {}
     });
-    if socket
-        .send(Message::Text(connected.to_string().into()))
-        .await
-        .is_err()
-    {
+    if !send_book_ws_json(&mut socket, connected).await {
         return;
     }
 
     while let Some(message) = socket.recv().await {
         match message {
             Ok(Message::Text(text)) => {
-                let message_type = serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|value| value["type"].as_str().map(ToString::to_string))
-                    .unwrap_or_else(|| "unknown".to_string());
-                let response = json!({
-                    "type": "error",
-                    "source": "book",
-                    "stage": "unsupported",
-                    "content": format!("Book WebSocket action {message_type} should use the REST compatibility endpoints in this Rust build."),
-                    "metadata": { "request_type": message_type }
-                });
-                if socket
-                    .send(Message::Text(response.to_string().into()))
+                let data = match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if !send_book_ws_json(
+                            &mut socket,
+                            json!({
+                                "type": "error",
+                                "content": format!("Bad message: {error}")
+                            }),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let message_type = data["type"].as_str().unwrap_or_default().trim();
+                if message_type.is_empty() {
+                    if !send_book_ws_json(
+                        &mut socket,
+                        json!({ "type": "error", "content": "Missing 'type' field" }),
+                    )
                     .await
-                    .is_err()
-                {
-                    return;
+                    {
+                        return;
+                    }
+                    continue;
+                }
+
+                match message_type {
+                    "create" => {
+                        if !send_book_ws_json(
+                            &mut socket,
+                            book_ws_stage_event(
+                                "stage_start",
+                                "ideation",
+                                "Starting book ideation",
+                                json!({}),
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        match create_book_record(&state, &data) {
+                            Ok((book, proposal)) => {
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_progress_event(
+                                        "ideation",
+                                        "proposal_ready",
+                                        json!({
+                                            "book_id": book["id"],
+                                            "proposal": proposal
+                                        }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_stage_event(
+                                        "stage_end",
+                                        "ideation",
+                                        "Book proposal ready",
+                                        json!({ "book_id": book["id"] }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    json!({
+                                        "type": "create_result",
+                                        "book": book,
+                                        "proposal": proposal
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if !send_book_ws_api_error(&mut socket, "Book create failed", error)
+                                    .await
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    "confirm_proposal" => {
+                        let book_id = data["book_id"].as_str().unwrap_or_default();
+                        if !send_book_ws_json(
+                            &mut socket,
+                            book_ws_stage_event(
+                                "stage_start",
+                                "exploration",
+                                "Starting source exploration",
+                                json!({ "book_id": book_id }),
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        match confirm_book_proposal_record(&state, book_id, data.get("proposal")) {
+                            Ok((book, spine)) => {
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_progress_event(
+                                        "exploration",
+                                        "exploration_ready",
+                                        json!({
+                                            "book_id": book["id"],
+                                            "summary": spine["exploration_summary"]
+                                        }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_stage_event(
+                                        "stage_end",
+                                        "exploration",
+                                        "Exploration ready",
+                                        json!({ "book_id": book["id"] }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_stage_event(
+                                        "stage_start",
+                                        "spine",
+                                        "Building book spine",
+                                        json!({ "book_id": book["id"] }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_progress_event(
+                                        "spine",
+                                        "spine_ready",
+                                        json!({
+                                            "book_id": book["id"],
+                                            "spine": spine
+                                        }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_stage_event(
+                                        "stage_end",
+                                        "spine",
+                                        "Book spine ready",
+                                        json!({ "book_id": book["id"] }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    json!({
+                                        "type": "confirm_proposal_result",
+                                        "book": book,
+                                        "spine": spine
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if !send_book_ws_api_error(
+                                    &mut socket,
+                                    "Book proposal confirmation failed",
+                                    error,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    "confirm_spine" => {
+                        let book_id = data["book_id"].as_str().unwrap_or_default();
+                        if !send_book_ws_json(
+                            &mut socket,
+                            book_ws_stage_event(
+                                "stage_start",
+                                "spine",
+                                "Confirming book spine",
+                                json!({ "book_id": book_id }),
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        let auto_compile = data["auto_compile"].as_bool().unwrap_or(true);
+                        match confirm_book_spine_record(
+                            &state,
+                            book_id,
+                            data.get("spine"),
+                            auto_compile,
+                        ) {
+                            Ok(pages) => {
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_progress_event(
+                                        "spine",
+                                        "overview_ready",
+                                        json!({
+                                            "book_id": book_id,
+                                            "pages_count": pages.len(),
+                                            "auto_compile": auto_compile
+                                        }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_stage_event(
+                                        "stage_end",
+                                        "spine",
+                                        "Book overview ready",
+                                        json!({ "book_id": book_id }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    json!({
+                                        "type": "confirm_spine_result",
+                                        "pages": pages
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if !send_book_ws_api_error(
+                                    &mut socket,
+                                    "Book spine confirmation failed",
+                                    error,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    "compile_page" => {
+                        let book_id = data["book_id"].as_str().unwrap_or_default();
+                        let page_id = data["page_id"].as_str().unwrap_or_default();
+                        let force = data["force"].as_bool().unwrap_or(false);
+                        let no_op = load_book_page(&state, book_id, page_id)
+                            .map(|page| book_page_compile_is_noop(&page, force))
+                            .unwrap_or(false);
+                        if !no_op
+                            && !send_book_ws_json(
+                                &mut socket,
+                                book_ws_progress_event(
+                                    "compilation",
+                                    "page_compile_started",
+                                    json!({ "book_id": book_id, "page_id": page_id }),
+                                ),
+                            )
+                            .await
+                        {
+                            return;
+                        }
+                        match compile_book_page_record(&state, book_id, page_id, force) {
+                            Ok(page) => {
+                                if !no_op
+                                    && !send_book_ws_json(
+                                        &mut socket,
+                                        book_ws_progress_event(
+                                            "compilation",
+                                            "page_compiled",
+                                            json!({
+                                                "book_id": book_id,
+                                                "page_id": page_id,
+                                                "page": page
+                                            }),
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    json!({
+                                        "type": "compile_page_result",
+                                        "page": page
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if !send_book_ws_api_error(
+                                    &mut socket,
+                                    "Book page compilation failed",
+                                    error,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    "regenerate_block" => {
+                        let book_id = data["book_id"].as_str().unwrap_or_default();
+                        let page_id = data["page_id"].as_str().unwrap_or_default();
+                        let block_id = data["block_id"].as_str().unwrap_or_default();
+                        if !send_book_ws_json(
+                            &mut socket,
+                            book_ws_progress_event(
+                                "compilation",
+                                "block_started",
+                                json!({
+                                    "book_id": book_id,
+                                    "page_id": page_id,
+                                    "block_id": block_id
+                                }),
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        match regenerate_book_block_record(&state, &data) {
+                            Ok(block) => {
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    book_ws_progress_event(
+                                        "compilation",
+                                        "block_ready",
+                                        json!({
+                                            "book_id": book_id,
+                                            "page_id": page_id,
+                                            "block_id": block_id,
+                                            "block": block
+                                        }),
+                                    ),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                if !send_book_ws_json(
+                                    &mut socket,
+                                    json!({
+                                        "type": "regenerate_block_result",
+                                        "block": block
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if !send_book_ws_api_error(
+                                    &mut socket,
+                                    "Book block regeneration failed",
+                                    error,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        let response = json!({
+                            "type": "error",
+                            "content": format!("Unknown message type: {message_type}")
+                        });
+                        if !send_book_ws_json(&mut socket, response).await {
+                            return;
+                        }
+                    }
                 }
             }
             Ok(Message::Close(_)) | Err(_) => return,
@@ -2269,6 +6142,13 @@ type ApiError = (StatusCode, Json<Value>);
 
 fn api_error(status: StatusCode, detail: &str) -> ApiError {
     (status, Json(json!({ "detail": detail })))
+}
+
+fn api_error_detail(error: &ApiError) -> String {
+    error.1.0["detail"]
+        .as_str()
+        .unwrap_or("Knowledge task failed")
+        .to_string()
 }
 
 async fn notebook_health() -> Json<Value> {
@@ -2518,11 +6398,17 @@ async fn delete_co_writer_document(
     }
 }
 
-async fn co_writer_edit(Json(payload): Json<Value>) -> impl IntoResponse {
+async fn co_writer_edit(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
     match co_writer_edit_value(&payload) {
         Ok((edited_text, operation_id)) => {
-            Json(json!({ "edited_text": edited_text, "operation_id": operation_id }))
-                .into_response()
+            match save_co_writer_edit_operation(&state, &payload, &edited_text, &operation_id) {
+                Ok(()) => Json(json!({ "edited_text": edited_text, "operation_id": operation_id }))
+                    .into_response(),
+                Err(error) => error.into_response(),
+            }
         }
         Err(error) => error.into_response(),
     }
@@ -3439,15 +7325,108 @@ fn save_co_writer_tool_call(
     if value["tool_traces"].as_array().is_none_or(Vec::is_empty) {
         return Ok(None);
     }
+    write_co_writer_tool_call_file(state, operation_id, tool_type, value).map(Some)
+}
+
+fn write_co_writer_tool_call_file(
+    state: &AppState,
+    operation_id: &str,
+    tool_type: &str,
+    value: &Value,
+) -> Result<String, ApiError> {
     let Some(operation_id) = safe_storage_component(operation_id) else {
-        return Ok(None);
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid operation id"));
     };
     let Some(tool_type) = safe_storage_component(tool_type) else {
-        return Ok(None);
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid tool type"));
     };
     let path = co_writer_tool_calls_dir(state).join(format!("{operation_id}_{tool_type}.json"));
     write_json_file(&path, value)?;
-    Ok(Some(path.to_string_lossy().to_string()))
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn save_co_writer_edit_operation(
+    state: &AppState,
+    payload: &Value,
+    edited_text: &str,
+    operation_id: &str,
+) -> Result<(), ApiError> {
+    if operation_id.is_empty() {
+        return Ok(());
+    }
+
+    let action = payload["action"].as_str().unwrap_or("rewrite");
+    let instruction = payload["instruction"].as_str().unwrap_or("").trim();
+    let original_text = payload["text"].as_str().unwrap_or("");
+    let source = payload["source"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let kb_name = payload["kb_name"].as_str().map(str::trim).unwrap_or("");
+
+    let tool_call_file = match source {
+        Some("rag") if !kb_name.is_empty() => {
+            let tool_call = json!({
+                "type": "rag",
+                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "operation_id": operation_id,
+                "query": instruction,
+                "kb_name": kb_name,
+                "mode": "naive",
+                "context": "",
+                "raw_result": {
+                    "success": true,
+                    "content": "Rust Co-Writer compatibility recorded the requested RAG context lookup.",
+                    "sources": []
+                }
+            });
+            Some(write_co_writer_tool_call_file(
+                state,
+                operation_id,
+                "rag",
+                &tool_call,
+            )?)
+        }
+        Some("web") | Some("web_search") => {
+            let tool_call = json!({
+                "type": "web_search",
+                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "operation_id": operation_id,
+                "query": instruction,
+                "answer": "",
+                "citations": [],
+                "search_results": [],
+                "usage": {}
+            });
+            Some(write_co_writer_tool_call_file(
+                state,
+                operation_id,
+                "web",
+                &tool_call,
+            )?)
+        }
+        _ => None,
+    };
+
+    let entry = json!({
+        "id": operation_id,
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "action": action,
+        "source": source,
+        "kb_name": payload["kb_name"].clone(),
+        "input": {
+            "original_text": original_text,
+            "instruction": instruction
+        },
+        "output": {
+            "edited_text": edited_text
+        },
+        "tool_call_file": tool_call_file,
+        "model": "deterministic-co-writer"
+    });
+    let mut history = load_co_writer_history(state)?;
+    history.push(entry);
+    save_co_writer_history(state, &history)
 }
 
 fn save_co_writer_operation(
@@ -3726,6 +7705,27 @@ fn upsert_question_entry_value(state: &AppState, payload: &Value) -> Result<Valu
     let session_id = payload["session_id"]
         .as_str()
         .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "session_id is required"))?;
+    let session = read_session(state, session_id).map_err(|_| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Session not found: {session_id}"),
+        )
+    })?;
+    upsert_question_entry_value_for_session(
+        state,
+        payload,
+        session["title"].as_str().unwrap_or_default(),
+    )
+}
+
+fn upsert_question_entry_value_for_session(
+    state: &AppState,
+    payload: &Value,
+    session_title: &str,
+) -> Result<Value, ApiError> {
+    let session_id = payload["session_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "session_id is required"))?;
     let question_id = payload["question_id"]
         .as_str()
         .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "question_id is required"))?;
@@ -3734,12 +7734,6 @@ fn upsert_question_entry_value(state: &AppState, payload: &Value) -> Result<Valu
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "question is required"))?;
-    let session = read_session(state, session_id).map_err(|_| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            &format!("Session not found: {session_id}"),
-        )
-    })?;
     let mut store = load_question_store(state);
     let now = now_seconds();
     let existing_position = store["entries"]
@@ -3761,7 +7755,7 @@ fn upsert_question_entry_value(state: &AppState, payload: &Value) -> Result<Valu
             let entry = json!({
                 "id": entry_id,
                 "session_id": session_id,
-                "session_title": session["title"].as_str().unwrap_or(""),
+                "session_title": session_title,
                 "question_id": question_id,
                 "question": question,
                 "question_type": payload["question_type"].as_str().unwrap_or(""),
@@ -4451,11 +8445,12 @@ fn confirm_book_spine_record(
     auto_compile: bool,
 ) -> Result<Vec<Value>, ApiError> {
     let mut book = load_book_manifest(state, book_id)?;
-    let spine = spine
+    let mut spine = spine
         .filter(|value| value.is_object())
         .cloned()
         .or_else(|| load_book_json(state, book_id, "spine.json").ok())
         .unwrap_or_else(|| default_spine(book_id, &book["proposal"]));
+    spine = ensure_book_overview_chapter(spine, &book);
     write_book_json(state, book_id, "spine.json", &spine)?;
     let pages = if auto_compile {
         compile_pages_from_spine(state, book_id, true)?
@@ -4481,6 +8476,7 @@ fn compile_pages_from_spine(
     mark_ready: bool,
 ) -> Result<Vec<Value>, ApiError> {
     let spine = load_book_json(state, book_id, "spine.json")?;
+    let book = load_book_manifest(state, book_id)?;
     let mut pages = Vec::new();
     for chapter in spine["chapters"].as_array().cloned().unwrap_or_default() {
         let page_ids = chapter["page_ids"]
@@ -4500,6 +8496,16 @@ fn compile_pages_from_spine(
                     "",
                 )
             });
+            if is_book_overview_chapter(&chapter) {
+                page["content_type"] = json!("overview");
+                page["status"] = json!("ready");
+                if !book_page_has_block_type(&page, "concept_graph") {
+                    page["blocks"] = json!(book_overview_blocks(&book, &spine));
+                }
+                page["updated_at"] = json!(now_seconds());
+            } else if mark_ready {
+                page = compile_book_page_value(&book, &spine, &chapter, page, true);
+            }
             if mark_ready {
                 page["status"] = json!("ready");
                 page["updated_at"] = json!(now_seconds());
@@ -4510,6 +8516,887 @@ fn compile_pages_from_spine(
     }
     refresh_book_counts(state, book_id)?;
     Ok(pages)
+}
+
+fn compile_book_page_record(
+    state: &AppState,
+    book_id: &str,
+    page_id: &str,
+    force: bool,
+) -> Result<Value, ApiError> {
+    let book = load_book_manifest(state, book_id)?;
+    let spine = load_book_json(state, book_id, "spine.json")?;
+    let page = load_book_page(state, book_id, page_id)?;
+    if book_page_compile_is_noop(&page, force) {
+        return Ok(page);
+    }
+    let chapter = book_chapter_for_page(&spine, &page, page_id).unwrap_or_else(|| {
+        json!({
+            "id": page["chapter_id"].as_str().unwrap_or("chapter-1"),
+            "title": page["title"].as_str().unwrap_or("Socartes page"),
+            "learning_objectives": page["learning_objectives"].clone(),
+            "content_type": page["content_type"].as_str().unwrap_or("theory"),
+            "source_anchors": [],
+            "summary": "",
+            "order": page["order"].as_i64().unwrap_or_default(),
+            "page_ids": [page_id]
+        })
+    });
+    let page = compile_book_page_value(&book, &spine, &chapter, page, force);
+    write_book_page(state, book_id, &page)?;
+    append_book_log(
+        state,
+        book_id,
+        "compile_page",
+        &format!(
+            "page {} -> {} ({}/{} blocks ready)",
+            page["id"].as_str().unwrap_or(page_id),
+            page["status"].as_str().unwrap_or("ready"),
+            ready_book_block_count(&page),
+            page["blocks"].as_array().map(Vec::len).unwrap_or_default()
+        ),
+    )?;
+    maybe_finalize_book_after_page_compile(state, book_id)?;
+    refresh_book_counts(state, book_id)?;
+    Ok(page)
+}
+
+fn book_page_compile_is_noop(page: &Value, force: bool) -> bool {
+    page["status"] == "ready" && !force && !book_page_has_rust_placeholder(page)
+}
+
+fn compile_book_page_value(
+    book: &Value,
+    spine: &Value,
+    chapter: &Value,
+    mut page: Value,
+    force: bool,
+) -> Value {
+    let content_type = page["content_type"]
+        .as_str()
+        .or_else(|| chapter["content_type"].as_str())
+        .unwrap_or("theory");
+    if is_book_overview_chapter(chapter) || content_type == "overview" {
+        page["content_type"] = json!("overview");
+        let existing_blocks = page["blocks"].as_array().cloned().unwrap_or_default();
+        if existing_blocks.is_empty() || existing_blocks.iter().any(is_rust_book_placeholder_block)
+        {
+            let mut overview_blocks = book_overview_blocks(book, spine);
+            apply_existing_book_block_identity(&mut overview_blocks, &existing_blocks);
+            page["blocks"] = json!(overview_blocks);
+        } else {
+            let blocks = existing_blocks
+                .iter()
+                .map(|block| {
+                    generate_existing_overview_block_for_compile(book, chapter, &page, block)
+                })
+                .collect::<Vec<_>>();
+            page["blocks"] = json!(blocks);
+        }
+        let status = compiled_book_page_status(&page);
+        page["status"] = json!(status);
+        page["error"] = json!(compiled_book_page_error(&page, status));
+        page["updated_at"] = json!(now_seconds());
+        return page;
+    }
+
+    page["content_type"] = json!(content_type);
+    if page["learning_objectives"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        page["learning_objectives"] = chapter["learning_objectives"].clone();
+    }
+
+    let existing_blocks = page["blocks"].as_array().cloned().unwrap_or_default();
+    let user_notes = existing_blocks
+        .iter()
+        .filter(|block| block["type"].as_str() == Some("user_note"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let generated_blocks = existing_blocks
+        .iter()
+        .filter(|block| block["type"].as_str() != Some("user_note"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_placeholder = generated_blocks.iter().any(is_rust_book_placeholder_block);
+    let force_reset_existing = force && !generated_blocks.is_empty() && !has_placeholder;
+    let needs_plan = generated_blocks.is_empty() || has_placeholder;
+    if force_reset_existing {
+        let blocks = existing_blocks
+            .iter()
+            .map(|block| reset_existing_book_block_for_compile(book, chapter, &page, block))
+            .collect::<Vec<_>>();
+        page["blocks"] = json!(blocks);
+    } else if needs_plan {
+        let mut planned = planned_book_blocks_for_page(book, chapter, &page);
+        apply_existing_book_block_identity(&mut planned, &generated_blocks);
+        let mut blocks = user_notes;
+        blocks.extend(planned);
+        page["blocks"] = json!(blocks);
+    }
+    let status = compiled_book_page_status(&page);
+    page["status"] = json!(status);
+    page["error"] = json!(compiled_book_page_error(&page, status));
+    page["updated_at"] = json!(now_seconds());
+    page
+}
+
+fn book_chapter_for_page(spine: &Value, page: &Value, page_id: &str) -> Option<Value> {
+    let chapter_id = page["chapter_id"].as_str().unwrap_or_default();
+    spine["chapters"]
+        .as_array()?
+        .iter()
+        .find(|chapter| {
+            chapter["id"].as_str() == Some(chapter_id)
+                || chapter["page_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|value| value.as_str() == Some(page_id))
+        })
+        .cloned()
+}
+
+fn compiled_book_page_status(page: &Value) -> &'static str {
+    let blocks = page["blocks"].as_array().cloned().unwrap_or_default();
+    if blocks.is_empty() {
+        return "error";
+    }
+    let ready = blocks
+        .iter()
+        .filter(|block| block["status"] == "ready")
+        .count();
+    if ready == blocks.len() {
+        "ready"
+    } else if ready == 0 {
+        "error"
+    } else {
+        "partial"
+    }
+}
+
+fn compiled_book_page_error(page: &Value, status: &str) -> String {
+    let blocks = page["blocks"].as_array().cloned().unwrap_or_default();
+    if blocks.is_empty() {
+        return "No blocks were planned for this page.".to_string();
+    }
+    if status == "ready" {
+        return String::new();
+    }
+    let errored = blocks
+        .iter()
+        .filter(|block| block["status"] == "error")
+        .count();
+    if status == "error" {
+        format!("All {errored} blocks failed to generate.")
+    } else {
+        format!("{errored}/{} blocks failed.", blocks.len())
+    }
+}
+
+fn ready_book_block_count(page: &Value) -> usize {
+    page["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["status"] == "ready")
+        .count()
+}
+
+fn maybe_finalize_book_after_page_compile(state: &AppState, book_id: &str) -> Result<(), ApiError> {
+    let mut book = load_book_manifest(state, book_id)?;
+    if book["status"] == "ready" {
+        return Ok(());
+    }
+    let pages = load_book_pages(state, book_id).unwrap_or_default();
+    if !pages.is_empty() && pages.iter().all(|page| page["status"] == "ready") {
+        book["status"] = json!("ready");
+        book["updated_at"] = json!(now_seconds());
+        write_book_manifest(state, book_id, &book)?;
+        append_book_log(
+            state,
+            book_id,
+            "finalize_book",
+            "all pages ready -> status=READY",
+        )?;
+    }
+    Ok(())
+}
+
+fn book_page_has_rust_placeholder(page: &Value) -> bool {
+    page["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(is_rust_book_placeholder_block)
+}
+
+fn is_rust_book_placeholder_block(block: &Value) -> bool {
+    block["title"].as_str() == Some("Socartes learning trace")
+        || block["payload"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("This Rust page is backed by file-backed Book data"))
+        || block["params"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("This Rust page is backed by file-backed Book data"))
+}
+
+fn apply_existing_book_block_identity(planned: &mut [Value], existing: &[Value]) {
+    for (planned_block, old_block) in planned.iter_mut().zip(existing.iter()) {
+        if let Some(id) = old_block["id"].as_str() {
+            planned_block["id"] = json!(id);
+        }
+        if let Some(created_at) = old_block.get("created_at") {
+            planned_block["created_at"] = created_at.clone();
+        }
+        let mut preserved = Map::new();
+        for key in ["transition_in", "deep_dive_page_id"] {
+            if !old_block["metadata"][key].is_null() {
+                preserved.insert(key.to_string(), old_block["metadata"][key].clone());
+            }
+        }
+        if !preserved.is_empty() {
+            merge_object_value(&mut planned_block["metadata"], &Value::Object(preserved));
+        }
+    }
+}
+
+fn reset_existing_book_block_for_compile(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    block: &Value,
+) -> Value {
+    if block["type"].as_str() == Some("user_note") {
+        return block.clone();
+    }
+
+    let block_type = block["type"].as_str().unwrap_or("section");
+    let title = block["title"].as_str().unwrap_or("Block");
+    let params = block["params"].clone();
+    let mut metadata = Map::new();
+    for key in ["transition_in", "deep_dive_page_id"] {
+        if !block["metadata"][key].is_null() {
+            metadata.insert(key.to_string(), block["metadata"][key].clone());
+        }
+    }
+    metadata.insert("generator".to_string(), json!("rust_static_book_compiler"));
+    metadata.insert("generation_ms".to_string(), json!(0));
+
+    let now = now_seconds();
+    let mut reset = block.clone();
+    reset["status"] = json!("ready");
+    reset["payload"] =
+        generated_payload_for_existing_book_block(book, chapter, page, block_type, title, &params);
+    reset["error"] = json!("");
+    reset["source_anchors"] = json!([]);
+    reset["metadata"] = Value::Object(metadata);
+    reset["updated_at"] = json!(now);
+    reset
+}
+
+fn generate_existing_overview_block_for_compile(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    block: &Value,
+) -> Value {
+    if block["status"].as_str() == Some("ready") {
+        return block.clone();
+    }
+    let block_type = block["type"].as_str().unwrap_or("text");
+    let title = block["title"].as_str().unwrap_or("Overview block");
+    let params = block["params"].clone();
+    if block_type == "concept_graph" && params["concept_graph"].is_null() {
+        let mut errored = block.clone();
+        mark_missing_concept_graph_payload(&mut errored);
+        return errored;
+    }
+    let mut generated = block.clone();
+    generated["status"] = json!("ready");
+    generated["payload"] =
+        generated_payload_for_existing_book_block(book, chapter, page, block_type, title, &params);
+    generated["error"] = json!("");
+    merge_object_value(
+        &mut generated["metadata"],
+        &metadata_for_generated_existing_book_block(book, block_type, &params),
+    );
+    if let Some(object) = generated["metadata"].as_object_mut() {
+        object.remove("failure");
+    }
+    generated["updated_at"] = json!(now_seconds());
+    generated
+}
+
+fn mark_missing_concept_graph_payload(block: &mut Value) {
+    block["status"] = json!("error");
+    block["error"] = json!("concept_graph payload missing from BlockContext.extra");
+    merge_object_value(
+        &mut block["metadata"],
+        &json!({
+            "failure": {
+                "kind": "generator_error",
+                "message": "concept_graph payload missing from BlockContext.extra",
+                "retryable": true,
+                "source": "ConceptGraphGenerator"
+            }
+        }),
+    );
+    block["updated_at"] = json!(now_seconds());
+}
+
+fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Value, ApiError> {
+    let book_id = request["book_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "book_id is required"))?;
+    let page_id = request["page_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "page_id is required"))?;
+    let block_id = request["block_id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "block_id is required"))?;
+    let book = load_book_manifest(state, book_id)?;
+    let spine = load_book_json(state, book_id, "spine.json")?;
+    let mut page = load_book_page(state, book_id, page_id)?;
+    let page_context = page.clone();
+    let chapter = book_chapter_for_page(&spine, &page, page_id).unwrap_or_else(|| {
+        json!({
+            "id": page["chapter_id"].as_str().unwrap_or("chapter-1"),
+            "title": page["title"].as_str().unwrap_or("Socartes page"),
+            "learning_objectives": page["learning_objectives"].clone(),
+            "content_type": page["content_type"].as_str().unwrap_or("theory"),
+            "source_anchors": [],
+            "summary": "",
+            "order": page["order"].as_i64().unwrap_or_default(),
+            "page_ids": [page_id]
+        })
+    });
+
+    let block = {
+        let blocks = page["blocks"]
+            .as_array_mut()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Block not found"))?;
+        let index = blocks
+            .iter()
+            .position(|block| block["id"].as_str() == Some(block_id))
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Block not found"))?;
+        let block = &mut blocks[index];
+        if let Some(params) = request
+            .get("params_override")
+            .filter(|value| value.is_object())
+        {
+            merge_object_value(&mut block["params"], params);
+        }
+
+        let block_type = block["type"].as_str().unwrap_or("text").to_string();
+        let title = block["title"].as_str().unwrap_or("Block").to_string();
+        let params = block["params"].clone();
+        if block_type == "concept_graph" && params["concept_graph"].is_null() {
+            mark_missing_concept_graph_payload(block);
+        } else {
+            block["status"] = json!("ready");
+            block["payload"] = generated_payload_for_existing_book_block(
+                &book,
+                &chapter,
+                &page_context,
+                &block_type,
+                &title,
+                &params,
+            );
+            block["error"] = json!("");
+            merge_object_value(
+                &mut block["metadata"],
+                &metadata_for_generated_existing_book_block(&book, &block_type, &params),
+            );
+            if let Some(metadata) = block["metadata"].as_object_mut() {
+                metadata.remove("failure");
+            }
+            block["updated_at"] = json!(now_seconds());
+        }
+        block["metadata"]["regenerated"] = json!(true);
+        block.clone()
+    };
+
+    let status = compiled_book_page_status(&page);
+    page["status"] = json!(status);
+    page["error"] = json!(compiled_book_page_error(&page, status));
+    page["updated_at"] = json!(now_seconds());
+    write_book_page(state, book_id, &page)?;
+    refresh_book_counts(state, book_id)?;
+    Ok(block)
+}
+
+fn metadata_for_generated_existing_book_block(
+    book: &Value,
+    block_type: &str,
+    params: &Value,
+) -> Value {
+    if block_type == "concept_graph" {
+        let graph = params["concept_graph"].clone();
+        return json!({
+            "node_count": graph["nodes"].as_array().map(Vec::len).unwrap_or_default(),
+            "edge_count": graph["edges"].as_array().map(Vec::len).unwrap_or_default()
+        });
+    }
+    json!({
+        "used_rag": false,
+        "kb": as_string_array(&book["knowledge_bases"]),
+        "generation_ms": 0
+    })
+}
+
+fn generated_payload_for_existing_book_block(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    block_type: &str,
+    title: &str,
+    params: &Value,
+) -> Value {
+    let topic = params["topic"]
+        .as_str()
+        .or_else(|| page["title"].as_str())
+        .unwrap_or("this topic");
+    let role = params["role"].as_str().unwrap_or(title);
+    let chapter_title = chapter["title"].as_str().unwrap_or("the chapter");
+    match block_type {
+        "section" | "text" => json!({
+            "format": block_type,
+            "intro": format!("{title} for {topic}, grounded in {chapter_title}."),
+            "subsections": [{
+                "heading": title,
+                "role": role,
+                "focus": topic,
+                "body": format!("This block explains {topic} through the Socartes learning loop while preserving the author-approved page plan."),
+                "target_words": 220
+            }],
+            "key_takeaway": format!("{topic} is easier to learn when generated content keeps the existing structure and refreshes the evidence-backed explanation."),
+            "focus": topic,
+            "role": role
+        }),
+        "figure" => json!({
+            "render_type": "mermaid",
+            "code": {
+                "language": "mermaid",
+                "content": format!("flowchart LR\n  plan[\"Existing plan\"] --> topic[\"{topic}\"]\n  topic --> evidence[\"Course evidence\"]\n  evidence --> critique[\"Critic check\"]")
+            },
+            "description": format!("Refreshed diagram for {topic}."),
+            "chart_type": "diagram"
+        }),
+        "interactive" => json!({
+            "render_type": "html",
+            "code": {
+                "language": "html",
+                "content": format!("<section><h3>{topic}</h3><p>Review the preserved plan, retrieved evidence, and critic check.</p></section>")
+            },
+            "description": format!("Refreshed interaction for {topic}."),
+            "chart_type": "guided_exercise"
+        }),
+        "animation" => json!({
+            "render_type": "video",
+            "artifacts": [],
+            "video_url": "",
+            "filename": "",
+            "summary": format!("Refreshed animation outline for {topic}."),
+            "key_points": ["Preserve the plan", "Regenerate the explanation", "Critique the result"],
+            "description": format!("Step animation for {topic}.")
+        }),
+        "callout" => json!({
+            "variant": params["variant"].as_str().unwrap_or("info"),
+            "label": title,
+            "body": format!("When studying {topic}, keep the existing learning sequence stable while refreshing generated claims against evidence.")
+        }),
+        "code" => json!({
+            "language": params["language"].as_str().unwrap_or("python"),
+            "code": "steps = ['preserve_plan', 'refresh_payload', 'clear_errors', 'critique']\nfor step in steps:\n    print(step)",
+            "explanation": format!("A compact trace for checking how {topic} is regenerated without replanning the page."),
+            "intent": role
+        }),
+        "quiz" => json!({
+            "questions": [{
+                "question_id": "q1",
+                "question": format!("What should force compilation preserve for {topic}?"),
+                "question_type": "multiple_choice",
+                "options": {
+                    "A": "The existing page plan and block parameters",
+                    "B": "Only a new random block list",
+                    "C": "Stale errors and old payloads",
+                    "D": "No user-authored notes"
+                },
+                "correct_answer": "A",
+                "explanation": "Force compilation refreshes generated content while keeping the accepted block plan.",
+                "difficulty": params["difficulty"].as_str().unwrap_or("medium"),
+                "concentration": topic
+            }],
+            "topic": topic
+        }),
+        "flash_cards" => json!({
+            "cards": [
+                {
+                    "front": format!("{topic}: what remains stable?"),
+                    "back": "The accepted block list, block ids, titles, types, and params.",
+                    "hint": "Think about force reset versus replanning."
+                },
+                {
+                    "front": format!("{topic}: what is refreshed?"),
+                    "back": "Generated payloads, errors, source anchors, and transient metadata.",
+                    "hint": "Generated outputs are cleared before regeneration."
+                }
+            ],
+            "topic": topic
+        }),
+        "timeline" => json!({
+            "events": [
+                {"date": "Step 1", "title": "Reset", "description": "Clear generated outputs and stale errors."},
+                {"date": "Step 2", "title": "Regenerate", "description": format!("Refresh content for {topic}.")},
+                {"date": "Step 3", "title": "Finalize", "description": "Aggregate block status into the page status."}
+            ]
+        }),
+        "concept_graph" => {
+            let graph = params["concept_graph"].clone();
+            let node_to_chapter = graph["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|node| {
+                    let id = node["id"].as_str()?;
+                    let chapter_id = node["chapter_id"].as_str()?;
+                    Some((id.to_string(), json!(chapter_id)))
+                })
+                .collect::<Map<_, _>>();
+            json!({
+                "render_type": "concept_graph",
+                "code": {
+                    "language": "mermaid",
+                    "content": render_book_concept_mermaid(&graph)
+                },
+                "graph": graph,
+                "index": {
+                    "chapters": [],
+                    "node_to_chapter": node_to_chapter
+                }
+            })
+        }
+        _ => json!({
+            "body": format!("Refreshed {title} for {topic}."),
+            "variant": "info",
+            "knowledge_bases": as_string_array(&book["knowledge_bases"])
+        }),
+    }
+}
+
+fn planned_book_blocks_for_page(book: &Value, chapter: &Value, page: &Value) -> Vec<Value> {
+    let content_type = page["content_type"]
+        .as_str()
+        .or_else(|| chapter["content_type"].as_str())
+        .unwrap_or("theory");
+    match content_type {
+        "derivation" => vec![
+            planned_section_block(book, chapter, page, "Setup", "setup"),
+            planned_visual_block(chapter, page, "animation", "Step-by-step derivation"),
+            planned_section_block(book, chapter, page, "Formal proof", "formal_proof"),
+            planned_code_block(chapter, page, "Verification example", "verify"),
+            planned_callout_block(chapter, page, "Insight", "insight"),
+            planned_section_block(book, chapter, page, "Interpretation", "interpretation"),
+            planned_quiz_block(chapter, page, 2, "medium"),
+        ],
+        "history" => vec![
+            planned_section_block(book, chapter, page, "Context", "context"),
+            planned_timeline_block(chapter, page),
+            planned_section_block(book, chapter, page, "Narrative", "narrative"),
+            planned_visual_block(chapter, page, "figure", "Historical illustration"),
+            planned_callout_block(chapter, page, "Connection", "connection"),
+            planned_section_block(book, chapter, page, "Analysis", "analysis"),
+            planned_quiz_block(chapter, page, 2, "medium"),
+        ],
+        "practice" => vec![
+            planned_section_block(book, chapter, page, "Brief", "brief"),
+            planned_quiz_block(chapter, page, 3, "easy"),
+            planned_code_block(chapter, page, "Scaffold", "scaffold"),
+            planned_section_block(book, chapter, page, "Walkthrough", "walkthrough"),
+            planned_visual_block(chapter, page, "interactive", "Guided exercise"),
+            planned_quiz_block(chapter, page, 3, "hard"),
+            planned_callout_block(chapter, page, "Common pitfall", "common_pitfall"),
+        ],
+        "concept" => vec![
+            planned_section_block(book, chapter, page, "Definition", "definition"),
+            planned_visual_block(chapter, page, "figure", "Concept map"),
+            planned_section_block(book, chapter, page, "Examples", "examples"),
+            planned_flash_cards_block(chapter, page, 5),
+            planned_callout_block(chapter, page, "Common pitfall", "common_pitfall"),
+            planned_visual_block(chapter, page, "figure", "Comparison"),
+            planned_quiz_block(chapter, page, 3, "medium"),
+        ],
+        _ => vec![
+            planned_section_block(book, chapter, page, "Introduction", "introduction"),
+            planned_visual_block(chapter, page, "figure", "Diagram"),
+            planned_section_block(book, chapter, page, "Deep dive", "deep_dive"),
+            planned_callout_block(chapter, page, "Key idea", "key_idea"),
+            planned_code_block(chapter, page, "Example", "example"),
+            planned_section_block(book, chapter, page, "Synthesis", "synthesis"),
+            planned_quiz_block(chapter, page, 3, "medium"),
+            planned_flash_cards_block(chapter, page, 5),
+        ],
+    }
+}
+
+fn planned_block_params(chapter: &Value, page: &Value, role: &str) -> Value {
+    json!({
+        "role": role,
+        "topic": page["title"].as_str().unwrap_or("Socartes page"),
+        "chapter_title": chapter["title"].as_str().unwrap_or("Untitled chapter"),
+        "chapter_summary": chapter["summary"].as_str().unwrap_or_default(),
+        "objectives": page["learning_objectives"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .cloned()
+            .unwrap_or_else(|| chapter["learning_objectives"].as_array().cloned().unwrap_or_default()),
+        "anchors": chapter["source_anchors"].as_array().cloned().unwrap_or_default()
+    })
+}
+
+fn planned_block_metadata(book: &Value, chapter: &Value, page: &Value, role: &str) -> Value {
+    json!({
+        "generator": "rust_static_book_compiler",
+        "role": role,
+        "transition_in": format!(
+            "{}: {}",
+            chapter["title"].as_str().unwrap_or("Chapter"),
+            page["title"].as_str().unwrap_or("Page")
+        ),
+        "used_rag": false,
+        "kb": as_string_array(&book["knowledge_bases"]),
+        "generation_ms": 0
+    })
+}
+
+fn book_block_with_payload(
+    block_type: &str,
+    title: &str,
+    params: Value,
+    payload: Value,
+    metadata: Value,
+) -> Value {
+    let mut block = new_book_block(block_type, title, &params, true);
+    block["payload"] = payload;
+    block["metadata"] = metadata;
+    block
+}
+
+fn planned_section_block(
+    book: &Value,
+    chapter: &Value,
+    page: &Value,
+    title: &str,
+    role: &str,
+) -> Value {
+    let params = planned_block_params(chapter, page, role);
+    let topic = page["title"].as_str().unwrap_or("this topic");
+    let chapter_title = chapter["title"].as_str().unwrap_or("the chapter");
+    let payload = json!({
+        "format": "section",
+        "intro": format!("{title} for {topic}, grounded in {chapter_title}."),
+        "subsections": [{
+            "heading": title,
+            "role": role,
+            "focus": topic,
+            "body": format!("This block explains {topic} through the Socartes learning loop: plan with the learner goal, retrieve relevant course evidence, execute the explanation, and critique the result before moving on."),
+            "target_words": 220
+        }],
+        "key_takeaway": format!("{topic} is easier to learn when each claim is connected to evidence and checked by a critic."),
+        "focus": topic,
+        "role": role
+    });
+    book_block_with_payload(
+        "section",
+        title,
+        params,
+        payload,
+        planned_block_metadata(book, chapter, page, role),
+    )
+}
+
+fn planned_visual_block(chapter: &Value, page: &Value, block_type: &str, title: &str) -> Value {
+    let params = planned_block_params(chapter, page, title);
+    let topic = page["title"].as_str().unwrap_or("Topic");
+    let payload = match block_type {
+        "interactive" => json!({
+            "render_type": "html",
+            "code": {
+                "language": "html",
+                "content": format!("<section><h3>{topic}</h3><p>Toggle between planner, executor, critic, and reflection steps.</p></section>")
+            },
+            "description": format!("Guided interaction for {topic}."),
+            "chart_type": "guided_exercise"
+        }),
+        "animation" => json!({
+            "render_type": "video",
+            "artifacts": [],
+            "video_url": "",
+            "filename": "",
+            "summary": format!("Animated progression for {topic}."),
+            "key_points": ["Plan the goal", "Execute with evidence", "Critique the answer"],
+            "description": format!("Step animation for {topic}.")
+        }),
+        _ => json!({
+            "render_type": "mermaid",
+            "code": {
+                "language": "mermaid",
+                "content": format!("flowchart LR\n  learner[\"Learner\"] --> planner[\"Planner\"]\n  planner --> rag[\"RAG Evidence\"]\n  rag --> executor[\"Executor\"]\n  executor --> critic[\"Critic\"]\n  critic --> answer[\"{topic}\"]")
+            },
+            "description": format!("Concept diagram for {topic}."),
+            "chart_type": "diagram"
+        }),
+    };
+    book_block_with_payload(
+        block_type,
+        title,
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": title,
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
+}
+
+fn planned_callout_block(chapter: &Value, page: &Value, title: &str, variant: &str) -> Value {
+    let params = planned_block_params(chapter, page, variant);
+    let topic = page["title"].as_str().unwrap_or("this topic");
+    let payload = json!({
+        "variant": variant,
+        "label": title,
+        "body": format!("When studying {topic}, separate retrieved evidence from the model's own inference before accepting the final answer.")
+    });
+    book_block_with_payload(
+        "callout",
+        title,
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": variant,
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
+}
+
+fn planned_code_block(chapter: &Value, page: &Value, title: &str, intent: &str) -> Value {
+    let params = planned_block_params(chapter, page, intent);
+    let topic = page["title"].as_str().unwrap_or("topic");
+    let payload = json!({
+        "language": "python",
+        "code": "steps = ['plan', 'retrieve', 'execute', 'critique']\nfor step in steps:\n    print(step)",
+        "explanation": format!("A compact trace for checking how {topic} moves through the agent workflow."),
+        "intent": intent
+    });
+    book_block_with_payload(
+        "code",
+        title,
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": intent,
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
+}
+
+fn planned_quiz_block(chapter: &Value, page: &Value, count: usize, difficulty: &str) -> Value {
+    let params = planned_block_params(chapter, page, "quiz");
+    let topic = page["title"].as_str().unwrap_or("this topic");
+    let questions = (1..=count)
+        .map(|index| {
+            json!({
+                "question_id": format!("q{index}"),
+                "question": format!("Which Socartes step best verifies the answer for {topic}?"),
+                "question_type": "multiple_choice",
+                "options": {
+                    "A": "Critic",
+                    "B": "Ignoring evidence",
+                    "C": "Skipping retrieval",
+                    "D": "Deleting context"
+                },
+                "correct_answer": "A",
+                "explanation": "The critic checks the generated answer against the goal and retrieved evidence.",
+                "difficulty": difficulty,
+                "concentration": topic
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "questions": questions,
+        "topic": topic
+    });
+    book_block_with_payload(
+        "quiz",
+        "Check your understanding",
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": "quiz",
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
+}
+
+fn planned_flash_cards_block(chapter: &Value, page: &Value, count: usize) -> Value {
+    let params = planned_block_params(chapter, page, "flash_cards");
+    let topic = page["title"].as_str().unwrap_or("this topic");
+    let cards = (1..=count)
+        .map(|index| {
+            json!({
+                "front": format!("{topic} checkpoint {index}"),
+                "back": "Plan, retrieve, execute, critique, and reflect.",
+                "hint": "Think about the multi-agent learning loop."
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({ "cards": cards, "topic": topic });
+    book_block_with_payload(
+        "flash_cards",
+        "Flash cards",
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": "flash_cards",
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
+}
+
+fn planned_timeline_block(chapter: &Value, page: &Value) -> Value {
+    let params = planned_block_params(chapter, page, "timeline");
+    let topic = page["title"].as_str().unwrap_or("this topic");
+    let payload = json!({
+        "events": [
+            {"date": "Step 1", "title": "Plan", "description": format!("Define the learning goal for {topic}.")},
+            {"date": "Step 2", "title": "Retrieve", "description": "Bring in course evidence before drafting."},
+            {"date": "Step 3", "title": "Critique", "description": "Check the answer before finalizing it."}
+        ]
+    });
+    book_block_with_payload(
+        "timeline",
+        "Timeline",
+        params,
+        payload,
+        json!({
+            "generator": "rust_static_book_compiler",
+            "role": "timeline",
+            "transition_in": chapter["title"].as_str().unwrap_or("Chapter"),
+            "generation_ms": 0
+        }),
+    )
 }
 
 fn refresh_book_counts(state: &AppState, book_id: &str) -> Result<(), ApiError> {
@@ -4525,6 +9412,284 @@ fn refresh_book_counts(state: &AppState, book_id: &str) -> Result<(), ApiError> 
     );
     book["updated_at"] = json!(now_seconds());
     write_book_manifest(state, book_id, &book)
+}
+
+fn book_kb_source_dirs(state: &AppState, name: &str) -> Vec<PathBuf> {
+    let component = safe_storage_component(name).unwrap_or_else(|| "invalid".to_string());
+    vec![
+        knowledge_files_dir(state, name),
+        state.knowledge_root.join(&component).join("raw"),
+        state
+            .knowledge_root
+            .join("knowledge_bases")
+            .join(&component)
+            .join("raw"),
+    ]
+}
+
+fn collect_book_kb_files(dir: &FsPath, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_book_kb_files(&path, files);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+}
+
+fn book_kb_fingerprint(state: &AppState, name: &str) -> String {
+    for source_dir in book_kb_source_dirs(state, name) {
+        if !source_dir.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_book_kb_files(&source_dir, &mut files);
+        files.sort();
+        let tokens = files
+            .into_iter()
+            .filter_map(|path| {
+                let metadata = fs::metadata(&path).ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                let filename = path.file_name()?.to_str()?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                Some(format!("{filename}:{modified}:{}", metadata.len()))
+            })
+            .collect::<Vec<_>>();
+        if !tokens.is_empty() {
+            return sha256_hex(tokens.join("|").as_bytes());
+        }
+    }
+    String::new()
+}
+
+fn book_kb_fingerprints(state: &AppState, knowledge_bases: &[String]) -> Map<String, Value> {
+    knowledge_bases
+        .iter()
+        .map(|name| (name.clone(), json!(book_kb_fingerprint(state, name))))
+        .collect()
+}
+
+fn ready_book_page_ids(state: &AppState, book_id: &str) -> Vec<String> {
+    load_book_pages(state, book_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|page| page["status"].as_str() == Some("ready"))
+        .filter_map(|page| page["id"].as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn book_kb_drift_report(
+    state: &AppState,
+    book_id: &str,
+    book: &mut Value,
+) -> Result<Value, ApiError> {
+    let knowledge_bases = as_string_array(&book["knowledge_bases"]);
+    let selected = knowledge_bases.iter().cloned().collect::<HashSet<_>>();
+    let current = book_kb_fingerprints(state, &knowledge_bases);
+    let stored = book["kb_fingerprints"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut new_kbs = Vec::new();
+    let mut removed_kbs = Vec::new();
+    let mut changed_kbs = Vec::new();
+
+    if !stored.is_empty() {
+        for name in &knowledge_bases {
+            if !stored.contains_key(name) {
+                new_kbs.push(name.clone());
+                continue;
+            }
+            let stored_value = stored.get(name).and_then(Value::as_str).unwrap_or("");
+            let current_value = current.get(name).and_then(Value::as_str).unwrap_or("");
+            if !stored_value.is_empty()
+                && !current_value.is_empty()
+                && stored_value != current_value
+            {
+                changed_kbs.push(name.clone());
+            }
+        }
+        for name in stored.keys() {
+            if selected.contains(name) && !current.contains_key(name) {
+                removed_kbs.push(name.clone());
+            }
+        }
+    }
+
+    let has_drift = !(new_kbs.is_empty() && removed_kbs.is_empty() && changed_kbs.is_empty());
+    let stale_page_ids = if has_drift {
+        ready_book_page_ids(state, book_id)
+    } else {
+        Vec::new()
+    };
+
+    if stored.is_empty() {
+        book["kb_fingerprints"] = Value::Object(current.clone());
+        book["updated_at"] = json!(now_seconds());
+        write_book_manifest(state, book_id, book)?;
+    } else if has_drift {
+        book["stale_page_ids"] = json!(stale_page_ids);
+        book["updated_at"] = json!(now_seconds());
+        write_book_manifest(state, book_id, book)?;
+        append_book_log(
+            state,
+            book_id,
+            "kb_health",
+            &format!("detected kb drift ({} stale pages)", stale_page_ids.len()),
+        )?;
+    } else if !book["stale_page_ids"]
+        .as_array()
+        .map(Vec::is_empty)
+        .unwrap_or(true)
+    {
+        book["stale_page_ids"] = json!([]);
+        book["updated_at"] = json!(now_seconds());
+        write_book_manifest(state, book_id, book)?;
+    }
+
+    Ok(json!({
+        "book_id": book_id,
+        "has_drift": has_drift,
+        "new_kbs": new_kbs,
+        "removed_kbs": removed_kbs,
+        "changed_kbs": changed_kbs,
+        "current_fingerprints": current,
+        "stale_page_ids": stale_page_ids
+    }))
+}
+
+fn append_book_log(
+    state: &AppState,
+    book_id: &str,
+    operation: &str,
+    message: &str,
+) -> Result<(), ApiError> {
+    let dir = book_dir(state, book_id);
+    fs::create_dir_all(&dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create book log directory: {error}"),
+        )
+    })?;
+    let line = format!(
+        "- `{}` **{}** \u{2014} {}\n",
+        now_rfc3339(),
+        operation,
+        message
+    );
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("log.md"))
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to open book log: {error}"),
+            )
+        })?;
+    file.write_all(line.as_bytes()).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write book log: {error}"),
+        )
+    })
+}
+
+fn parse_book_log_line(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("- `")?;
+    let (timestamp, rest) = rest.split_once("` **")?;
+    let (operation, rest) = rest.split_once("**")?;
+    let message = rest
+        .trim_start()
+        .strip_prefix('\u{2014}')
+        .or_else(|| rest.trim_start().strip_prefix('-'))
+        .or_else(|| rest.trim_start().strip_prefix('\u{2013}'))
+        .unwrap_or_else(|| rest.trim_start())
+        .trim_start()
+        .to_string();
+    Some((timestamp.to_string(), operation.to_string(), message))
+}
+
+fn scan_book_log_health(state: &AppState, book_id: &str) -> Value {
+    let mut total_entries = 0usize;
+    let mut error_entries = 0usize;
+    let mut block_failures = 0usize;
+    let mut last_compile_at = String::new();
+    let mut last_error_at = String::new();
+    let mut repeated = HashMap::<String, usize>::new();
+    let text = fs::read_to_string(book_dir(state, book_id).join("log.md")).unwrap_or_default();
+
+    for line in text.lines() {
+        let Some((timestamp, operation, message)) = parse_book_log_line(line) else {
+            continue;
+        };
+        total_entries += 1;
+        if matches!(
+            operation.as_str(),
+            "compile_page" | "page_compiled" | "page_planned"
+        ) {
+            last_compile_at = timestamp.clone();
+        }
+        let marker_text = format!(
+            "{} {}",
+            operation.to_ascii_lowercase(),
+            message.to_ascii_lowercase()
+        );
+        let is_failure = ["error", "fail", "failed", "failure"]
+            .iter()
+            .any(|marker| marker_text.contains(marker));
+        if is_failure {
+            error_entries += 1;
+            last_error_at = timestamp;
+            if operation == "block_error" {
+                block_failures += 1;
+            }
+            let excerpt = message.chars().take(80).collect::<String>();
+            *repeated
+                .entry(format!("{operation}:{excerpt}"))
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut repeated_failures = repeated
+        .into_iter()
+        .filter(|(_, count)| *count >= 3)
+        .map(|(signature, count)| json!({ "signature": signature, "count": count }))
+        .collect::<Vec<_>>();
+    repeated_failures.sort_by(|left, right| {
+        right["count"]
+            .as_u64()
+            .cmp(&left["count"].as_u64())
+            .then_with(|| {
+                left["signature"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(right["signature"].as_str().unwrap_or(""))
+            })
+    });
+    repeated_failures.truncate(10);
+
+    json!({
+        "book_id": book_id,
+        "total_entries": total_entries,
+        "error_entries": error_entries,
+        "block_failures": block_failures,
+        "last_compile_at": last_compile_at,
+        "last_error_at": last_error_at,
+        "repeated_failures": repeated_failures
+    })
 }
 
 fn normalize_book_manifest(mut book: Value) -> Value {
@@ -4570,7 +9735,7 @@ fn default_spine(book_id: &str, proposal: &Value) -> Value {
                 "Connect the learner intent to retrieved course evidence",
                 "Explain the Planner, Executor, Critic, and Reflection loop"
             ],
-            "content_type": "overview",
+            "content_type": "theory",
             "source_anchors": [],
             "prerequisites": [],
             "page_ids": ["page-1"],
@@ -4587,6 +9752,284 @@ fn default_spine(book_id: &str, proposal: &Value) -> Value {
     })
 }
 
+fn ensure_book_overview_chapter(mut spine: Value, book: &Value) -> Value {
+    {
+        let chapters = match spine["chapters"].as_array_mut() {
+            Some(chapters) => chapters,
+            None => {
+                spine["chapters"] = json!([]);
+                spine["chapters"].as_array_mut().unwrap()
+            }
+        };
+        if chapters.first().is_some_and(is_book_overview_chapter) {
+            ensure_book_concept_graph(&mut spine);
+            return spine;
+        }
+        for chapter in chapters.iter_mut() {
+            let order = chapter["order"].as_i64().unwrap_or_default();
+            chapter["order"] = json!(order + 1);
+        }
+        let zh = book["language"].as_str() == Some("zh");
+        chapters.insert(
+            0,
+            json!({
+                "id": "overview",
+                "title": if zh { "本书导览" } else { "How to read this book" },
+                "learning_objectives": if zh {
+                    json!(["了解整本书的章节脉络", "掌握各章之间的概念依赖关系", "选择最合适的阅读顺序"])
+                } else {
+                    json!(["See the full chapter map at a glance", "Understand how concepts depend on each other", "Pick the reading path that fits your goals"])
+                },
+                "content_type": "overview",
+                "source_anchors": [],
+                "prerequisites": [],
+                "page_ids": ["overview"],
+                "summary": if zh {
+                    "自动生成的概念图与章节索引，作为本书的入口。"
+                } else {
+                    "Auto-generated overview of the book's concept graph and chapter index."
+                },
+                "order": 0,
+                "auto_overview": true
+            }),
+        );
+    }
+    ensure_book_concept_graph(&mut spine);
+    spine
+}
+
+fn is_book_overview_chapter(chapter: &Value) -> bool {
+    chapter["auto_overview"].as_bool().unwrap_or(false)
+        || chapter["content_type"].as_str() == Some("overview")
+}
+
+fn ensure_book_concept_graph(spine: &mut Value) {
+    let has_nodes = spine["concept_graph"]["nodes"]
+        .as_array()
+        .is_some_and(|nodes| !nodes.is_empty());
+    if has_nodes {
+        return;
+    }
+    let chapters = spine["chapters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|chapter| !is_book_overview_chapter(chapter))
+        .collect::<Vec<_>>();
+    let nodes = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, chapter)| {
+            let id = chapter["id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("chapter-{}", index + 1));
+            let title = chapter["title"].as_str().unwrap_or("Untitled chapter");
+            json!({
+                "id": format!("concept-{}", index + 1),
+                "label": title,
+                "chapter_id": id,
+                "description": chapter["summary"].as_str().unwrap_or(title),
+                "weight": 1.0
+            })
+        })
+        .collect::<Vec<_>>();
+    let edges = nodes
+        .windows(2)
+        .map(|pair| {
+            json!({
+                "src": pair[0]["id"].as_str().unwrap_or_default(),
+                "dst": pair[1]["id"].as_str().unwrap_or_default(),
+                "relation": "extends",
+                "rationale": "Recommended chapter order"
+            })
+        })
+        .collect::<Vec<_>>();
+    spine["concept_graph"] = json!({ "nodes": nodes, "edges": edges });
+}
+
+fn book_overview_blocks(book: &Value, spine: &Value) -> Vec<Value> {
+    let zh = book["language"].as_str() == Some("zh");
+    let graph = spine["concept_graph"].clone();
+    let chapter_index = book_chapter_index(spine);
+    let intro_body = if zh {
+        format!(
+            "# {}\n\n{}\n\n你可以按从上到下的顺序阅读，也可以根据自己的兴趣或先验知识选择切入点。",
+            book["title"].as_str().unwrap_or("这本书"),
+            book["description"].as_str().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "# {}\n\n{}\n\nThe diagram below maps the core concepts in this book and how they depend on each other. The chapter index that follows lists all {} chapters.",
+            book["title"].as_str().unwrap_or("This book"),
+            book["description"].as_str().unwrap_or_default(),
+            chapter_index.len()
+        )
+    };
+    let index_lines = chapter_index
+        .iter()
+        .map(|chapter| {
+            let title = chapter["title"].as_str().unwrap_or("Untitled chapter");
+            let summary = chapter["summary"].as_str().unwrap_or_default();
+            if summary.is_empty() {
+                format!("- **{title}**")
+            } else {
+                format!("- **{title}** - {summary}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let index_body = format!(
+        "{}\n\n{}",
+        if zh {
+            "## 章节索引"
+        } else {
+            "## Chapter index"
+        },
+        index_lines.join("\n")
+    );
+    vec![
+        new_book_block(
+            "text",
+            if zh {
+                "如何阅读这本书"
+            } else {
+                "How to read this book"
+            },
+            &json!({
+                "role": "overview_intro",
+                "body": intro_body,
+                "content": intro_body,
+                "format": "markdown"
+            }),
+            true,
+        ),
+        book_concept_graph_block(&graph, &chapter_index, zh),
+        new_book_block(
+            "text",
+            if zh { "章节索引" } else { "Chapter index" },
+            &json!({
+                "role": "chapter_index",
+                "body": index_body,
+                "content": index_body,
+                "format": "markdown"
+            }),
+            true,
+        ),
+    ]
+}
+
+fn book_chapter_index(spine: &Value) -> Vec<Value> {
+    spine["chapters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|chapter| !is_book_overview_chapter(chapter))
+        .map(|chapter| {
+            json!({
+                "id": chapter["id"].as_str().unwrap_or_default(),
+                "title": chapter["title"].as_str().unwrap_or("Untitled chapter"),
+                "summary": chapter["summary"].as_str().unwrap_or_default(),
+                "objectives": chapter["learning_objectives"].clone(),
+                "order": chapter["order"].as_i64().unwrap_or_default(),
+                "content_type": chapter["content_type"].as_str().unwrap_or("theory"),
+                "page_id": chapter["page_ids"].as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            })
+        })
+        .collect()
+}
+
+fn book_concept_graph_block(graph: &Value, chapter_index: &[Value], zh: bool) -> Value {
+    let now = now_seconds();
+    let node_to_chapter = graph["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let id = node["id"].as_str()?;
+            let chapter_id = node["chapter_id"].as_str()?;
+            Some((id.to_string(), json!(chapter_id)))
+        })
+        .collect::<Map<_, _>>();
+    let node_count = graph["nodes"].as_array().map(Vec::len).unwrap_or_default();
+    let edge_count = graph["edges"].as_array().map(Vec::len).unwrap_or_default();
+    json!({
+        "id": format!("block-{}", unique_id()),
+        "type": "concept_graph",
+        "status": "ready",
+        "title": if zh { "概念图" } else { "Concept map" },
+        "params": {
+            "concept_graph": graph,
+            "chapter_index": chapter_index
+        },
+        "payload": {
+            "render_type": "concept_graph",
+            "code": {
+                "language": "mermaid",
+                "content": render_book_concept_mermaid(graph)
+            },
+            "graph": graph,
+            "index": {
+                "chapters": chapter_index,
+                "node_to_chapter": node_to_chapter
+            }
+        },
+        "source_anchors": [],
+        "metadata": {
+            "node_count": node_count,
+            "edge_count": edge_count
+        },
+        "error": "",
+        "created_at": now,
+        "updated_at": now
+    })
+}
+
+fn book_page_has_block_type(page: &Value, block_type: &str) -> bool {
+    page["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|block| block["type"].as_str() == Some(block_type))
+}
+
+fn render_book_concept_mermaid(graph: &Value) -> String {
+    let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
+    let edges = graph["edges"].as_array().cloned().unwrap_or_default();
+    let mut lines = vec!["graph TD".to_string()];
+    if nodes.is_empty() {
+        lines.push("  empty[\"(no concepts yet)\"]".to_string());
+        return lines.join("\n");
+    }
+    let mut node_aliases = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let alias = format!("n{}", index + 1);
+        let id = node["id"].as_str().unwrap_or_default().to_string();
+        let label = node["label"]
+            .as_str()
+            .unwrap_or("Concept")
+            .replace('"', "'");
+        node_aliases.insert(id, alias.clone());
+        lines.push(format!("  {alias}[\"{label}\"]"));
+    }
+    for edge in edges {
+        let Some(src) = edge["src"].as_str().and_then(|id| node_aliases.get(id)) else {
+            continue;
+        };
+        let Some(dst) = edge["dst"].as_str().and_then(|id| node_aliases.get(id)) else {
+            continue;
+        };
+        let relation = edge["relation"].as_str().unwrap_or("related");
+        lines.push(format!("  {src} -->|{relation}| {dst}"));
+    }
+    lines.join("\n")
+}
+
 fn default_progress(book_id: &str) -> Value {
     json!({
         "book_id": book_id,
@@ -4595,7 +10038,7 @@ fn default_progress(book_id: &str) -> Value {
         "bookmarked_page_ids": [],
         "quiz_attempts": [],
         "weak_chapters": [],
-        "score": 0.0,
+        "score": 0,
         "updated_at": now_seconds()
     })
 }
@@ -4958,7 +10401,8 @@ fn settings_provider_choices() -> Value {
             { "value": "jina", "label": "Jina", "base_url": "" },
             { "value": "searxng", "label": "SearXNG", "base_url": "" },
             { "value": "duckduckgo", "label": "DuckDuckGo", "base_url": "" },
-            { "value": "perplexity", "label": "Perplexity", "base_url": "" }
+            { "value": "perplexity", "label": "Perplexity", "base_url": "" },
+            { "value": "serper", "label": "Serper", "base_url": "" }
         ]
     })
 }
@@ -4970,21 +10414,38 @@ fn render_settings_env(catalog: &Value) -> Value {
         .unwrap_or_else(|| "deterministic-embedding".to_string());
     let search_provider =
         active_search_provider(catalog).unwrap_or_else(|| "duckduckgo".to_string());
+    let llm_api_key = active_catalog_profile(catalog, "llm")
+        .and_then(|profile| profile["api_key"].as_str())
+        .unwrap_or("");
+    let embedding_api_key = active_catalog_profile(catalog, "embedding")
+        .and_then(|profile| profile["api_key"].as_str())
+        .unwrap_or("");
+    let search_api_key = active_catalog_profile(catalog, "search")
+        .and_then(|profile| profile["api_key"].as_str())
+        .unwrap_or("");
     json!({
         "SOCARTES_LLM_MODEL": llm_model,
+        "SOCARTES_LLM_API_KEY": llm_api_key,
         "SOCARTES_EMBEDDING_MODEL": embedding_model,
-        "SOCARTES_SEARCH_PROVIDER": search_provider
+        "SOCARTES_EMBEDDING_API_KEY": embedding_api_key,
+        "SOCARTES_SEARCH_PROVIDER": search_provider,
+        "SOCARTES_SEARCH_API_KEY": search_api_key
     })
+}
+
+fn active_catalog_profile<'a>(catalog: &'a Value, service_name: &str) -> Option<&'a Value> {
+    let service = &catalog["services"][service_name];
+    let active_profile_id = service["active_profile_id"].as_str();
+    service["profiles"]
+        .as_array()?
+        .iter()
+        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
+        .or_else(|| service["profiles"].as_array()?.first())
 }
 
 fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<String> {
     let service = &catalog["services"][service_name];
-    let active_profile_id = service["active_profile_id"].as_str();
-    let profile = service["profiles"]
-        .as_array()?
-        .iter()
-        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
-        .or_else(|| service["profiles"].as_array()?.first())?;
+    let profile = active_catalog_profile(catalog, service_name)?;
     let active_model_id = service["active_model_id"].as_str();
     let model = profile["models"]
         .as_array()?
@@ -4997,6 +10458,984 @@ fn active_catalog_model_name(catalog: &Value, service_name: &str) -> Option<Stri
         .map(ToString::to_string)
 }
 
+fn redact_settings_catalog(catalog: &Value) -> Value {
+    let mut redacted = catalog.clone();
+    if let Some(services) = redacted["services"].as_object_mut() {
+        for service in services.values_mut() {
+            let Some(profiles) = service["profiles"].as_array_mut() else {
+                continue;
+            };
+            for profile in profiles {
+                if profile["api_key"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    profile["api_key"] = json!(SETTINGS_SECRET_MASK);
+                }
+            }
+        }
+    }
+    redacted
+}
+
+fn restore_masked_settings_catalog_secrets(incoming: &Value, current: &Value) -> Value {
+    let mut restored = incoming.clone();
+    let Some(restored_services) = restored["services"].as_object_mut() else {
+        return restored;
+    };
+    for (service_name, restored_service) in restored_services {
+        let current_profiles = current["services"][service_name]["profiles"]
+            .as_array()
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .filter_map(|profile| Some((profile["id"].as_str()?, profile)))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let Some(restored_profiles) = restored_service["profiles"].as_array_mut() else {
+            continue;
+        };
+        for profile in restored_profiles {
+            if profile["api_key"].as_str() != Some(SETTINGS_SECRET_MASK) {
+                continue;
+            }
+            let Some(profile_id) = profile["id"].as_str() else {
+                continue;
+            };
+            if let Some(current_profile) = current_profiles.get(profile_id)
+                && current_profile["api_key"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            {
+                profile["api_key"] = current_profile["api_key"].clone();
+            }
+        }
+    }
+    restored
+}
+
+fn redact_settings_env(env_values: &Value) -> Value {
+    let mut redacted = env_values.clone();
+    let Some(object) = redacted.as_object_mut() else {
+        return redacted;
+    };
+    for (key, value) in object {
+        if value.as_str().is_none_or(|text| text.is_empty()) {
+            continue;
+        }
+        let upper_key = key.to_ascii_uppercase();
+        if ["API_KEY", "TOKEN", "SECRET", "PASSWORD"]
+            .iter()
+            .any(|hint| upper_key.contains(hint))
+        {
+            *value = json!(SETTINGS_SECRET_MASK);
+        }
+    }
+    redacted
+}
+
+fn require_settings_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthTokenPayload, Box<Response>> {
+    let payload = require_auth(state, headers)?;
+    if payload.role != "admin" {
+        return Err(Box::new(
+            api_error(
+                StatusCode::FORBIDDEN,
+                "Model configuration is managed by an administrator.",
+            )
+            .into_response(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn settings_grant_path(state: &AppState, user_id: &str) -> PathBuf {
+    state
+        .data_root
+        .join("multi-user")
+        .join("_system")
+        .join("grants")
+        .join(format!("{user_id}.json"))
+}
+
+fn empty_settings_grant(user_id: &str) -> Value {
+    json!({
+        "version": 1,
+        "user_id": user_id,
+        "models": { "llm": [], "embedding": [], "search": [] },
+        "knowledge_bases": [],
+        "skills": [],
+        "spaces": []
+    })
+}
+
+fn normalize_settings_grant(user_id: &str, payload: &Value) -> Value {
+    let mut grant = empty_settings_grant(user_id);
+    let Some(object) = payload.as_object() else {
+        return grant;
+    };
+
+    if let Some(version) = object.get("version") {
+        let normalized_version = version
+            .as_i64()
+            .or_else(|| version.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| {
+                version
+                    .as_str()
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+            })
+            .unwrap_or(1);
+        grant["version"] = json!(normalized_version);
+    }
+
+    if let Some(models) = object.get("models").and_then(Value::as_object) {
+        for service_name in ["llm", "embedding", "search"] {
+            let items = models
+                .get(service_name)
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter(|value| value.is_object())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            grant["models"][service_name] = json!(items);
+        }
+    }
+
+    for key in ["knowledge_bases", "skills", "spaces"] {
+        let items = object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        grant[key] = json!(items);
+    }
+
+    grant
+}
+
+fn load_settings_grant(state: &AppState, user_id: &str) -> Value {
+    fs::read_to_string(settings_grant_path(state, user_id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .map(|value| normalize_settings_grant(user_id, &value))
+        .unwrap_or_else(|| empty_settings_grant(user_id))
+}
+
+fn save_settings_grant(
+    state: &AppState,
+    user_id: &str,
+    payload: &Value,
+) -> Result<Value, ApiError> {
+    let grant = normalize_settings_grant(user_id, payload);
+    validate_settings_grant(&grant)
+        .map_err(|detail| api_error(StatusCode::BAD_REQUEST, &detail))?;
+    let path = settings_grant_path(state, user_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create grant directory: {error}"),
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&grant).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize grant: {error}"),
+        )
+    })?;
+    fs::write(path, bytes).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write grant: {error}"),
+        )
+    })?;
+    Ok(grant)
+}
+
+fn validate_settings_grant(grant: &Value) -> Result<(), String> {
+    fn walk(value: &Value, trail: &str) -> Result<(), String> {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    let lowered = key.to_ascii_lowercase();
+                    if matches!(
+                        lowered.as_str(),
+                        "api_key" | "secret" | "password" | "token" | "path" | "base_url"
+                    ) || lowered.ends_with("_key")
+                    {
+                        return Err(format!(
+                            "Grants must not contain secret/path field: {trail}.{key}"
+                        ));
+                    }
+                    walk(child, &format!("{trail}.{key}"))?;
+                }
+            }
+            Value::Array(values) => {
+                for (index, child) in values.iter().enumerate() {
+                    walk(child, &format!("{trail}[{index}]"))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    walk(grant, "grant")
+}
+
+fn redacted_model_access_for_user(state: &AppState, user_id: &str) -> Value {
+    let grant = load_settings_grant(state, user_id);
+    let catalog = load_settings_catalog(state);
+    let mut result = json!({ "llm": [], "embedding": [], "search": [] });
+    for service_name in ["llm", "embedding", "search"] {
+        let items = grant["models"][service_name]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let service_items = result[service_name].as_array_mut().expect("array");
+        for item in items {
+            let profile_id = item["profile_id"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let Some(profile) = settings_profile_by_id(&catalog, service_name, &profile_id) else {
+                service_items.push(json!({
+                    "profile_id": profile_id,
+                    "name": item["name"].as_str().unwrap_or(if profile_id.is_empty() {
+                        "Unavailable profile"
+                    } else {
+                        &profile_id
+                    }),
+                    "source": "admin",
+                    "available": false
+                }));
+                continue;
+            };
+            if service_name == "search" {
+                service_items.push(json!({
+                    "profile_id": profile_id,
+                    "name": profile["name"]
+                        .as_str()
+                        .or_else(|| profile["provider"].as_str())
+                        .unwrap_or(&profile_id),
+                    "provider": profile["provider"].as_str().unwrap_or(""),
+                    "source": "admin",
+                    "available": true
+                }));
+                continue;
+            }
+            for model_id in item["model_ids"].as_array().cloned().unwrap_or_default() {
+                let model_id = model_id.as_str().unwrap_or("").to_string();
+                let model = settings_model_by_id(profile, &model_id);
+                service_items.push(json!({
+                    "profile_id": profile_id,
+                    "model_id": model_id,
+                    "name": model
+                        .and_then(|model| model["name"].as_str())
+                        .unwrap_or(&model_id),
+                    "model": model
+                        .and_then(|model| model["model"].as_str())
+                        .unwrap_or(""),
+                    "source": "admin",
+                    "available": model.is_some()
+                }));
+            }
+        }
+    }
+    result
+}
+
+fn settings_profile_by_id<'a>(
+    catalog: &'a Value,
+    service_name: &str,
+    profile_id: &str,
+) -> Option<&'a Value> {
+    catalog["services"][service_name]["profiles"]
+        .as_array()?
+        .iter()
+        .find(|profile| profile["id"].as_str() == Some(profile_id))
+}
+
+fn settings_model_by_id<'a>(profile: &'a Value, model_id: &str) -> Option<&'a Value> {
+    profile["models"]
+        .as_array()?
+        .iter()
+        .find(|model| model["id"].as_str() == Some(model_id))
+}
+
+async fn multi_user_my_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let is_admin = payload.role == "admin";
+    let grant = load_settings_grant(&state, &payload.user_id);
+    Json(json!({
+        "user": auth_payload_public_user(&payload),
+        "models": if is_admin {
+            json!({})
+        } else {
+            redacted_model_access_for_user(&state, &payload.user_id)
+        },
+        "knowledge_bases": multi_user_visible_knowledge_bases(&state, &payload, &grant),
+        "skills": if is_admin {
+            json!([])
+        } else {
+            json!(assigned_skill_ids_from_grant(&grant))
+        },
+        "spaces": if is_admin {
+            json!([])
+        } else {
+            json!(grant["spaces"].as_array().cloned().unwrap_or_default())
+        }
+    }))
+    .into_response()
+}
+
+async fn multi_user_admin_resources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    match skill_summaries(&state) {
+        Ok(skills) => Json(json!({
+            "models": multi_user_admin_catalog_summary(&state),
+            "knowledge_bases": multi_user_admin_knowledge_summary(&state),
+            "skills": skills
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn multi_user_list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    let users = match load_auth_users(&state) {
+        Ok(users) => users,
+        Err(error) => return error.into_response(),
+    };
+    Json(json!({
+        "users": users
+            .into_iter()
+            .map(|(username, record)| json!({
+                "id": record.id,
+                "username": username,
+                "role": record.role,
+                "created_at": record.created_at,
+                "disabled": record.disabled
+            }))
+            .collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+async fn multi_user_get_user_grants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    if let Err(error) = require_assignable_user(&state, &user_id) {
+        return error.into_response();
+    }
+    Json(json!({ "grant": load_settings_grant(&state, &user_id) })).into_response()
+}
+
+async fn multi_user_put_user_grants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    if let Err(error) = require_assignable_user(&state, &user_id) {
+        return error.into_response();
+    }
+    let Some(grant) = payload.get("grant").filter(|value| value.is_object()) else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "grant is required").into_response();
+    };
+    match save_settings_grant(&state, &user_id, grant) {
+        Ok(grant) => Json(json!({ "grant": grant })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn multi_user_assign_space_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(payload): Json<MultiUserSpaceAssignPayload>,
+) -> impl IntoResponse {
+    let admin = match require_admin(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    if let Err(error) = require_assignable_user(&state, &user_id) {
+        return error.into_response();
+    }
+
+    let admin_workspace = admin_workspace_root(&state);
+    let user_workspace = user_workspace_root(&state, &user_id);
+    let source = match safe_relative_dir(&admin_workspace, &payload.source) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    if !source.is_dir() {
+        return api_error(StatusCode::NOT_FOUND, "Source space/template not found").into_response();
+    }
+
+    let target_name = payload
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "space".to_string());
+    let target = match safe_relative_dir(&user_workspace, &target_name) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    if target.exists() {
+        return api_error(StatusCode::CONFLICT, "Target already exists").into_response();
+    }
+    if let Err(error) = copy_dir_recursive(&source, &target) {
+        return error.into_response();
+    }
+
+    let provenance = json!({
+        "source": "admin",
+        "source_path": payload.source,
+        "assigned_by": admin.username
+    });
+    let provenance_path = target.join(".socartes_provenance.json");
+    let provenance_bytes = match serde_json::to_vec_pretty(&provenance) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to serialize space provenance: {error}"),
+            )
+            .into_response();
+        }
+    };
+    if let Err(error) = fs::write(&provenance_path, provenance_bytes) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write space provenance: {error}"),
+        )
+        .into_response();
+    }
+
+    let mut grant = load_settings_grant(&state, &user_id);
+    if !grant["spaces"].is_array() {
+        grant["spaces"] = json!([]);
+    }
+    let space_id = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&target_name)
+        .to_string();
+    grant["spaces"]
+        .as_array_mut()
+        .expect("spaces array")
+        .push(json!({
+            "space_id": space_id,
+            "mode": "copy",
+            "source": "admin",
+            "provenance": provenance
+        }));
+    if let Err(error) = save_settings_grant(&state, &user_id, &grant) {
+        return error.into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "target": target
+            .strip_prefix(&user_workspace)
+            .ok()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&target_name)
+    }))
+    .into_response()
+}
+
+fn auth_payload_public_user(payload: &AuthTokenPayload) -> Value {
+    json!({
+        "id": payload.user_id,
+        "username": payload.username,
+        "role": payload.role,
+        "is_admin": payload.role == "admin"
+    })
+}
+
+fn require_assignable_user(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let Some((_username, record)) = auth_user_by_id(state, user_id)? else {
+        return Err(api_error(StatusCode::NOT_FOUND, "User not found"));
+    };
+    if record.role == "admin" {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Admin users use the main workspace and cannot receive assignments.",
+        ));
+    }
+    Ok(())
+}
+
+fn auth_user_by_id(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Option<(String, AuthUserRecord)>, ApiError> {
+    let users = load_auth_users(state)?;
+    Ok(users
+        .into_iter()
+        .find(|(_username, record)| record.id == user_id))
+}
+
+fn multi_user_admin_catalog_summary(state: &AppState) -> Value {
+    let catalog = load_settings_catalog(state);
+    let mut out = json!({ "llm": [], "embedding": [], "search": [] });
+    for service_name in ["llm", "embedding", "search"] {
+        let Some(profiles) = catalog["services"][service_name]["profiles"].as_array() else {
+            continue;
+        };
+        let service_items = out[service_name].as_array_mut().expect("array");
+        for profile in profiles {
+            let profile_id = profile["id"].as_str().unwrap_or("").to_string();
+            if service_name == "search" {
+                service_items.push(json!({
+                    "profile_id": profile_id,
+                    "name": profile["name"]
+                        .as_str()
+                        .or_else(|| profile["provider"].as_str())
+                        .unwrap_or(&profile_id),
+                    "provider": profile["provider"].as_str().unwrap_or("")
+                }));
+                continue;
+            }
+            let models = profile["models"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|model| {
+                            let model_id = model["id"].as_str().unwrap_or("").to_string();
+                            json!({
+                                "model_id": model_id,
+                                "name": model["name"]
+                                    .as_str()
+                                    .or_else(|| model["model"].as_str())
+                                    .unwrap_or(&model_id),
+                                "model": model["model"].as_str().unwrap_or("")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            service_items.push(json!({
+                "profile_id": profile_id,
+                "name": profile["name"].as_str().unwrap_or(&profile_id),
+                "models": models
+            }));
+        }
+    }
+    out
+}
+
+fn multi_user_admin_knowledge_summary(state: &AppState) -> Vec<Value> {
+    admin_knowledge_base_names(state)
+        .into_iter()
+        .map(|name| {
+            json!({
+                "resource_id": format!("admin:kb:{name}"),
+                "name": name,
+                "source": "admin"
+            })
+        })
+        .collect()
+}
+
+fn multi_user_visible_knowledge_bases(
+    state: &AppState,
+    payload: &AuthTokenPayload,
+    grant: &Value,
+) -> Vec<Value> {
+    if payload.role == "admin" {
+        return admin_knowledge_base_names(state)
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "id": format!("admin:kb:{name}"),
+                    "name": name,
+                    "source": "admin",
+                    "assigned": false,
+                    "read_only": false,
+                    "provenance_label": "Admin workspace"
+                })
+            })
+            .collect();
+    }
+
+    let mut items = user_knowledge_base_names(state, &payload.user_id)
+        .into_iter()
+        .map(|name| {
+            json!({
+                "id": format!("user:kb:{name}"),
+                "name": name,
+                "source": "user",
+                "assigned": false,
+                "read_only": false,
+                "provenance_label": "Created by you"
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut existing_ids = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+    let admin_names = admin_knowledge_base_names(state)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for grant_item in grant["knowledge_bases"].as_array().into_iter().flatten() {
+        let Some(name) = knowledge_grant_name(grant_item) else {
+            continue;
+        };
+        let resource_id = format!("admin:kb:{name}");
+        if existing_ids.contains(&resource_id) {
+            continue;
+        }
+        existing_ids.insert(resource_id.clone());
+        items.push(json!({
+            "id": resource_id,
+            "name": name,
+            "source": "admin",
+            "assigned": true,
+            "read_only": true,
+            "available": admin_names.contains(&name),
+            "provenance_label": "Assigned by admin",
+            "needs_admin_reindex": grant_item["needs_admin_reindex"].as_bool().unwrap_or(false),
+            "embedding_signature": grant_item["embedding_signature"].as_str().unwrap_or("")
+        }));
+    }
+    items
+}
+
+fn knowledge_grant_name(item: &Value) -> Option<String> {
+    let direct_name = item["name"]
+        .as_str()
+        .or_else(|| item["kb_name"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(name) = direct_name {
+        return Some(name.to_string());
+    }
+    item["resource_id"]
+        .as_str()
+        .or_else(|| item["id"].as_str())
+        .and_then(|resource_id| resource_id.strip_prefix("admin:kb:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn assigned_skill_ids_from_grant(grant: &Value) -> Vec<String> {
+    let mut ids = grant["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item["skill_id"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn granted_admin_knowledge_names(grant: &Value) -> HashSet<String> {
+    grant["knowledge_bases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(knowledge_grant_name)
+        .collect()
+}
+
+fn requested_resource_name<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn user_knowledge_base_dir(state: &AppState, user_id: &str, name: &str) -> PathBuf {
+    let component = safe_storage_component(name).unwrap_or_else(|| "invalid".to_string());
+    state
+        .data_root
+        .join("multi-user")
+        .join(user_id)
+        .join("knowledge_bases")
+        .join(component)
+}
+
+fn resolve_knowledge_access(
+    state: &AppState,
+    payload: &AuthTokenPayload,
+    requested_name: &str,
+) -> Result<KnowledgeAccess, ApiError> {
+    let requested_name = requested_name.trim();
+    if requested_name == BUILTIN_KNOWLEDGE_BASE {
+        if payload.role == "admin" {
+            return Ok(KnowledgeAccess::Builtin);
+        }
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Knowledge base is not assigned to you",
+        ));
+    }
+
+    if payload.role == "admin" {
+        let name = requested_resource_name(requested_name, "admin:kb:")
+            .unwrap_or(requested_name)
+            .to_string();
+        if knowledge_base_exists(state, &name) {
+            return Ok(KnowledgeAccess::Admin {
+                name,
+                assigned: false,
+            });
+        }
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Knowledge base '{name}' not found"),
+        ));
+    }
+
+    let grant = load_settings_grant(state, &payload.user_id);
+    let granted_admin_names = granted_admin_knowledge_names(&grant);
+
+    if let Some(name) = requested_resource_name(requested_name, "admin:kb:") {
+        if !granted_admin_names.contains(name) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "Knowledge base is not assigned to you",
+            ));
+        }
+        if knowledge_base_exists(state, name) {
+            return Ok(KnowledgeAccess::Admin {
+                name: name.to_string(),
+                assigned: true,
+            });
+        }
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Knowledge base '{name}' not found"),
+        ));
+    }
+
+    let name = requested_resource_name(requested_name, "user:kb:").unwrap_or(requested_name);
+    if user_knowledge_base_dir(state, &payload.user_id, name).is_dir() {
+        return Ok(KnowledgeAccess::User {
+            name: name.to_string(),
+            user_id: payload.user_id.clone(),
+        });
+    }
+
+    if granted_admin_names.contains(name) {
+        if knowledge_base_exists(state, name) {
+            return Ok(KnowledgeAccess::Admin {
+                name: name.to_string(),
+                assigned: true,
+            });
+        }
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            &format!("Knowledge base '{name}' not found"),
+        ));
+    }
+
+    Err(api_error(
+        StatusCode::NOT_FOUND,
+        &format!("Knowledge base '{name}' not found"),
+    ))
+}
+
+fn ensure_knowledge_access_writable(access: &KnowledgeAccess) -> Result<(), ApiError> {
+    if matches!(access, KnowledgeAccess::Admin { assigned: true, .. }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Assigned admin knowledge bases are read-only",
+        ));
+    }
+    if matches!(access, KnowledgeAccess::Builtin) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Cannot overwrite the built-in Socartes course",
+        ));
+    }
+    Ok(())
+}
+
+fn admin_knowledge_base_names(state: &AppState) -> Vec<String> {
+    let mut names = load_knowledge_config_store(state)["knowledge_bases"]
+        .as_object()
+        .map(|items| items.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    names.extend(local_knowledge_base_names(state));
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn user_knowledge_base_names(state: &AppState, user_id: &str) -> Vec<String> {
+    directory_child_names(
+        &state
+            .data_root
+            .join("multi-user")
+            .join(user_id)
+            .join("knowledge_bases"),
+    )
+}
+
+fn admin_workspace_root(state: &AppState) -> PathBuf {
+    state.data_root.join("user").join("workspace")
+}
+
+fn user_workspace_root(state: &AppState, user_id: &str) -> PathBuf {
+    state
+        .data_root
+        .join("multi-user")
+        .join(user_id)
+        .join("user")
+        .join("workspace")
+}
+
+fn user_skills_root(state: &AppState, user_id: &str) -> PathBuf {
+    user_workspace_root(state, user_id).join("skills")
+}
+
+fn state_with_skills_root(state: &AppState, skills_root: PathBuf) -> AppState {
+    let mut scoped = state.clone();
+    scoped.skills_root = Arc::new(skills_root);
+    scoped
+}
+
+fn safe_relative_dir(root: &FsPath, value: &str) -> Result<PathBuf, ApiError> {
+    let relative = FsPath::new(value.trim());
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Path escapes workspace root",
+        ));
+    }
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Path escapes workspace root",
+        ));
+    }
+    Ok(root.join(relative))
+}
+
+fn copy_dir_recursive(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+    fs::create_dir_all(target).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create target space: {error}"),
+        )
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read source space: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read source space entry: {error}"),
+            )
+        })?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to inspect source space entry: {error}"),
+            )
+        })?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path).map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to copy space file: {error}"),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn directory_child_names(path: &FsPath) -> Vec<String> {
+    let mut names = fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with("__") && !name.starts_with('.'))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 #[derive(Debug, Clone)]
 struct ChatRuntimeSelection {
     profile_id: String,
@@ -5007,6 +11446,7 @@ struct ChatRuntimeSelection {
     api_version: String,
     extra_headers: BTreeMap<String, String>,
     model: String,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5106,6 +11546,13 @@ fn active_chat_selection(
     if model_name == "deterministic-agent-loop" {
         return Ok(None);
     }
+    let reasoning_effort = model["reasoning_effort"]
+        .as_str()
+        .or_else(|| model["reasoning"]["effort"].as_str())
+        .or_else(|| profile["reasoning_effort"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+        .map(ToString::to_string);
     Ok(Some(ChatRuntimeSelection {
         profile_id,
         model_id,
@@ -5127,6 +11574,7 @@ fn active_chat_selection(
             .to_string(),
         extra_headers: parse_string_map_field(&profile["extra_headers"]),
         model: model_name.to_string(),
+        reasoning_effort,
     }))
 }
 
@@ -5243,6 +11691,17 @@ fn parse_string_map_field(value: &Value) -> BTreeMap<String, String> {
 }
 
 fn chat_completion_endpoint(selection: &ChatRuntimeSelection) -> Result<String, String> {
+    openai_compatible_endpoint(selection, "chat/completions")
+}
+
+fn openai_responses_endpoint(selection: &ChatRuntimeSelection) -> Result<String, String> {
+    openai_compatible_endpoint(selection, "responses")
+}
+
+fn openai_compatible_endpoint(
+    selection: &ChatRuntimeSelection,
+    suffix: &str,
+) -> Result<String, String> {
     let trimmed = selection.base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(
@@ -5253,11 +11712,33 @@ fn chat_completion_endpoint(selection: &ChatRuntimeSelection) -> Result<String, 
     if trimmed.starts_with("local://") {
         return Err("Selected LLM profile points to a local deterministic endpoint.".to_string());
     }
-    if trimmed.ends_with("/chat/completions") {
-        Ok(trimmed.to_string())
+    let base = trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/responses"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    if base.is_empty() {
+        Ok(format!("/{suffix}"))
     } else {
-        Ok(format!("{trimmed}/chat/completions"))
+        Ok(format!("{base}/{suffix}"))
     }
+}
+
+fn should_use_openai_responses_api(selection: &ChatRuntimeSelection) -> bool {
+    if selection.api_version.trim().is_empty() {
+        let binding = selection.binding.trim().to_ascii_lowercase();
+        if matches!(binding.as_str(), "anthropic" | "claude" | "ollama") {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    let model = selection.model.to_ascii_lowercase();
+    selection.reasoning_effort.is_some()
+        || model.contains("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
 }
 
 struct ChatCompletionBodyOptions<'a> {
@@ -5295,6 +11776,154 @@ fn chat_completion_body(
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+fn responses_body_from_chat_completion(
+    selection: &ChatRuntimeSelection,
+    chat_body: &Value,
+) -> Value {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in chat_body["messages"].as_array().into_iter().flatten() {
+        let role = message["role"].as_str().unwrap_or("user");
+        if role == "system" {
+            if let Some(text) = chat_message_text(&message["content"]) {
+                instructions.push(text);
+            }
+            continue;
+        }
+        if role == "tool" {
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": message["tool_call_id"].as_str().unwrap_or_default(),
+                "output": chat_message_text(&message["content"]).unwrap_or_default()
+            }));
+            continue;
+        }
+        for tool_call in message["tool_calls"].as_array().into_iter().flatten() {
+            if let Some(name) = tool_call["function"]["name"].as_str() {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": tool_call["id"].as_str().unwrap_or_default(),
+                    "name": name,
+                    "arguments": tool_call["function"]["arguments"].clone()
+                }));
+            }
+        }
+        if let Some(content) = responses_message_content_blocks(role, &message["content"]) {
+            input.push(json!({
+                "role": role,
+                "content": content
+            }));
+        }
+    }
+
+    let mut body = json!({
+        "model": chat_body["model"].as_str().unwrap_or(selection.model.as_str()),
+        "instructions": instructions.join("\n\n"),
+        "input": input,
+        "stream": false,
+        "store": false
+    });
+    if let Some(max_output_tokens) = chat_body
+        .get("max_output_tokens")
+        .or_else(|| chat_body.get("max_completion_tokens"))
+        .or_else(|| chat_body.get("max_tokens"))
+        .filter(|value| !value.is_null())
+    {
+        body["max_output_tokens"] = max_output_tokens.clone();
+    }
+    if let Some(effort) = selection.reasoning_effort.as_ref() {
+        body["reasoning"] = json!({ "effort": effort });
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    let tools = responses_tool_definitions(&chat_body["tools"]);
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+        if !chat_body["tool_choice"].is_null() {
+            body["tool_choice"] = chat_body["tool_choice"].clone();
+        }
+    }
+    body
+}
+
+fn chat_message_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part["text"].as_str())
+                        .or_else(|| part["content"].as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(_) => content["text"]
+            .as_str()
+            .or_else(|| content["content"].as_str())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn responses_message_content_blocks(role: &str, content: &Value) -> Option<Value> {
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let blocks = match content {
+        Value::String(text) => vec![json!({ "type": text_type, "text": text })],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part
+                    .as_str()
+                    .or_else(|| part["text"].as_str())
+                    .or_else(|| part["content"].as_str())
+                {
+                    return Some(json!({ "type": text_type, "text": text }));
+                }
+                if let Some(url) = part["image_url"]["url"]
+                    .as_str()
+                    .or_else(|| part["image_url"].as_str())
+                {
+                    return Some(json!({ "type": "input_image", "image_url": url }));
+                }
+                None
+            })
+            .collect::<Vec<_>>(),
+        Value::Object(_) => chat_message_text(content)
+            .map(|text| vec![json!({ "type": text_type, "text": text })])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    (!blocks.is_empty()).then_some(Value::Array(blocks))
+}
+
+fn responses_tool_definitions(tools: &Value) -> Vec<Value> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            if tool["type"] != "function" {
+                return Some(tool.clone());
+            }
+            let function = &tool["function"];
+            let name = function["name"].as_str()?;
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": function["description"].as_str().unwrap_or_default(),
+                "parameters": function["parameters"].clone()
+            }))
+        })
+        .collect()
 }
 
 fn chat_system_prompt(learner_context: &str, trace: &StudyTrace) -> String {
@@ -5366,6 +11995,12 @@ struct PreparedChatAttachment {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedChatBookReference {
+    book_id: String,
+    page_ids: Vec<String>,
+}
+
 fn prepare_chat_turn_payload(
     state: &AppState,
     session_id: &str,
@@ -5373,9 +12008,10 @@ fn prepare_chat_turn_payload(
     content: &str,
 ) -> (Value, String) {
     let (attachments, documents) = prepare_chat_attachments(state, session_id, payload);
+    let book_context = build_chat_book_context(state, &payload["book_references"]);
     let mut persistence_payload = payload.clone();
     persistence_payload["attachments"] = attachments;
-    let effective_content = chat_content_with_attached_documents(content, &documents);
+    let effective_content = chat_content_with_context(content, &documents, &book_context);
     (persistence_payload, effective_content)
 }
 
@@ -5541,24 +12177,615 @@ fn extract_chat_attachment_text(filename: &str, mime_type: &str, bytes: &[u8]) -
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn chat_content_with_attached_documents(
+fn chat_content_with_context(
     content: &str,
     documents: &[PreparedChatAttachment],
+    book_context: &str,
 ) -> String {
-    if documents.is_empty() {
+    if documents.is_empty() && book_context.trim().is_empty() {
         return content.to_string();
     }
-    let mut effective = String::from("[Attached Documents]\n");
-    for document in documents.iter().take(8) {
-        effective.push_str("Filename: ");
-        effective.push_str(&document.filename);
-        effective.push('\n');
-        effective.push_str(&truncate_for_prompt(&document.text, 4000));
-        effective.push_str("\n\n");
+
+    let mut context_parts = Vec::new();
+    if !documents.is_empty() {
+        let mut attached = String::from("[Attached Documents]\n");
+        for document in documents.iter().take(8) {
+            attached.push_str("Filename: ");
+            attached.push_str(&document.filename);
+            attached.push('\n');
+            attached.push_str(&truncate_for_prompt(&document.text, 4000));
+            attached.push_str("\n\n");
+        }
+        context_parts.push(attached.trim_end().to_string());
     }
-    effective.push_str("[User Question]\n");
-    effective.push_str(content);
-    effective
+    if !book_context.trim().is_empty() {
+        context_parts.push(format!("[Book Context]\n{}", book_context.trim()));
+    }
+    context_parts.push(format!("[User Question]\n{content}"));
+    context_parts.join("\n\n")
+}
+
+fn normalize_chat_book_references(value: &Value) -> Vec<NormalizedChatBookReference> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut refs: Vec<NormalizedChatBookReference> = Vec::new();
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(book_id) = object
+            .get("book_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let mut page_ids = Vec::new();
+        if let Some(values) = object.get("page_ids").and_then(Value::as_array) {
+            for value in values {
+                if let Some(page_id) = value.as_str().map(str::trim)
+                    && !page_id.is_empty()
+                    && !page_ids.iter().any(|seen| seen == page_id)
+                {
+                    page_ids.push(page_id.to_string());
+                }
+            }
+        }
+        if page_ids.is_empty()
+            && let Some(page_id) = object
+                .get("page_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            page_ids.push(page_id.to_string());
+        }
+        if page_ids.is_empty() {
+            continue;
+        }
+
+        if let Some(existing) = refs
+            .iter_mut()
+            .find(|reference| reference.book_id == book_id)
+        {
+            for page_id in page_ids {
+                if !existing.page_ids.iter().any(|seen| seen == &page_id) {
+                    existing.page_ids.push(page_id);
+                }
+            }
+        } else {
+            refs.push(NormalizedChatBookReference {
+                book_id: book_id.to_string(),
+                page_ids,
+            });
+        }
+    }
+    refs
+}
+
+fn build_chat_book_context(state: &AppState, value: &Value) -> String {
+    const MAX_CONTEXT_CHARS: usize = 32_000;
+    const MAX_PAGE_CHARS: usize = 12_000;
+    const MAX_BLOCK_CHARS: usize = 4_000;
+
+    let refs = normalize_chat_book_references(value);
+    if refs.is_empty() {
+        return String::new();
+    }
+
+    let mut sections = Vec::new();
+    for reference in refs {
+        let Ok(book) = load_book_manifest(state, &reference.book_id) else {
+            continue;
+        };
+        let spine = load_book_json(state, &reference.book_id, "spine.json").unwrap_or(Value::Null);
+        let mut page_sections = Vec::new();
+        for page_id in reference.page_ids {
+            let Ok(page) = load_book_page(state, &reference.book_id, &page_id) else {
+                continue;
+            };
+            let chapter = chat_book_chapter_for_page(&spine, &page);
+            let page_text =
+                serialize_chat_book_page(&spine, chapter, &page, MAX_PAGE_CHARS, MAX_BLOCK_CHARS);
+            if !page_text.trim().is_empty() {
+                page_sections.push(page_text);
+            }
+        }
+        if !page_sections.is_empty() {
+            sections.push(format!(
+                "{}\n\n{}",
+                serialize_chat_book_header(&book),
+                page_sections.join("\n\n")
+            ));
+        }
+    }
+
+    truncate_for_prompt(&sections.join("\n\n---\n\n"), MAX_CONTEXT_CHARS)
+}
+
+fn chat_book_chapter_for_page(spine: &Value, page: &Value) -> Option<Value> {
+    let chapter_id = page["chapter_id"].as_str()?;
+    spine["chapters"]
+        .as_array()?
+        .iter()
+        .find(|chapter| chapter["id"].as_str() == Some(chapter_id))
+        .cloned()
+}
+
+fn serialize_chat_book_header(book: &Value) -> String {
+    let mut lines = Vec::new();
+    let title = clean_book_context_value(&book["title"]);
+    let fallback_id = clean_book_context_value(&book["id"]);
+    lines.push(format!(
+        "# Book: {}",
+        if title.is_empty() { fallback_id } else { title }
+    ));
+    let description = clean_book_context_value(&book["description"]);
+    if !description.is_empty() {
+        lines.push(format!(
+            "Description: {}",
+            clip_book_context_text(&description, 800)
+        ));
+    }
+    let language = clean_book_context_value(&book["language"]);
+    if !language.is_empty() {
+        lines.push(format!("Language: {language}"));
+    }
+    lines.join("\n")
+}
+
+fn serialize_chat_book_page(
+    spine: &Value,
+    chapter: Option<Value>,
+    page: &Value,
+    page_char_limit: usize,
+    block_char_limit: usize,
+) -> String {
+    let mut lines = Vec::new();
+    let title = clean_book_context_value(&page["title"]);
+    let fallback_id = clean_book_context_value(&page["id"]);
+    lines.push(format!(
+        "## Page: {}",
+        if title.is_empty() { fallback_id } else { title }
+    ));
+
+    let chapter_title = chapter
+        .as_ref()
+        .map(|value| clean_book_context_value(&value["title"]))
+        .unwrap_or_default();
+    if !chapter_title.is_empty() {
+        lines.push(format!("Chapter: {chapter_title}"));
+    }
+    let chapter_summary = chapter
+        .as_ref()
+        .map(|value| clean_book_context_value(&value["summary"]))
+        .unwrap_or_default();
+    if !chapter_summary.is_empty() {
+        lines.push(format!(
+            "Chapter summary: {}",
+            clip_book_context_text(&chapter_summary, 1200)
+        ));
+    }
+
+    let objectives = page["learning_objectives"].as_array().or_else(|| {
+        chapter
+            .as_ref()
+            .and_then(|value| value["learning_objectives"].as_array())
+    });
+    if let Some(objectives) = objectives {
+        let items = objectives
+            .iter()
+            .filter_map(|value| {
+                let text = clean_book_context_value(value);
+                (!text.is_empty()).then(|| format!("- {}", clip_book_context_text(&text, 300)))
+            })
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            lines.push("Learning objectives:".to_string());
+            lines.extend(items);
+        }
+    }
+
+    let status = clean_book_context_value(&page["status"]);
+    if !status.is_empty() {
+        lines.push(format!("Page status: {status}"));
+    }
+    let exploration_summary = clean_book_context_value(&spine["exploration_summary"]);
+    if !exploration_summary.is_empty() {
+        lines.push(format!(
+            "Book source summary: {}",
+            clip_book_context_text(&exploration_summary, 1000)
+        ));
+    }
+
+    let block_texts = page["blocks"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| {
+                    let text = serialize_chat_book_block(block, block_char_limit);
+                    (!text.trim().is_empty()).then_some(text)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !block_texts.is_empty() {
+        lines.push("Page content:".to_string());
+        lines.extend(block_texts);
+    }
+    let error = clean_book_context_value(&page["error"]);
+    if !error.is_empty() {
+        lines.push(format!(
+            "Page error: {}",
+            clip_book_context_text(&error, 600)
+        ));
+    }
+    clip_book_context_text(&lines.join("\n"), page_char_limit)
+}
+
+fn serialize_chat_book_block(block: &Value, block_char_limit: usize) -> String {
+    let block_type = clean_book_context_value(&block["type"]);
+    let status = clean_book_context_value(&block["status"]);
+    if status == "hidden" {
+        return String::new();
+    }
+
+    let title = clean_book_context_value(&block["title"]);
+    let mut heading = format!(
+        "### Block: {}",
+        if title.is_empty() {
+            block_type.clone()
+        } else {
+            title
+        }
+    );
+    if !block_type.is_empty() {
+        heading.push_str(&format!(" ({block_type})"));
+    }
+
+    if status != "ready" {
+        let mut details = vec![
+            heading,
+            format!(
+                "Status: {}",
+                if status.is_empty() {
+                    "unknown"
+                } else {
+                    &status
+                }
+            ),
+        ];
+        let error = clean_book_context_value(&block["error"]);
+        if !error.is_empty() {
+            details.push(format!("Error: {}", clip_book_context_text(&error, 500)));
+        }
+        return details.join("\n");
+    }
+
+    let payload = &block["payload"];
+    let mut body = payload_for_chat_book_block(&block_type, payload);
+    if body.is_empty() {
+        let error = clean_book_context_value(&block["error"]);
+        if !error.is_empty() {
+            body = format!("Error: {}", clip_book_context_text(&error, 500));
+        }
+    }
+    if body.is_empty() {
+        return String::new();
+    }
+    clip_book_context_text(&format!("{heading}\n{body}"), block_char_limit)
+}
+
+fn payload_for_chat_book_block(block_type: &str, payload: &Value) -> String {
+    let bridge = join_book_text_fields(payload, &["bridge_text", "transition_in"]);
+    let main = match block_type {
+        "text" | "user_note" => {
+            join_book_text_fields(payload, &["content", "body", "text", "markdown"])
+        }
+        "callout" => join_non_empty(vec![
+            clean_book_context_value(&payload["label"]),
+            clean_book_context_value(&payload["body"]),
+        ]),
+        "section" => format_chat_book_section(payload),
+        "quiz" => format_chat_book_quiz(payload),
+        "flash_cards" => format_chat_book_flash_cards(payload),
+        "timeline" => format_chat_book_timeline(payload),
+        "code" => format_chat_book_code(payload),
+        "deep_dive" => format_chat_book_deep_dive(payload),
+        "figure" | "interactive" | "animation" | "concept_graph" => {
+            format_chat_book_visual_summary(payload)
+        }
+        _ => safe_book_payload_summary(payload),
+    };
+    join_non_empty(vec![bridge, main])
+}
+
+fn format_chat_book_section(payload: &Value) -> String {
+    let mut lines = Vec::new();
+    let intro = clean_book_context_value(&payload["intro"]);
+    if !intro.is_empty() {
+        lines.push(intro);
+    }
+    if let Some(subsections) = payload["subsections"].as_array() {
+        for item in subsections {
+            let heading = clean_book_context_value(&item["heading"]);
+            let focus = clean_book_context_value(&item["focus"]);
+            let body = clean_book_context_value(&item["body"]);
+            if !heading.is_empty() {
+                lines.push(format!("#### {heading}"));
+            }
+            if !focus.is_empty() {
+                lines.push(format!("Focus: {focus}"));
+            }
+            if !body.is_empty() {
+                lines.push(body);
+            }
+        }
+    }
+    let takeaway = clean_book_context_value(&payload["key_takeaway"]);
+    if !takeaway.is_empty() {
+        lines.push(format!("Key takeaway: {takeaway}"));
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_quiz(payload: &Value) -> String {
+    let Some(questions) = payload["questions"].as_array() else {
+        return join_book_text_fields(payload, &["topic", "question", "explanation"]);
+    };
+    let mut lines = Vec::new();
+    for (index, item) in questions.iter().take(8).enumerate() {
+        let question = clean_book_context_value(&item["question"]);
+        if question.is_empty() {
+            continue;
+        }
+        lines.push(format!("Q{}: {question}", index + 1));
+        if let Some(options) = item["options"].as_object() {
+            let option_text = options
+                .iter()
+                .filter_map(|(key, value)| {
+                    let key = clean_book_context_text(key);
+                    let value = clean_book_context_value(value);
+                    (!key.is_empty() && !value.is_empty()).then(|| format!("{key}. {value}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !option_text.is_empty() {
+                lines.push(format!("Options: {option_text}"));
+            }
+        }
+        let answer = clean_book_context_value(&item["correct_answer"]);
+        if !answer.is_empty() {
+            lines.push(format!("Answer: {answer}"));
+        }
+        let explanation = clean_book_context_value(&item["explanation"]);
+        if !explanation.is_empty() {
+            lines.push(format!("Explanation: {explanation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_flash_cards(payload: &Value) -> String {
+    let Some(cards) = payload["cards"].as_array() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for (index, item) in cards.iter().take(12).enumerate() {
+        let front = clean_book_context_value(&item["front"]);
+        let back = clean_book_context_value(&item["back"]);
+        if front.is_empty() || back.is_empty() {
+            continue;
+        }
+        let hint = clean_book_context_value(&item["hint"]);
+        let suffix = if hint.is_empty() {
+            String::new()
+        } else {
+            format!(" Hint: {hint}")
+        };
+        lines.push(format!("Card {}: {front} -> {back}{suffix}", index + 1));
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_timeline(payload: &Value) -> String {
+    let Some(events) = payload["events"].as_array() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for item in events.iter().take(10) {
+        let line = join_non_empty(vec![
+            clean_book_context_value(&item["date"]),
+            clean_book_context_value(&item["title"]),
+            clean_book_context_value(&item["description"]),
+        ])
+        .replace('\n', " - ");
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_code(payload: &Value) -> String {
+    let mut lines = Vec::new();
+    let intent = clean_book_context_value(&payload["intent"]);
+    if !intent.is_empty() {
+        lines.push(format!("Intent: {intent}"));
+    }
+    let explanation = clean_book_context_value(&payload["explanation"]);
+    if !explanation.is_empty() {
+        lines.push(format!("Explanation: {explanation}"));
+    }
+    let code = clean_book_context_value(&payload["code"]);
+    if !code.is_empty() {
+        let language = clean_book_context_value(&payload["language"]);
+        lines.push(format!(
+            "Code ({}):\n{}",
+            if language.is_empty() {
+                "code"
+            } else {
+                &language
+            },
+            clip_book_context_text(&code, 1200)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_deep_dive(payload: &Value) -> String {
+    let Some(suggestions) = payload["suggestions"].as_array() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for item in suggestions.iter().take(6) {
+        let topic = clean_book_context_value(&item["topic"]);
+        if topic.is_empty() {
+            continue;
+        }
+        let rationale = clean_book_context_value(&item["rationale"]);
+        if rationale.is_empty() {
+            lines.push(format!("- {topic}"));
+        } else {
+            lines.push(format!("- {topic}: {rationale}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_chat_book_visual_summary(payload: &Value) -> String {
+    let mut lines = Vec::new();
+    let summary = join_book_text_fields(
+        payload,
+        &["description", "summary", "caption", "chart_type"],
+    );
+    if !summary.is_empty() {
+        lines.push(summary);
+    }
+    if let Some(points) = payload["key_points"].as_array() {
+        for point in points.iter().take(8) {
+            let text = clean_book_context_value(point);
+            if !text.is_empty() {
+                lines.push(format!("- {text}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn safe_book_payload_summary(payload: &Value) -> String {
+    fn walk(node: &Value, key: &str, emitted: &mut usize, lines: &mut Vec<String>) {
+        if *emitted >= 16 {
+            return;
+        }
+        let lowered = key.to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "code" | "html" | "svg" | "content" | "artifact" | "artifacts"
+        ) {
+            return;
+        }
+        match node {
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+                let text = clean_book_context_value(node);
+                if !text.is_empty() {
+                    *emitted += 1;
+                    lines.push(clip_book_context_text(&text, 500));
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, key, emitted, lines);
+                    if *emitted >= 16 {
+                        break;
+                    }
+                }
+            }
+            Value::Object(object) => {
+                for (child_key, child_value) in object {
+                    walk(child_value, child_key, emitted, lines);
+                    if *emitted >= 16 {
+                        break;
+                    }
+                }
+            }
+            Value::Null => {}
+        }
+    }
+
+    let mut emitted = 0;
+    let mut lines = Vec::new();
+    walk(payload, "", &mut emitted, &mut lines);
+    lines.join("\n")
+}
+
+fn join_book_text_fields(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .filter_map(|key| {
+            let text = clean_book_context_value(&payload[*key]);
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn join_non_empty(parts: Vec<String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean_book_context_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => clean_book_context_text(text),
+        Value::Number(_) | Value::Bool(_) => clean_book_context_text(&value.to_string()),
+        _ => String::new(),
+    }
+}
+
+fn clean_book_context_text(text: &str) -> String {
+    let mut cleaned = strip_book_think_blocks(text);
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "");
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    cleaned.trim().to_string()
+}
+
+fn strip_book_think_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.to_ascii_lowercase().find("<think") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let Some(end) = after_start.to_ascii_lowercase().find("</think>") else {
+            break;
+        };
+        rest = &after_start[end + "</think>".len()..];
+    }
+    out
+}
+
+fn clip_book_context_text(text: &str, limit: usize) -> String {
+    let text = clean_book_context_text(text);
+    if limit == 0 || text.chars().count() <= limit {
+        return text;
+    }
+    let head = limit.saturating_sub(40);
+    let mut clipped = text.chars().take(head).collect::<String>();
+    clipped = clipped.trim_end().to_string();
+    clipped.push_str("\n...[truncated]");
+    clipped
 }
 
 fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
@@ -5574,13 +12801,63 @@ async fn call_chat_completion_provider(
     selection: &ChatRuntimeSelection,
     body: Value,
 ) -> Result<ChatProviderResponse, String> {
-    let endpoint = chat_completion_endpoint(selection)?;
+    let use_responses_api = should_use_openai_responses_api(selection);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| error.to_string())?;
+
+    if use_responses_api {
+        let responses_endpoint = openai_responses_endpoint(selection)?;
+        let responses_body = responses_body_from_chat_completion(selection, &body);
+        let (status, text) = send_openai_compatible_request(
+            &client,
+            selection,
+            &responses_endpoint,
+            &responses_body,
+        )
+        .await?;
+        if status.is_success() {
+            return parse_chat_provider_response_text(selection, &text, true);
+        }
+        if should_fallback_from_responses_error(status, &text) {
+            let chat_endpoint = chat_completion_endpoint(selection)?;
+            let (chat_status, chat_text) =
+                send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+            if !chat_status.is_success() {
+                return Err(format!(
+                    "HTTP {} from {chat_endpoint}: {chat_text}",
+                    chat_status.as_u16()
+                ));
+            }
+            return parse_chat_provider_response_text(selection, &chat_text, false);
+        }
+        return Err(format!(
+            "HTTP {} from {responses_endpoint}: {text}",
+            status.as_u16()
+        ));
+    }
+
+    let chat_endpoint = chat_completion_endpoint(selection)?;
+    let (status, text) =
+        send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} from {chat_endpoint}: {text}",
+            status.as_u16()
+        ));
+    }
+    parse_chat_provider_response_text(selection, &text, false)
+}
+
+async fn send_openai_compatible_request(
+    client: &reqwest::Client,
+    selection: &ChatRuntimeSelection,
+    endpoint: &str,
+    body: &Value,
+) -> Result<(StatusCode, String), String> {
     let request = client
-        .post(&endpoint)
+        .post(endpoint)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
     let request = apply_openai_compatible_request_headers(
         request,
@@ -5595,13 +12872,45 @@ async fn call_chat_completion_provider(
         .map_err(|error| error.to_string())?;
     let status = response.status();
     let text = response.text().await.map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(format!("HTTP {} from {endpoint}: {text}", status.as_u16()));
+    Ok((status, text))
+}
+
+fn should_fallback_from_responses_error(status: StatusCode, response_text: &str) -> bool {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
     }
-    let payload = serde_json::from_str::<Value>(&text)
+    let text = response_text.to_ascii_lowercase();
+    [
+        "responses",
+        "response api",
+        "max_output_tokens",
+        "instructions",
+        "previous_response",
+        "unknown parameter",
+        "unrecognized request argument",
+        "unsupported",
+        "not supported",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn parse_chat_provider_response_text(
+    _selection: &ChatRuntimeSelection,
+    text: &str,
+    use_responses_api: bool,
+) -> Result<ChatProviderResponse, String> {
+    let payload = serde_json::from_str::<Value>(text)
         .map_err(|error| format!("Invalid JSON response: {error}"))?;
-    let response = parse_chat_completion_response(&payload)
-        .ok_or_else(|| "Chat completion response did not include assistant content".to_string())?;
+    let response = if use_responses_api {
+        parse_responses_provider_response(&payload)
+    } else {
+        parse_chat_completion_response(&payload)
+    }
+    .ok_or_else(|| "Chat completion response did not include assistant content".to_string())?;
     if response.content.is_none() && response.tool_calls.is_empty() {
         return Err("Chat completion response did not include assistant content".to_string());
     }
@@ -5703,6 +13012,115 @@ fn parse_chat_completion_response(payload: &Value) -> Option<ChatProviderRespons
         reasoning_content: parse_chat_reasoning_content(message),
         finish_reason: choice["finish_reason"].as_str().map(ToString::to_string),
     })
+}
+
+fn parse_responses_provider_response(payload: &Value) -> Option<ChatProviderResponse> {
+    let output = payload["output"].as_array()?;
+    let mut content_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item["type"].as_str().unwrap_or_default() {
+            "message" => {
+                for part in item["content"].as_array().into_iter().flatten() {
+                    if matches!(
+                        part["type"].as_str(),
+                        Some("output_text") | Some("text") | Some("input_text")
+                    ) && let Some(text) =
+                        part["text"].as_str().or_else(|| part["content"].as_str())
+                    {
+                        content_parts.push(text.to_string());
+                    }
+                }
+            }
+            "reasoning" => {
+                for part in item["summary"].as_array().into_iter().flatten() {
+                    if let Some(text) = part["text"]
+                        .as_str()
+                        .or_else(|| part["summary"].as_str())
+                        .or_else(|| part["content"].as_str())
+                    {
+                        reasoning_parts.push(text.to_string());
+                    }
+                }
+            }
+            "function_call" => {
+                if let Some(name) = item["name"].as_str() {
+                    tool_calls.push(json!({
+                        "id": item["call_id"]
+                            .as_str()
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or_default(),
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": item["arguments"].clone()
+                        }
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let content = if content_parts.is_empty() {
+        payload["output_text"]
+            .as_str()
+            .map(ToString::to_string)
+            .filter(|text| !text.trim().is_empty())
+    } else {
+        Some(content_parts.join(""))
+    };
+    let usage = responses_usage_as_chat_usage(&payload["usage"]);
+    Some(ChatProviderResponse {
+        content,
+        tool_calls,
+        usage,
+        reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n")),
+        finish_reason: payload["status"].as_str().map(ToString::to_string),
+    })
+}
+
+fn responses_usage_as_chat_usage(usage: &Value) -> Option<Value> {
+    if usage.is_null() {
+        return None;
+    }
+    let mut mapped = usage.clone();
+    if let Some(object) = mapped.as_object_mut() {
+        if let Some(input_tokens) = usage["input_tokens"].as_u64() {
+            object.insert("prompt_tokens".to_string(), json!(input_tokens));
+        }
+        if let Some(output_tokens) = usage["output_tokens"].as_u64() {
+            object.insert("completion_tokens".to_string(), json!(output_tokens));
+        }
+        if let Some(total_tokens) = usage["total_tokens"].as_u64() {
+            object.insert("total_tokens".to_string(), json!(total_tokens));
+        }
+    }
+    Some(mapped)
+}
+
+fn responses_payload_as_chat_completion(
+    selection: &ChatRuntimeSelection,
+    payload: &Value,
+) -> Option<Value> {
+    let response = parse_responses_provider_response(payload)?;
+    let message = json!({
+        "role": "assistant",
+        "content": response.content.clone().unwrap_or_default(),
+        "tool_calls": response.tool_calls
+    });
+    Some(json!({
+        "id": payload["id"].as_str().unwrap_or("chatcmpl-responses-compat"),
+        "object": "chat.completion",
+        "created": now_seconds() as u64,
+        "model": payload["model"].as_str().unwrap_or(selection.model.as_str()),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": response.finish_reason.as_deref().unwrap_or("stop")
+        }],
+        "usage": response.usage.unwrap_or_else(|| json!({}))
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6452,6 +13870,228 @@ async fn embedding_settings_events(state: &AppState, catalog: &Value) -> String 
     body
 }
 
+async fn llm_settings_events(state: &AppState, catalog: &Value) -> String {
+    let mut body = String::new();
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Preparing configuration snapshot.",
+    )));
+    let selection = match active_chat_selection(catalog, &Value::Null) {
+        Ok(Some(selection)) => selection,
+        Ok(None) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed",
+                "No provider-backed LLM model is configured.",
+            )));
+            return body;
+        }
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed", error,
+            )));
+            return body;
+        }
+    };
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Loading LLM config from the active catalog selection.",
+    )));
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!(
+            "Resolved LLM model `{}` with binding `{}`.",
+            selection.model, selection.binding
+        ),
+    )));
+    let endpoint = match chat_completion_endpoint(&selection) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed", error,
+            )));
+            return body;
+        }
+    };
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!("Request target: {endpoint}"),
+    )));
+
+    let probe = json!({
+        "model": selection.model.as_str(),
+        "stream": false,
+        "temperature": 0.1,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Respond briefly but include your model identity if possible."
+            },
+            {
+                "role": "user",
+                "content": "Say 'OK' and identify the model you are using."
+            }
+        ]
+    });
+    let response_payload = match call_raw_openai_chat_completion(&selection, probe).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed",
+                format!("LLM request failed: {error}"),
+            )));
+            return body;
+        }
+    };
+    let snippet = parse_chat_completion_content(&response_payload)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if snippet.is_empty() {
+        body.push_str(&settings_data_event(settings_event_payload(
+            "failed",
+            "LLM returned an empty response.",
+        )));
+        return body;
+    }
+    body.push_str(&settings_data_event(json!({
+        "type": "response",
+        "message": "Received LLM response.",
+        "timestamp": now_seconds(),
+        "snippet": truncate_for_prompt(&snippet, 400),
+        "model": response_payload["model"].clone(),
+        "usage": response_payload["usage"].clone()
+    })));
+
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Detecting model context window.",
+    )));
+    let (context_window, source, detail) = detected_llm_context_window(catalog, &selection);
+    let detected_at = now_rfc3339();
+    body.push_str(&settings_data_event(json!({
+        "type": "context_window",
+        "message": format!("Context window set to {context_window} tokens ({source})."),
+        "timestamp": now_seconds(),
+        "context_window": context_window,
+        "source": source,
+        "detail": detail,
+        "detected_at": detected_at
+    })));
+
+    let saved_catalog = catalog_with_detected_llm_context_window(
+        catalog,
+        &selection,
+        context_window,
+        &source,
+        &detected_at,
+    );
+    match write_settings_json(state, "catalog.json", &saved_catalog) {
+        Ok(()) => body.push_str(&settings_data_event(json!({
+            "type": "catalog",
+            "message": "Saved updated model metadata to model_catalog.json.",
+            "timestamp": now_seconds(),
+            "catalog": saved_catalog
+        }))),
+        Err(error) => {
+            let detail = error.1.0["detail"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string();
+            body.push_str(&settings_data_event(settings_event_payload(
+                "warning",
+                format!("Could not save detected LLM context window: {detail}"),
+            )));
+        }
+    }
+    body.push_str(&settings_data_event(settings_event_payload(
+        "completed",
+        "LLM test completed successfully.",
+    )));
+    body
+}
+
+async fn search_settings_events(catalog: &Value) -> String {
+    let mut body = String::new();
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Preparing configuration snapshot.",
+    )));
+    let resolved = resolve_search_runtime_config(catalog);
+    body.push_str(&settings_data_event(json!({
+        "type": "config",
+        "message": "Loaded search config from the active catalog selection.",
+        "timestamp": now_seconds(),
+        "provider": resolved.requested_provider,
+        "effective_provider": resolved.provider,
+        "base_url": resolved.base_url,
+        "api_key": if resolved.api_key.is_empty() { "" } else { "********" },
+        "proxy": resolved.proxy,
+        "max_results": resolved.max_results
+    })));
+    if resolved.unsupported_provider {
+        body.push_str(&settings_data_event(settings_event_payload(
+            "failed",
+            format!(
+                "Search provider `{}` is deprecated/unsupported. Switch to {}.",
+                resolved.requested_provider,
+                supported_search_provider_hint()
+            ),
+        )));
+        return body;
+    }
+    if resolved.missing_credentials {
+        body.push_str(&settings_data_event(settings_event_payload(
+            "failed",
+            search_missing_credentials_message(&resolved.requested_provider),
+        )));
+        return body;
+    }
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!("Resolved search provider `{}`.", resolved.provider),
+    )));
+    if let Some(reason) = &resolved.fallback_reason {
+        body.push_str(&settings_data_event(settings_event_payload(
+            "warning",
+            reason.clone(),
+        )));
+    }
+    let query = "Socartes configuration health check";
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        format!("Running search query: {query}"),
+    )));
+    let result = match run_search_health_check(&resolved, query).await {
+        Ok(result) => result,
+        Err(error) => {
+            body.push_str(&settings_data_event(settings_event_payload(
+                "failed", error,
+            )));
+            return body;
+        }
+    };
+    body.push_str(&settings_data_event(json!({
+        "type": "response",
+        "message": "Search result received.",
+        "timestamp": now_seconds(),
+        "answer_preview": truncate_for_prompt(&result.answer, 240),
+        "citation_count": result.citation_count,
+        "search_result_count": result.search_result_count
+    })));
+    if result.answer.is_empty() && result.search_result_count == 0 {
+        body.push_str(&settings_data_event(settings_event_payload(
+            "failed",
+            "Search provider returned no answer and no search results.",
+        )));
+        return body;
+    }
+    body.push_str(&settings_data_event(settings_event_payload(
+        "completed",
+        "SEARCH test completed successfully.",
+    )));
+    body
+}
+
 fn catalog_with_detected_embedding_dimension(
     catalog: &Value,
     detected_dim: i64,
@@ -6493,6 +14133,82 @@ fn catalog_with_detected_embedding_dimension(
                         .collect::<Vec<_>>()
                         .join(",")
                 );
+            }
+        }
+    }
+    saved
+}
+
+fn selected_llm_model<'a>(
+    catalog: &'a Value,
+    selection: &ChatRuntimeSelection,
+) -> Option<&'a Value> {
+    catalog["services"]["llm"]["profiles"]
+        .as_array()?
+        .iter()
+        .find(|profile| profile["id"].as_str() == Some(selection.profile_id.as_str()))
+        .or_else(|| catalog["services"]["llm"]["profiles"].as_array()?.first())
+        .and_then(|profile| {
+            profile["models"]
+                .as_array()?
+                .iter()
+                .find(|model| model["id"].as_str() == Some(selection.model_id.as_str()))
+                .or_else(|| profile["models"].as_array()?.first())
+        })
+}
+
+fn detected_llm_context_window(
+    catalog: &Value,
+    selection: &ChatRuntimeSelection,
+) -> (i64, String, String) {
+    if let Some(model) = selected_llm_model(catalog, selection)
+        && let Some(context_window) = parse_i64_field(&model["context_window"])
+        && context_window > 0
+    {
+        let source = model["context_window_source"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("catalog")
+            .to_string();
+        return (
+            context_window,
+            source,
+            "Using context window from active model metadata.".to_string(),
+        );
+    }
+    (
+        8192,
+        "catalog_default".to_string(),
+        "No context window was configured for the active model; using Socartes default metadata."
+            .to_string(),
+    )
+}
+
+fn catalog_with_detected_llm_context_window(
+    catalog: &Value,
+    selection: &ChatRuntimeSelection,
+    context_window: i64,
+    source: &str,
+    detected_at: &str,
+) -> Value {
+    let mut saved = catalog.clone();
+    if let Some(profiles) = saved["services"]["llm"]["profiles"].as_array_mut() {
+        let profile_index = profiles
+            .iter()
+            .position(|profile| profile["id"].as_str() == Some(selection.profile_id.as_str()))
+            .unwrap_or(0);
+        if let Some(profile) = profiles.get_mut(profile_index)
+            && let Some(models) = profile["models"].as_array_mut()
+        {
+            let model_index = models
+                .iter()
+                .position(|model| model["id"].as_str() == Some(selection.model_id.as_str()))
+                .unwrap_or(0);
+            if let Some(model) = models.get_mut(model_index) {
+                model["context_window"] = json!(context_window.to_string());
+                model["context_window_source"] = json!(source);
+                model["context_window_detected_at"] = json!(detected_at);
             }
         }
     }
@@ -6572,15 +14288,1401 @@ fn llm_selection_field(selection: &Map<String, Value>, key: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SearchRuntimeConfig {
+    provider: String,
+    requested_provider: String,
+    api_key: String,
+    base_url: String,
+    proxy: Option<String>,
+    max_results: usize,
+    unsupported_provider: bool,
+    missing_credentials: bool,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchHealthResult {
+    answer: String,
+    citation_count: usize,
+    search_result_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchProviderResult {
+    answer: String,
+    provider: String,
+    model: String,
+    citations: Vec<Value>,
+    search_results: Vec<Value>,
+    usage: Value,
+    metadata: Value,
+}
+
 fn active_search_provider(catalog: &Value) -> Option<String> {
+    let resolved = resolve_search_runtime_config(catalog);
+    (!resolved.provider.is_empty()).then_some(resolved.provider)
+}
+
+fn resolve_search_runtime_config(catalog: &Value) -> SearchRuntimeConfig {
     let service = &catalog["services"]["search"];
     let active_profile_id = service["active_profile_id"].as_str();
-    let profile = service["profiles"]
-        .as_array()?
+    let profile = service["profiles"].as_array().and_then(|profiles| {
+        profiles
+            .iter()
+            .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
+            .or_else(|| profiles.first())
+    });
+    let profile_provider = profile
+        .and_then(|profile| profile["provider"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let requested_provider = profile_provider
+        .map(ToString::to_string)
+        .or_else(|| env::var("SEARCH_PROVIDER").ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "brave".to_string());
+    let mut provider = requested_provider.clone();
+    let mut api_key = profile
+        .and_then(|profile| profile["api_key"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut base_url = profile
+        .and_then(|profile| profile["base_url"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let proxy = profile
+        .and_then(|profile| profile["proxy"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            env::var("SEARCH_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+    let max_results = profile
+        .and_then(|profile| parse_i64_field(&profile["max_results"]))
+        .unwrap_or(5)
+        .clamp(1, 10) as usize;
+
+    if provider == "searxng" && base_url.is_empty() {
+        base_url = env::var("SEARXNG_BASE_URL")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    if api_key.is_empty()
+        && let Some(env_key) = search_provider_api_key_from_env(&provider)
+    {
+        api_key = env_key;
+    }
+
+    let deprecated_provider = DEPRECATED_SEARCH_PROVIDERS.contains(&provider.as_str());
+    let unsupported_provider =
+        deprecated_provider || !SUPPORTED_SEARCH_PROVIDERS.contains(&provider.as_str());
+    let missing_credentials =
+        matches!(provider.as_str(), "perplexity" | "serper") && api_key.is_empty();
+    let mut fallback_reason = None;
+    if !unsupported_provider {
+        if matches!(provider.as_str(), "brave" | "tavily" | "jina") && api_key.is_empty() {
+            fallback_reason = Some(format!(
+                "{provider} requires api_key, falling back to duckduckgo"
+            ));
+            provider = "duckduckgo".to_string();
+        } else if provider == "searxng" && base_url.is_empty() {
+            fallback_reason =
+                Some("searxng requires base_url, falling back to duckduckgo".to_string());
+            provider = "duckduckgo".to_string();
+        }
+    }
+
+    SearchRuntimeConfig {
+        provider,
+        requested_provider,
+        api_key,
+        base_url,
+        proxy,
+        max_results,
+        unsupported_provider,
+        missing_credentials,
+        fallback_reason,
+    }
+}
+
+fn search_provider_api_key_from_env(provider: &str) -> Option<String> {
+    let keys: &[&str] = match provider {
+        "brave" => &["BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"],
+        "tavily" => &["TAVILY_API_KEY"],
+        "jina" => &["JINA_API_KEY"],
+        "perplexity" => &["PERPLEXITY_API_KEY"],
+        "serper" => &["SERPER_API_KEY"],
+        _ => &[],
+    };
+    keys.iter().find_map(|key| {
+        env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn supported_search_provider_hint() -> &'static str {
+    "brave/tavily/jina/searxng/duckduckgo/perplexity/serper"
+}
+
+fn search_provider_env_hint(provider: &str) -> &'static str {
+    match provider {
+        "serper" => "SERPER_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        _ => "provider-specific API key",
+    }
+}
+
+fn search_missing_credentials_message(provider: &str) -> String {
+    format!(
+        "{provider} requires api_key. Set profile.api_key or {}.",
+        search_provider_env_hint(provider)
+    )
+}
+
+fn search_missing_credentials_error(provider: &str) -> String {
+    format!(
+        "Set profile.api_key or {}",
+        search_provider_env_hint(provider)
+    )
+}
+
+async fn run_search_health_check(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchHealthResult, String> {
+    let result = run_web_search(config, query).await?;
+    let answer = if result.answer.trim().is_empty() && !result.search_results.is_empty() {
+        format_search_results_answer(query, &result.search_results)
+    } else {
+        result.answer
+    };
+    Ok(SearchHealthResult {
+        answer,
+        citation_count: result.citations.len(),
+        search_result_count: result.search_results.len(),
+    })
+}
+
+async fn run_web_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    if config.unsupported_provider {
+        return Err(format!(
+            "Search provider `{}` is deprecated/unsupported.",
+            config.requested_provider
+        ));
+    }
+    if config.missing_credentials {
+        return Err(format!(
+            "Search provider `{}` missing credentials.",
+            config.requested_provider
+        ));
+    }
+
+    match config.provider.as_str() {
+        "duckduckgo" => run_duckduckgo_search(config, query).await,
+        "brave" => run_brave_search(config, query).await,
+        "tavily" => run_tavily_search(config, query).await,
+        "perplexity" => run_perplexity_search(config, query).await,
+        "jina" => run_jina_search(config, query).await,
+        "serper" => run_serper_search(config, query).await,
+        "searxng" => run_searxng_search(config, query).await,
+        provider => Ok(deterministic_search_result(
+            provider,
+            query,
+            config.max_results,
+        )),
+    }
+}
+
+async fn run_duckduckgo_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let endpoint = duckduckgo_search_endpoint(&config.base_url);
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let count = config.max_results.clamp(1, 10).to_string();
+    let response = client
+        .get(&endpoint)
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+        .header(
+            reqwest::header::USER_AGENT,
+            "Socartes-Rust/0.1 (+https://sc.tckr.top)",
+        )
+        .query(&[("q", query), ("max_results", count.as_str())])
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("duckduckgo returned {status}: {text}"));
+    }
+    let search_results = parse_duckduckgo_html_results(&text)
+        .into_iter()
+        .take(config.max_results)
+        .collect::<Vec<_>>();
+    let citations = search_results
         .iter()
-        .find(|profile| Some(profile["id"].as_str().unwrap_or_default()) == active_profile_id)
-        .or_else(|| service["profiles"].as_array()?.first())?;
-    profile["provider"].as_str().map(ToString::to_string)
+        .enumerate()
+        .map(|(index, result)| duckduckgo_result_to_citation(index + 1, result))
+        .collect::<Vec<_>>();
+    Ok(SearchProviderResult {
+        answer: String::new(),
+        provider: "duckduckgo".to_string(),
+        model: "duckduckgo".to_string(),
+        citations,
+        search_results,
+        usage: json!({}),
+        metadata: json!({
+            "finish_reason": "stop",
+            "requested_url": endpoint
+        }),
+    })
+}
+
+fn duckduckgo_search_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        "https://duckduckgo.com/html/".to_string()
+    } else if base_url.ends_with("/html") {
+        format!("{base_url}/")
+    } else {
+        format!("{base_url}/html/")
+    }
+}
+
+fn parse_duckduckgo_html_results(html: &str) -> Vec<Value> {
+    let document = ScraperHtml::parse_document(html);
+    let result_selector = Selector::parse(".result").expect("valid duckduckgo result selector");
+    let title_selector = Selector::parse(".result__a").expect("valid duckduckgo title selector");
+    let snippet_selector =
+        Selector::parse(".result__snippet").expect("valid duckduckgo snippet selector");
+
+    document
+        .select(&result_selector)
+        .filter_map(|result| {
+            let title_node = result.select(&title_selector).next()?;
+            let title = normalize_html_text(title_node.text());
+            let url = duckduckgo_result_url(title_node.value().attr("href").unwrap_or_default());
+            let snippet = result
+                .select(&snippet_selector)
+                .next()
+                .map(|node| normalize_html_text(node.text()))
+                .unwrap_or_default();
+            if title.is_empty() && url.is_empty() && snippet.is_empty() {
+                None
+            } else {
+                Some(duckduckgo_result_to_search_result(title, url, snippet))
+            }
+        })
+        .collect()
+}
+
+fn normalize_html_text<'a, I>(parts: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    parts
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn duckduckgo_result_url(href: &str) -> String {
+    let href = href.trim();
+    if href.is_empty() {
+        return String::new();
+    }
+    if let Some(redirect) = query_param(href, "uddg") {
+        return percent_decode_url_component(&redirect);
+    }
+    if href.starts_with("//") {
+        format!("https:{href}")
+    } else if href.starts_with('/') {
+        format!("https://duckduckgo.com{href}")
+    } else {
+        href.to_string()
+    }
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let normalized = url.replace("&amp;", "&");
+    let query = normalized.split_once('?')?.1;
+    query.split('&').find_map(|item| {
+        let (name, value) = item.split_once('=')?;
+        (name == key).then(|| value.to_string())
+    })
+}
+
+fn percent_decode_url_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+                {
+                    output.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn duckduckgo_result_to_search_result(title: String, url: String, snippet: String) -> Value {
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": "",
+        "source": "DuckDuckGo",
+        "content": "",
+        "score": json!(0.0),
+        "sitelinks": [],
+        "attributes": {}
+    })
+}
+
+fn duckduckgo_result_to_citation(index: usize, result: &Value) -> Value {
+    json!({
+        "id": index,
+        "reference": format!("[{index}]"),
+        "url": trimmed_json_string(&result["url"]).unwrap_or_default(),
+        "title": trimmed_json_string(&result["title"]).unwrap_or_default(),
+        "snippet": trimmed_json_string(&result["snippet"]).unwrap_or_default(),
+        "date": "",
+        "source": "DuckDuckGo",
+        "content": "",
+        "type": "web",
+        "icon": "",
+        "website": "",
+        "web_anchor": ""
+    })
+}
+
+async fn run_brave_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let endpoint = if config.base_url.trim().is_empty() {
+        "https://api.search.brave.com/res/v1/web/search".to_string()
+    } else {
+        let base_url = config.base_url.trim().trim_end_matches('/');
+        if base_url.ends_with("/res/v1/web/search") {
+            base_url.to_string()
+        } else {
+            format!("{base_url}/res/v1/web/search")
+        }
+    };
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let count = config.max_results.clamp(1, 10).to_string();
+    let response = client
+        .get(&endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("X-Subscription-Token", &config.api_key)
+        .query(&[("q", query), ("count", count.as_str())])
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("brave returned {status}: {text}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("brave returned invalid JSON: {error}"))?;
+    let rows = payload["web"]["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let search_results = rows
+        .iter()
+        .take(config.max_results)
+        .map(brave_result_to_search_result)
+        .collect::<Vec<_>>();
+    let citations = search_results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "id": index + 1,
+                "reference": format!("[{}]", index + 1),
+                "url": trimmed_json_string(&result["url"]).unwrap_or_default(),
+                "title": trimmed_json_string(&result["title"]).unwrap_or_default(),
+                "snippet": trimmed_json_string(&result["snippet"]).unwrap_or_default(),
+                "date": trimmed_json_string(&result["date"]).unwrap_or_default(),
+                "source": "Brave",
+                "content": trimmed_json_string(&result["content"]).unwrap_or_default(),
+                "type": "web",
+                "icon": "",
+                "website": "",
+                "web_anchor": ""
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(SearchProviderResult {
+        answer: format_search_results_answer(query, &search_results),
+        provider: "brave".to_string(),
+        model: "brave-search".to_string(),
+        citations,
+        search_results,
+        usage: Value::Null,
+        metadata: json!({
+            "finish_reason": "stop",
+            "requested_url": endpoint
+        }),
+    })
+}
+
+fn brave_result_to_search_result(result: &Value) -> Value {
+    let title = trimmed_json_string(&result["title"])
+        .unwrap_or_else(|| "Untitled search result".to_string());
+    let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+    let snippet = trimmed_json_string(&result["description"]).unwrap_or_default();
+    let date = trimmed_json_string(&result["age"]).unwrap_or_default();
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": date,
+        "source": "Brave",
+        "content": snippet,
+        "score": Value::Null
+    })
+}
+
+async fn run_tavily_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let endpoint = if config.base_url.trim().is_empty() {
+        "https://api.tavily.com/search".to_string()
+    } else {
+        let base_url = config.base_url.trim().trim_end_matches('/');
+        if base_url.ends_with("/search") {
+            base_url.to_string()
+        } else {
+            format!("{base_url}/search")
+        }
+    };
+    let search_depth = "basic";
+    let topic = "general";
+    let include_answer = true;
+    let include_raw_content = false;
+    let include_images = false;
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let request_payload = json!({
+        "api_key": config.api_key,
+        "query": query,
+        "search_depth": search_depth,
+        "topic": topic,
+        "max_results": config.max_results,
+        "include_answer": include_answer,
+        "include_raw_content": include_raw_content,
+        "include_images": include_images
+    });
+    let response = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_payload.to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|payload| trimmed_json_string(&payload["error"]))
+            .unwrap_or(text);
+        return Err(format!("tavily returned {status}: {detail}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("tavily returned invalid JSON: {error}"))?;
+    let rows = payload["results"].as_array().cloned().unwrap_or_default();
+    let search_results = rows
+        .iter()
+        .take(config.max_results)
+        .map(tavily_result_to_search_result)
+        .collect::<Vec<_>>();
+    let citations = search_results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "id": index + 1,
+                "reference": format!("[{}]", index + 1),
+                "url": trimmed_json_string(&result["url"]).unwrap_or_default(),
+                "title": trimmed_json_string(&result["title"]).unwrap_or_default(),
+                "snippet": trimmed_json_string(&result["snippet"]).unwrap_or_default(),
+                "date": "",
+                "source": trimmed_json_string(&result["source"]).unwrap_or_default(),
+                "content": trimmed_json_string(&result["content"]).unwrap_or_default(),
+                "type": "web",
+                "icon": "",
+                "website": "",
+                "web_anchor": ""
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut metadata = Map::new();
+    metadata.insert("finish_reason".to_string(), json!("stop"));
+    metadata.insert("search_depth".to_string(), json!(search_depth));
+    metadata.insert("topic".to_string(), json!(topic));
+    metadata.insert("requested_url".to_string(), json!(endpoint));
+    if !payload["images"].is_null() {
+        metadata.insert("images".to_string(), payload["images"].clone());
+    }
+    if !payload["response_time"].is_null() {
+        metadata.insert(
+            "response_time".to_string(),
+            payload["response_time"].clone(),
+        );
+    }
+
+    Ok(SearchProviderResult {
+        answer: trimmed_json_string(&payload["answer"]).unwrap_or_default(),
+        provider: "tavily".to_string(),
+        model: format!("tavily-{search_depth}"),
+        citations,
+        search_results,
+        usage: json!({}),
+        metadata: Value::Object(metadata),
+    })
+}
+
+fn tavily_result_to_search_result(result: &Value) -> Value {
+    let title = trimmed_json_string(&result["title"])
+        .unwrap_or_else(|| "Untitled search result".to_string());
+    let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+    let snippet = trimmed_json_string(&result["content"]).unwrap_or_default();
+    let date = trimmed_json_string(&result["published_date"]).unwrap_or_default();
+    let source = trimmed_json_string(&result["source"]).unwrap_or_default();
+    let content = trimmed_json_string(&result["raw_content"]).unwrap_or_default();
+    let score = if result["score"].is_number() {
+        result["score"].clone()
+    } else {
+        json!(0.0)
+    };
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": date,
+        "source": source,
+        "content": content,
+        "score": score
+    })
+}
+
+async fn run_perplexity_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let endpoint = if config.base_url.trim().is_empty() {
+        "https://api.perplexity.ai/chat/completions".to_string()
+    } else {
+        let base_url = config.base_url.trim().trim_end_matches('/');
+        if base_url.ends_with("/chat/completions") {
+            base_url.to_string()
+        } else {
+            format!("{base_url}/chat/completions")
+        }
+    };
+    let model = "sonar";
+    let system_prompt = "You are a helpful AI assistant. Provide detailed and accurate answers based on web search results.";
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let request_payload = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
+        ]
+    });
+    let response = client
+        .post(&endpoint)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", config.api_key),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_payload.to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|payload| {
+                trimmed_json_string(&payload["error"]["message"])
+                    .or_else(|| trimmed_json_string(&payload["message"]))
+                    .or_else(|| trimmed_json_string(&payload["error"]))
+            })
+            .unwrap_or(text);
+        return Err(format!("perplexity returned {status}: {detail}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("perplexity returned invalid JSON: {error}"))?;
+    let choices = payload["choices"].as_array().cloned().unwrap_or_default();
+    let Some(choice) = choices.first() else {
+        return Err("Perplexity API returned no choices".to_string());
+    };
+    let answer = trimmed_json_string(&choice["message"]["content"])
+        .or_else(|| {
+            (!choice["message"]["content"].is_null())
+                .then(|| choice["message"]["content"].to_string())
+        })
+        .unwrap_or_default();
+    let search_results = payload["search_results"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(perplexity_result_to_search_result)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let citations = payload["citations"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let url = trimmed_json_string(item)
+                        .or_else(|| trimmed_json_string(&item["url"]))
+                        .or_else(|| trimmed_json_string(&item["link"]))?;
+                    let matched = search_results.iter().find(|result| {
+                        trimmed_json_string(&result["url"]).as_deref() == Some(url.as_str())
+                    });
+                    let title = matched
+                        .and_then(|result| trimmed_json_string(&result["title"]))
+                        .unwrap_or_default();
+                    let snippet = matched
+                        .and_then(|result| trimmed_json_string(&result["snippet"]))
+                        .unwrap_or_default();
+                    Some(json!({
+                        "id": index + 1,
+                        "reference": format!("[{}]", index + 1),
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "date": "",
+                        "source": "",
+                        "content": "",
+                        "type": "web",
+                        "icon": "",
+                        "website": "",
+                        "web_anchor": ""
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut metadata = Map::new();
+    metadata.insert("finish_reason".to_string(), choice["finish_reason"].clone());
+    metadata.insert("requested_url".to_string(), json!(endpoint));
+
+    Ok(SearchProviderResult {
+        answer,
+        provider: "perplexity".to_string(),
+        model: trimmed_json_string(&payload["model"]).unwrap_or_else(|| model.to_string()),
+        citations,
+        search_results,
+        usage: perplexity_usage(&payload["usage"]),
+        metadata: Value::Object(metadata),
+    })
+}
+
+fn perplexity_usage(usage: &Value) -> Value {
+    if usage.is_null() {
+        return json!({});
+    }
+    let mut output = Map::new();
+    output.insert(
+        "prompt_tokens".to_string(),
+        json!(parse_i64_field(&usage["prompt_tokens"]).unwrap_or(0)),
+    );
+    output.insert(
+        "completion_tokens".to_string(),
+        json!(parse_i64_field(&usage["completion_tokens"]).unwrap_or(0)),
+    );
+    output.insert(
+        "total_tokens".to_string(),
+        json!(parse_i64_field(&usage["total_tokens"]).unwrap_or(0)),
+    );
+    if !usage["cost"].is_null() {
+        let mut cost = Map::new();
+        for key in ["total_cost", "input_tokens_cost", "output_tokens_cost"] {
+            cost.insert(key.to_string(), usage["cost"][key].clone());
+        }
+        output.insert("cost".to_string(), Value::Object(cost));
+    }
+    Value::Object(output)
+}
+
+fn perplexity_result_to_search_result(result: &Value) -> Value {
+    let title = trimmed_json_string(&result["title"]).unwrap_or_default();
+    let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+    let snippet = trimmed_json_string(&result["snippet"]).unwrap_or_default();
+    let date = trimmed_json_string(&result["date"]).unwrap_or_default();
+    let source = trimmed_json_string(&result["source"]).unwrap_or_default();
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": date,
+        "source": source,
+        "content": "",
+        "score": json!(0.0)
+    })
+}
+
+async fn run_serper_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let mode = "search";
+    let endpoint = if config.base_url.trim().is_empty() {
+        format!("https://google.serper.dev/{mode}")
+    } else {
+        let base_url = config.base_url.trim().trim_end_matches('/');
+        if base_url.ends_with("/search") || base_url.ends_with("/scholar") {
+            base_url.to_string()
+        } else {
+            format!("{base_url}/{mode}")
+        }
+    };
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let request_payload = json!({
+        "q": query,
+        "num": config.max_results,
+        "gl": "us",
+        "hl": "en",
+        "page": 1,
+        "autocorrect": true
+    });
+    let response = client
+        .post(&endpoint)
+        .header("X-API-KEY", &config.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_payload.to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|payload| {
+                trimmed_json_string(&payload["message"])
+                    .or_else(|| trimmed_json_string(&payload["error"]))
+            })
+            .unwrap_or(text);
+        return Err(format!("serper returned {status}: {detail}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("serper returned invalid JSON: {error}"))?;
+    let rows = payload["organic"].as_array().cloned().unwrap_or_default();
+    let search_results = rows
+        .iter()
+        .take(config.max_results)
+        .map(|result| serper_result_to_search_result(result, mode))
+        .collect::<Vec<_>>();
+    let citations = search_results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "id": index + 1,
+                "reference": format!("[{}]", index + 1),
+                "url": trimmed_json_string(&result["url"]).unwrap_or_default(),
+                "title": trimmed_json_string(&result["title"]).unwrap_or_default(),
+                "snippet": trimmed_json_string(&result["snippet"]).unwrap_or_default(),
+                "date": trimmed_json_string(&result["date"]).unwrap_or_default(),
+                "source": trimmed_json_string(&result["source"]).unwrap_or_default(),
+                "content": "",
+                "type": "web",
+                "icon": "",
+                "website": "",
+                "web_anchor": ""
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut metadata = Map::new();
+    metadata.insert("finish_reason".to_string(), json!("stop"));
+    metadata.insert("mode".to_string(), json!(mode));
+    metadata.insert(
+        "searchParameters".to_string(),
+        payload["searchParameters"].clone(),
+    );
+    metadata.insert("requested_url".to_string(), json!(endpoint));
+    if !payload["knowledgeGraph"].is_null() {
+        metadata.insert(
+            "knowledgeGraph".to_string(),
+            payload["knowledgeGraph"].clone(),
+        );
+    }
+    if !payload["answerBox"].is_null() {
+        metadata.insert("answerBox".to_string(), payload["answerBox"].clone());
+    }
+    if !payload["peopleAlsoAsk"].is_null() {
+        metadata.insert(
+            "peopleAlsoAsk".to_string(),
+            payload["peopleAlsoAsk"].clone(),
+        );
+    }
+    if !payload["relatedSearches"].is_null() {
+        metadata.insert(
+            "relatedSearches".to_string(),
+            payload["relatedSearches"].clone(),
+        );
+    }
+    let metadata = Value::Object(metadata);
+    let answer = format_serper_answer(query, &search_results, &metadata);
+
+    Ok(SearchProviderResult {
+        answer,
+        provider: "serper".to_string(),
+        model: format!("serper-{mode}"),
+        citations,
+        search_results,
+        usage: json!({}),
+        metadata,
+    })
+}
+
+fn format_serper_answer(query: &str, search_results: &[Value], metadata: &Value) -> String {
+    let mut sections = Vec::new();
+    if !metadata["knowledgeGraph"].is_null() {
+        let title = trimmed_json_string(&metadata["knowledgeGraph"]["title"])
+            .unwrap_or_else(|| "Knowledge Graph".to_string());
+        let description =
+            trimmed_json_string(&metadata["knowledgeGraph"]["description"]).unwrap_or_default();
+        if !description.is_empty() {
+            sections.push(format!("## {title}\n\n{description}"));
+        }
+    }
+    let direct_answer = trimmed_json_string(&metadata["answerBox"]["answer"])
+        .or_else(|| trimmed_json_string(&metadata["answerBox"]["snippet"]))
+        .unwrap_or_default();
+    if !direct_answer.is_empty() {
+        sections.push(format!("### Direct Answer\n{direct_answer}"));
+    }
+    if !search_results.is_empty() {
+        let results = search_results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let title = trimmed_json_string(&result["title"])
+                    .unwrap_or_else(|| format!("Search result {}", index + 1));
+                let snippet = trimmed_json_string(&result["snippet"]).unwrap_or_default();
+                let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+                let date = trimmed_json_string(&result["date"]).unwrap_or_default();
+                let mut lines = vec![format!("**[{}] {title}**", index + 1)];
+                if !snippet.is_empty() {
+                    lines.push(snippet);
+                }
+                if !date.is_empty() {
+                    lines.push(format!("Date: {date}"));
+                }
+                if !url.is_empty() {
+                    lines.push(format!("Link: {url}"));
+                }
+                lines.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        sections.push(format!("### Search Results for \"{query}\"\n\n{results}"));
+    }
+    if let Some(items) = metadata["peopleAlsoAsk"].as_array()
+        && !items.is_empty()
+    {
+        let people = items
+            .iter()
+            .take(3)
+            .filter_map(|item| {
+                let question = trimmed_json_string(&item["question"])?;
+                let snippet = trimmed_json_string(&item["snippet"]).unwrap_or_default();
+                Some(if snippet.is_empty() {
+                    format!("Q: {question}")
+                } else {
+                    format!("Q: {question}\n{snippet}")
+                })
+            })
+            .collect::<Vec<_>>();
+        if !people.is_empty() {
+            sections.push(format!("### People Also Ask\n{}", people.join("\n\n")));
+        }
+    }
+    if let Some(items) = metadata["relatedSearches"].as_array()
+        && !items.is_empty()
+    {
+        let related = items
+            .iter()
+            .take(5)
+            .filter_map(|item| trimmed_json_string(&item["query"]))
+            .collect::<Vec<_>>();
+        if !related.is_empty() {
+            sections.push(format!("Related searches: {}", related.join(", ")));
+        }
+    }
+    if sections.is_empty() {
+        format_search_results_answer(query, search_results)
+    } else {
+        sections.join("\n\n---\n\n")
+    }
+}
+
+fn serper_result_to_search_result(result: &Value, mode: &str) -> Value {
+    let title = trimmed_json_string(&result["title"])
+        .unwrap_or_else(|| "Untitled search result".to_string());
+    let url = trimmed_json_string(&result["link"])
+        .or_else(|| trimmed_json_string(&result["url"]))
+        .unwrap_or_default();
+    let snippet = trimmed_json_string(&result["snippet"])
+        .or_else(|| trimmed_json_string(&result["description"]))
+        .unwrap_or_default();
+    let date = trimmed_json_string(&result["date"]).unwrap_or_default();
+    let source = trimmed_json_string(&result["source"]).unwrap_or_default();
+    let sitelinks = result["sitelinks"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "title": trimmed_json_string(&item["title"]).unwrap_or_default(),
+                        "link": trimmed_json_string(&item["link"]).unwrap_or_default()
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut attributes = result["attributes"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if mode == "scholar" {
+        for (source_key, target_key) in [
+            ("publicationInfo", "publicationInfo"),
+            ("citedBy", "citedBy"),
+            ("pdfUrl", "pdfUrl"),
+            ("year", "year"),
+            ("id", "paperId"),
+        ] {
+            if !result[source_key].is_null() {
+                attributes.insert(target_key.to_string(), result[source_key].clone());
+            }
+        }
+    }
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": date,
+        "source": source,
+        "content": "",
+        "score": json!(0.0),
+        "sitelinks": sitelinks,
+        "attributes": Value::Object(attributes)
+    })
+}
+
+async fn run_jina_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let base_url = if config.base_url.trim().is_empty() {
+        "https://s.jina.ai".to_string()
+    } else {
+        config.base_url.trim().trim_end_matches('/').to_string()
+    };
+    let timeout_secs = 60_u64;
+    let endpoint = format!("{base_url}/{}", jina_encode_query(query));
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let response = client
+        .get(&endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", config.api_key),
+        )
+        .header("X-Engine", "direct")
+        .header("X-Timeout", timeout_secs.to_string())
+        .header("X-With-Images-Summary", "true")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("jina returned {status}: {text}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("jina returned invalid JSON: {error}"))?;
+    let rows = payload["data"].as_array().cloned().unwrap_or_default();
+    let search_results = rows
+        .iter()
+        .take(config.max_results)
+        .map(jina_result_to_search_result)
+        .collect::<Vec<_>>();
+    let citations = search_results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "id": index + 1,
+                "reference": format!("[{}]", index + 1),
+                "url": trimmed_json_string(&result["url"]).unwrap_or_default(),
+                "title": trimmed_json_string(&result["title"]).unwrap_or_default(),
+                "snippet": trimmed_json_string(&result["snippet"]).unwrap_or_default(),
+                "date": trimmed_json_string(&result["date"]).unwrap_or_default(),
+                "source": "Jina",
+                "content": trimmed_json_string(&result["content"]).unwrap_or_default(),
+                "type": "web",
+                "icon": "",
+                "website": "",
+                "web_anchor": ""
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_tokens = parse_i64_field(&payload["meta"]["usage"]["tokens"]).unwrap_or_else(|| {
+        rows.iter()
+            .filter_map(|row| parse_i64_field(&row["usage"]["tokens"]))
+            .sum::<i64>()
+    });
+    let usage = if total_tokens > 0 {
+        json!({ "total_tokens": total_tokens })
+    } else {
+        json!({})
+    };
+    let attributes = search_results
+        .iter()
+        .map(|result| result["attributes"].clone())
+        .collect::<Vec<_>>();
+
+    Ok(SearchProviderResult {
+        answer: String::new(),
+        provider: "jina".to_string(),
+        model: "jina-reader".to_string(),
+        citations,
+        search_results,
+        usage,
+        metadata: json!({
+            "finish_reason": "stop",
+            "code": payload["code"].clone(),
+            "status": payload["status"].clone(),
+            "requested_url": endpoint,
+            "attributes": attributes
+        }),
+    })
+}
+
+fn jina_encode_query(query: &str) -> String {
+    let mut encoded = String::new();
+    for byte in query.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~' | '/') {
+            encoded.push(ch);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn jina_result_to_search_result(result: &Value) -> Value {
+    let title = trimmed_json_string(&result["title"])
+        .unwrap_or_else(|| "Untitled search result".to_string());
+    let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+    let snippet = trimmed_json_string(&result["description"]).unwrap_or_default();
+    let date = trimmed_json_string(&result["date"]).unwrap_or_default();
+    let content = trimmed_json_string(&result["content"]).unwrap_or_default();
+    let mut attributes = Map::new();
+    if !result["images"].is_null() {
+        attributes.insert("images".to_string(), result["images"].clone());
+    }
+    if !result["publishedTime"].is_null() {
+        attributes.insert("publishedTime".to_string(), result["publishedTime"].clone());
+    }
+    if !result["metadata"].is_null() {
+        attributes.insert("metadata".to_string(), result["metadata"].clone());
+    }
+    if !result["external"].is_null() {
+        attributes.insert("external".to_string(), result["external"].clone());
+    }
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": date,
+        "source": "Jina",
+        "content": content,
+        "score": json!(0.0),
+        "attributes": Value::Object(attributes)
+    })
+}
+
+async fn run_searxng_search(
+    config: &SearchRuntimeConfig,
+    query: &str,
+) -> Result<SearchProviderResult, String> {
+    let base_url = config.base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("searxng requires base_url".to_string());
+    }
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(proxy) = &config.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let response = client
+        .get(format!("{base_url}/search"))
+        .query(&[("q", query), ("format", "json")])
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("searxng returned {status}: {text}"));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("searxng returned invalid JSON: {error}"))?;
+    let search_results = payload["results"]
+        .as_array()
+        .map(|results| {
+            results
+                .iter()
+                .take(config.max_results)
+                .map(searxng_result_to_search_result)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let answer = trimmed_json_string(&payload["answer"])
+        .unwrap_or_else(|| format_search_results_answer(query, &search_results));
+    Ok(SearchProviderResult {
+        answer,
+        provider: "searxng".to_string(),
+        model: "searxng".to_string(),
+        citations: Vec::new(),
+        search_results,
+        usage: Value::Null,
+        metadata: json!({
+            "base_url": base_url,
+            "requested_url": format!("{base_url}/search")
+        }),
+    })
+}
+
+fn searxng_result_to_search_result(result: &Value) -> Value {
+    let title = trimmed_json_string(&result["title"])
+        .unwrap_or_else(|| "Untitled search result".to_string());
+    let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+    let snippet = trimmed_json_string(&result["content"]).unwrap_or_default();
+    let source = trimmed_json_string(&result["engine"]).unwrap_or_else(|| "searxng".to_string());
+    json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "date": Value::Null,
+        "source": source,
+        "content": snippet,
+        "score": Value::Null
+    })
+}
+
+fn deterministic_search_result(
+    provider: &str,
+    query: &str,
+    max_results: usize,
+) -> SearchProviderResult {
+    let title = "Socartes Rust compatibility search";
+    let snippet = format!("Socartes search health check resolved by {provider} for `{query}`.");
+    let search_results = vec![json!({
+        "title": title,
+        "url": "",
+        "snippet": snippet,
+        "date": Value::Null,
+        "source": provider,
+        "content": snippet,
+        "score": Value::Null
+    })]
+    .into_iter()
+    .take(max_results.max(1))
+    .collect::<Vec<_>>();
+    SearchProviderResult {
+        answer: format_search_results_answer(query, &search_results),
+        provider: provider.to_string(),
+        model: provider.to_string(),
+        citations: Vec::new(),
+        search_results,
+        usage: Value::Null,
+        metadata: json!({ "compatibility": true }),
+    }
+}
+
+fn format_search_results_answer(query: &str, search_results: &[Value]) -> String {
+    if search_results.is_empty() {
+        return format!("No web search results found for: {query}");
+    }
+    search_results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let title = trimmed_json_string(&result["title"])
+                .unwrap_or_else(|| format!("Search result {}", index + 1));
+            let snippet = trimmed_json_string(&result["snippet"]).unwrap_or_default();
+            let url = trimmed_json_string(&result["url"]).unwrap_or_default();
+            if url.is_empty() {
+                format!("**[{}] {title}**\n{snippet}", index + 1)
+            } else {
+                format!("**[{}] {title}**\n{snippet}\n{url}", index + 1)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn web_search_sources(result: &SearchProviderResult) -> Value {
+    let source_items = if result.citations.is_empty() {
+        &result.search_results
+    } else {
+        &result.citations
+    };
+    Value::Array(
+        source_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let extra = if result.citations.is_empty() {
+                    item
+                } else {
+                    result.search_results.get(index).unwrap_or(item)
+                };
+                let sitelinks = if item["sitelinks"].is_null() {
+                    extra["sitelinks"].clone()
+                } else {
+                    item["sitelinks"].clone()
+                };
+                let attributes = if item["attributes"].is_null() {
+                    extra["attributes"].clone()
+                } else {
+                    item["attributes"].clone()
+                };
+                json!({
+                    "type": "web",
+                    "title": trimmed_json_string(&item["title"])
+                        .or_else(|| trimmed_json_string(&item["reference"]))
+                        .unwrap_or_default(),
+                    "url": trimmed_json_string(&item["url"]).unwrap_or_default(),
+                    "snippet": trimmed_json_string(&item["snippet"])
+                        .or_else(|| trimmed_json_string(&item["content"]))
+                        .unwrap_or_default(),
+                    "date": item["date"].clone(),
+                    "source": trimmed_json_string(&item["source"]).unwrap_or_else(|| result.provider.clone()),
+                    "content": trimmed_json_string(&item["content"])
+                        .or_else(|| trimmed_json_string(&item["snippet"]))
+                        .unwrap_or_default(),
+                    "score": item["score"].clone(),
+                    "sitelinks": sitelinks,
+                    "attributes": attributes
+                })
+            })
+            .collect(),
+    )
+}
+
+fn web_search_metadata(
+    config: &SearchRuntimeConfig,
+    result: &SearchProviderResult,
+    query: &str,
+) -> Value {
+    json!({
+        "provider": result.provider,
+        "requested_provider": config.requested_provider,
+        "query": query,
+        "model": result.model,
+        "citation_count": result.citations.len(),
+        "search_result_count": result.search_results.len(),
+        "fallback_reason": config.fallback_reason,
+        "usage": result.usage,
+        "provider_metadata": result.metadata
+    })
 }
 
 fn default_knowledge_root() -> PathBuf {
@@ -6629,6 +15731,10 @@ fn tutorbot_workspace_dir(state: &AppState, bot_id: &str) -> PathBuf {
 
 fn tutorbot_sessions_dir(state: &AppState, bot_id: &str) -> PathBuf {
     tutorbot_workspace_dir(state, bot_id).join("sessions")
+}
+
+fn tutorbot_teams_dir(state: &AppState, bot_id: &str) -> PathBuf {
+    tutorbot_workspace_dir(state, bot_id).join("teams")
 }
 
 fn tutorbot_exists(state: &AppState, bot_id: &str) -> bool {
@@ -7063,25 +16169,52 @@ fn tutorbot_history_messages(state: &AppState, bot_id: &str, limit: usize) -> Ve
             continue;
         };
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let role = value["role"].as_str().unwrap_or("");
-            if role != "user" && role != "assistant" {
-                continue;
+            if let Some(value) = tutorbot_message_from_jsonl_line(line) {
+                messages.push(value);
             }
-            let Some(content) = normalize_history_content(&value["content"]) else {
-                continue;
-            };
-            value["content"] = json!(content);
-            if let Some(object) = value.as_object_mut() {
-                object.remove("reasoning_content");
-            }
-            messages.push(value);
         }
     }
     let start = messages.len().saturating_sub(limit);
     messages[start..].to_vec()
+}
+
+fn tutorbot_current_session_messages(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let file = tutorbot_session_file_stem(session_key);
+    let path = tutorbot_sessions_dir(state, bot_id).join(format!("{file}.jsonl"));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read TutorBot session for memory archival: {error}"),
+        )
+    })?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(tutorbot_message_from_jsonl_line)
+        .collect())
+}
+
+fn tutorbot_message_from_jsonl_line(line: &str) -> Option<Value> {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return None;
+    };
+    let role = value["role"].as_str().unwrap_or("");
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let content = normalize_history_content(&value["content"])?;
+    value["content"] = json!(content);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("reasoning_content");
+    }
+    Some(value)
 }
 
 fn normalize_history_content(value: &Value) -> Option<String> {
@@ -7150,7 +16283,7 @@ fn recent_tutorbot_summaries(state: &AppState, limit: usize) -> Vec<Value> {
 fn append_tutorbot_history(
     state: &AppState,
     bot_id: &str,
-    chat_id: &str,
+    session_key: &str,
     role: &str,
     content: &str,
 ) -> Result<(), ApiError> {
@@ -7161,8 +16294,9 @@ fn append_tutorbot_history(
             &format!("Failed to create TutorBot session directory: {error}"),
         )
     })?;
-    let file = safe_storage_component(chat_id).unwrap_or_else(|| "web".to_string());
+    let file = tutorbot_session_file_stem(session_key);
     let path = sessions.join(format!("{file}.jsonl"));
+    ensure_tutorbot_session_header(&path, session_key)?;
     let mut handle = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -7188,6 +16322,1409 @@ fn append_tutorbot_history(
             &format!("Failed to write TutorBot history: {error}"),
         )
     })
+}
+
+fn tutorbot_session_metadata(session_key: &str, created_at: &str, updated_at: &str) -> Value {
+    json!({
+        "_type": "metadata",
+        "key": session_key,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "metadata": {},
+        "last_consolidated": 0
+    })
+}
+
+fn tutorbot_session_metadata_line(
+    session_key: &str,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<String, ApiError> {
+    serde_json::to_string(&tutorbot_session_metadata(
+        session_key,
+        created_at,
+        updated_at,
+    ))
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize TutorBot session metadata: {error}"),
+        )
+    })
+}
+
+fn read_tutorbot_session_metadata(path: &FsPath) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let first_line = text.lines().find(|line| !line.trim().is_empty())?;
+    let metadata = serde_json::from_str::<Value>(first_line).ok()?;
+    (metadata["_type"].as_str() == Some("metadata")).then_some(metadata)
+}
+
+fn ensure_tutorbot_session_header(path: &FsPath, session_key: &str) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create TutorBot session directory: {error}"),
+            )
+        })?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.trim().is_empty() {
+        let now = now_rfc3339();
+        let header = tutorbot_session_metadata_line(session_key, &now, &now)?;
+        fs::write(path, format!("{header}\n")).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write TutorBot session metadata: {error}"),
+            )
+        })?;
+        return Ok(());
+    }
+    if read_tutorbot_session_metadata(path).is_some() {
+        return Ok(());
+    }
+    let now = now_rfc3339();
+    let header = tutorbot_session_metadata_line(session_key, &now, &now)?;
+    let mut rewritten = format!("{header}\n");
+    rewritten.push_str(existing.trim_end());
+    rewritten.push('\n');
+    fs::write(path, rewritten).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to rewrite TutorBot session metadata: {error}"),
+        )
+    })
+}
+
+fn reset_tutorbot_session(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+) -> Result<(), ApiError> {
+    let sessions = tutorbot_sessions_dir(state, bot_id);
+    fs::create_dir_all(&sessions).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot session directory: {error}"),
+        )
+    })?;
+    let file = tutorbot_session_file_stem(session_key);
+    let path = sessions.join(format!("{file}.jsonl"));
+    let now = now_rfc3339();
+    let created_at = read_tutorbot_session_metadata(&path)
+        .and_then(|metadata| metadata["created_at"].as_str().map(ToString::to_string))
+        .unwrap_or_else(|| now.clone());
+    let header = tutorbot_session_metadata_line(session_key, &created_at, &now)?;
+    fs::write(path, format!("{header}\n")).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to reset TutorBot session: {error}"),
+        )
+    })
+}
+
+fn archive_tutorbot_session_for_new(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+) -> Result<(), ApiError> {
+    let messages = tutorbot_current_session_messages(state, bot_id, session_key)?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let entry = format!(
+        "[{}] [RAW] {} messages\n{}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+        messages.len(),
+        format_tutorbot_archive_messages(&messages)
+    );
+    fs::create_dir_all(&*state.memory_root).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create memory store: {error}"),
+        )
+    })?;
+    let mut handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(memory_file_path(state, MemoryFileKind::Summary))
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to open TutorBot memory archive: {error}"),
+            )
+        })?;
+    writeln!(handle, "{}\n", entry.trim_end()).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write TutorBot memory archive: {error}"),
+        )
+    })
+}
+
+fn format_tutorbot_archive_messages(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let content = message["content"].as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let timestamp = message["timestamp"].as_str().unwrap_or("?");
+            let timestamp = timestamp
+                .get(..timestamp.len().min(16))
+                .unwrap_or(timestamp);
+            let role = message["role"].as_str().unwrap_or("message").to_uppercase();
+            Some(format!("[{timestamp}] {role}: {content}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn update_tutorbot_team_metadata(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    active: Option<bool>,
+) -> Result<(), ApiError> {
+    let sessions = tutorbot_sessions_dir(state, bot_id);
+    fs::create_dir_all(&sessions).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create TutorBot session directory: {error}"),
+        )
+    })?;
+    let file = tutorbot_session_file_stem(session_key);
+    let path = sessions.join(format!("{file}.jsonl"));
+    ensure_tutorbot_session_header(&path, session_key)?;
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = existing.lines();
+    let mut metadata = lines
+        .next()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["_type"].as_str() == Some("metadata"))
+        .unwrap_or_else(|| {
+            let now = now_rfc3339();
+            tutorbot_session_metadata(session_key, &now, &now)
+        });
+    metadata["updated_at"] = json!(now_rfc3339());
+    if !metadata["metadata"].is_object() {
+        metadata["metadata"] = json!({});
+    }
+    if let Some(active) = active {
+        metadata["metadata"]["nano_team_active"] = json!(active);
+    } else if let Some(object) = metadata["metadata"].as_object_mut() {
+        object.remove("nano_team_active");
+    }
+
+    let mut rewritten = serde_json::to_string(&metadata).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize TutorBot session metadata: {error}"),
+        )
+    })? + "\n";
+    for line in lines {
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+    fs::write(path, rewritten).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to update TutorBot session metadata: {error}"),
+        )
+    })
+}
+
+fn tutorbot_canonical_session_key(bot_id: &str) -> String {
+    format!("bot:{bot_id}")
+}
+
+fn tutorbot_session_file_stem(session_key: &str) -> String {
+    let file = session_key
+        .replace(':', "_")
+        .replace(['/', '\\'], "_")
+        .trim()
+        .to_string();
+    safe_storage_component(&file).unwrap_or_else(|| "web".to_string())
+}
+
+fn tutorbot_help_text() -> String {
+    [
+        "\u{1F408} TutorBot commands:",
+        "/new \u{2014} Start a new conversation",
+        "/stop \u{2014} Stop the current task",
+        "/restart \u{2014} Restart the bot",
+        "/team <goal> \u{2014} Start or instruct nano team mode",
+        "/team status \u{2014} Show nano team state",
+        "/team log [n] \u{2014} Show detailed collaboration logs (default 20)",
+        "/team approve <task_id> \u{2014} Approve a pending task",
+        "/team reject <task_id> <reason> \u{2014} Reject a pending task",
+        "/team manual <task_id> <instruction> \u{2014} Send change request",
+        "/team stop \u{2014} Stop nano team mode",
+        "/btw <instruction> \u{2014} Async side task via single subagent",
+        "/help \u{2014} Show available commands",
+    ]
+    .join("\n")
+}
+
+fn tutorbot_team_usage_text() -> String {
+    [
+        "Usage:",
+        "/team <goal>",
+        "/team status",
+        "/team log [n]",
+        "/team approve <task_id>",
+        "/team reject <task_id> <reason>",
+        "/team manual <task_id> <instruction>",
+        "/team stop",
+    ]
+    .join("\n")
+}
+
+fn tutorbot_short_task_id() -> String {
+    let mut task_id = uuid::Uuid::new_v4().simple().to_string();
+    task_id.truncate(8);
+    task_id
+}
+
+fn tutorbot_btw_accepted_text(task_id: &str) -> String {
+    format!("BTW accepted (id: {task_id}). I'll send the result when it finishes.")
+}
+
+fn tutorbot_btw_task_body(selection: &ChatRuntimeSelection, instruction: &str) -> Value {
+    json!({
+        "model": selection.model.as_str(),
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a focused Socartes subagent spawned to complete one background task. Complete the assigned task directly, use tools only when available, and return a concise final result for the main TutorBot to relay to the learner."
+            },
+            {
+                "role": "user",
+                "content": instruction
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 1400,
+        "stream": false
+    })
+}
+
+async fn run_tutorbot_btw_background_task(
+    state: AppState,
+    bot_id: String,
+    task_id: String,
+    instruction: String,
+    config: Value,
+    cancel_requested: Arc<AtomicBool>,
+) {
+    let selection = active_chat_selection(&load_settings_catalog(&state), &config["llm_selection"]);
+    let (status, result) = match selection {
+        Ok(Some(selection)) => {
+            let body = tutorbot_btw_task_body(&selection, &instruction);
+            match call_chat_completion_provider(&selection, body).await {
+                Ok(response) => {
+                    let content = response
+                        .content
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Task completed but no final response was generated.")
+                        .to_string();
+                    ("ok", content)
+                }
+                Err(error) => ("error", format!("Error: {error}")),
+            }
+        }
+        Ok(None) => ("ok", format!("Background task completed: {instruction}")),
+        Err(error) => ("error", format!("Error: {error}")),
+    };
+
+    if !cancel_requested.load(Ordering::SeqCst) {
+        state
+            .tutorbot_runtime
+            .publish(
+                &bot_id,
+                json!({
+                    "type": "proactive",
+                    "content": result,
+                    "metadata": {
+                        "task_id": task_id,
+                        "label": "btw",
+                        "status": status
+                    }
+                }),
+            )
+            .await;
+    }
+    state
+        .tutorbot_runtime
+        .finish_btw_task(&bot_id, &task_id)
+        .await;
+}
+
+async fn spawn_tutorbot_btw_task(
+    state: &AppState,
+    bot_id: &str,
+    task_id: &str,
+    instruction: &str,
+    config: &Value,
+) {
+    let cancel_requested = state
+        .tutorbot_runtime
+        .register_btw_task(bot_id, task_id)
+        .await;
+    let state = state.clone();
+    let bot_id = bot_id.to_string();
+    let task_id = task_id.to_string();
+    let instruction = instruction.to_string();
+    let config = config.clone();
+    tokio::spawn(async move {
+        run_tutorbot_btw_background_task(
+            state,
+            bot_id,
+            task_id,
+            instruction,
+            config,
+            cancel_requested,
+        )
+        .await;
+    });
+}
+
+#[derive(Debug, Clone)]
+struct TutorbotCommandResponse {
+    content: String,
+    metadata: Value,
+    prelude: Vec<TutorbotCommandEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct TutorbotCommandEvent {
+    content: String,
+    metadata: Value,
+}
+
+fn tutorbot_command_text(content: impl Into<String>) -> TutorbotCommandResponse {
+    TutorbotCommandResponse {
+        content: content.into(),
+        metadata: json!({}),
+        prelude: Vec::new(),
+    }
+}
+
+fn tutorbot_team_command_text(content: impl Into<String>) -> TutorbotCommandResponse {
+    TutorbotCommandResponse {
+        content: content.into(),
+        metadata: json!({ "team_text": true }),
+        prelude: Vec::new(),
+    }
+}
+
+fn tutorbot_team_command_with_prelude(
+    prelude: Vec<TutorbotCommandEvent>,
+    content: impl Into<String>,
+) -> TutorbotCommandResponse {
+    TutorbotCommandResponse {
+        content: content.into(),
+        metadata: json!({ "team_text": true }),
+        prelude,
+    }
+}
+
+fn tutorbot_team_session_dir(state: &AppState, bot_id: &str, session_key: &str) -> PathBuf {
+    tutorbot_teams_dir(state, bot_id).join(tutorbot_session_file_stem(session_key))
+}
+
+fn tutorbot_team_runtime_error(action: &str, error: impl std::fmt::Display) -> ApiError {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!("Failed to {action} TutorBot nano team runtime: {error}"),
+    )
+}
+
+fn write_pretty_json_file(path: &FsPath, value: &Value, action: &str) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| tutorbot_team_runtime_error("create", error))?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| tutorbot_team_runtime_error(action, error))?;
+    fs::write(path, bytes).map_err(|error| tutorbot_team_runtime_error(action, error))
+}
+
+fn read_optional_json_file(path: &FsPath) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+fn append_tutorbot_team_event(
+    run_dir: &FsPath,
+    kind: &str,
+    message: &str,
+    data: Value,
+) -> Result<(), ApiError> {
+    let mut event = json!({
+        "ts": now_rfc3339(),
+        "kind": kind,
+        "message": message
+    });
+    if !data.is_null() {
+        event["data"] = data;
+    }
+    let line = serde_json::to_string(&event)
+        .map_err(|error| tutorbot_team_runtime_error("serialize event for", error))?;
+    let events_path = run_dir.join("events.jsonl");
+    let mut handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_path)
+        .map_err(|error| tutorbot_team_runtime_error("open event log for", error))?;
+    writeln!(handle, "{line}")
+        .map_err(|error| tutorbot_team_runtime_error("append event to", error))
+}
+
+fn latest_tutorbot_team_run(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    only_active: bool,
+) -> Option<(PathBuf, Value)> {
+    let root = tutorbot_team_session_dir(state, bot_id, session_key);
+    let mut runs = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    runs.sort();
+    runs.reverse();
+    for run_dir in runs {
+        let config = read_optional_json_file(&run_dir.join("config.json"))?;
+        let status = config["status"].as_str().unwrap_or("");
+        if !only_active || matches!(status, "active" | "running") {
+            return Some((run_dir, config));
+        }
+    }
+    None
+}
+
+fn tutorbot_team_tasks(run_dir: &FsPath) -> Vec<Value> {
+    read_optional_json_file(&run_dir.join("tasks.json"))
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn write_tutorbot_team_tasks(run_dir: &FsPath, tasks: &[Value]) -> Result<(), ApiError> {
+    write_pretty_json_file(
+        &run_dir.join("tasks.json"),
+        &Value::Array(tasks.to_vec()),
+        "write tasks for",
+    )
+}
+
+fn append_tutorbot_team_mail(
+    run_dir: &FsPath,
+    from_agent: &str,
+    to_agent: &str,
+    content: &str,
+) -> Result<(), ApiError> {
+    let mut id = uuid::Uuid::new_v4().simple().to_string();
+    id.truncate(8);
+    let mail = json!({
+        "id": id,
+        "from_agent": from_agent,
+        "to_agent": to_agent,
+        "content": content,
+        "timestamp": now_rfc3339(),
+        "read_by": []
+    });
+    let line = serde_json::to_string(&mail)
+        .map_err(|error| tutorbot_team_runtime_error("serialize mailbox entry for", error))?;
+    let mut handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("mailbox.jsonl"))
+        .map_err(|error| tutorbot_team_runtime_error("open mailbox for", error))?;
+    writeln!(handle, "{line}")
+        .map_err(|error| tutorbot_team_runtime_error("append mailbox entry to", error))
+}
+
+#[derive(Debug, Clone)]
+struct TutorbotTeamPlan {
+    mission: String,
+    members: Vec<Value>,
+    tasks: Vec<Value>,
+    notes: String,
+    planning: Value,
+}
+
+fn deterministic_tutorbot_team_plan(mission: &str) -> TutorbotTeamPlan {
+    TutorbotTeamPlan {
+        mission: mission.to_string(),
+        members: vec![
+            json!({"name": "researcher", "role": "research and analysis", "model": null, "status": "idle"}),
+            json!({"name": "builder", "role": "execution and synthesis", "model": null, "status": "idle"}),
+        ],
+        tasks: vec![
+            json!({
+                "id": "t1",
+                "title": "Analyze the request",
+                "description": format!("Break down the objective: {mission}"),
+                "owner": "researcher",
+                "status": "pending",
+                "depends_on": [],
+                "plan": null,
+                "result": null,
+                "requires_approval": false
+            }),
+            json!({
+                "id": "t2",
+                "title": "Execute and report",
+                "description": "Implement the solution and summarize concrete outcomes.",
+                "owner": "builder",
+                "status": "pending",
+                "depends_on": ["t1"],
+                "plan": null,
+                "result": null,
+                "requires_approval": false
+            }),
+        ],
+        notes: "# Team Notes\n- Keep changes minimal and reliable.\n".to_string(),
+        planning: json!({ "source": "deterministic" }),
+    }
+}
+
+fn parse_tutorbot_team_plan_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unfenced = if trimmed.starts_with("```") {
+        let after_first_line = trimmed
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(trimmed);
+        after_first_line
+            .rsplit_once("```")
+            .map(|(body, _)| body.trim())
+            .unwrap_or(after_first_line.trim())
+    } else {
+        trimmed
+    };
+    serde_json::from_str::<Value>(unfenced)
+        .ok()
+        .filter(Value::is_object)
+        .or_else(|| {
+            let start = unfenced.find('{')?;
+            let end = unfenced.rfind('}')?;
+            (end > start)
+                .then(|| &unfenced[start..=end])
+                .and_then(|candidate| serde_json::from_str::<Value>(candidate).ok())
+                .filter(Value::is_object)
+        })
+}
+
+fn tutorbot_team_plan_has_dependency_cycle(tasks: &[Value]) -> bool {
+    let graph = tasks
+        .iter()
+        .filter_map(|task| {
+            let id = task["id"].as_str()?.to_string();
+            let deps = task["depends_on"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|dep| dep.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            Some((id, deps))
+        })
+        .collect::<HashMap<_, _>>();
+
+    fn visit(
+        node: &str,
+        graph: &HashMap<String, Vec<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if visited.contains(node) {
+            return false;
+        }
+        if !visiting.insert(node.to_string()) {
+            return true;
+        }
+        if let Some(deps) = graph.get(node) {
+            for dep in deps {
+                if graph.contains_key(dep) && visit(dep, graph, visiting, visited) {
+                    return true;
+                }
+            }
+        }
+        visiting.remove(node);
+        visited.insert(node.to_string());
+        false
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    graph
+        .keys()
+        .any(|node| visit(node, &graph, &mut visiting, &mut visited))
+}
+
+fn normalize_tutorbot_team_plan_payload(
+    payload: &Value,
+    selection: &ChatRuntimeSelection,
+) -> Result<TutorbotTeamPlan, String> {
+    let raw_members = payload["members"]
+        .as_array()
+        .ok_or_else(|| "members must be a list".to_string())?;
+    let raw_tasks = payload["tasks"]
+        .as_array()
+        .ok_or_else(|| "tasks must be a non-empty list".to_string())?;
+    if raw_members.len() < 2 {
+        return Err("at least 2 members are required".to_string());
+    }
+    if raw_tasks.is_empty() {
+        return Err("tasks must be a non-empty list".to_string());
+    }
+
+    let mut seen_members = HashSet::new();
+    let mut members = Vec::new();
+    for (index, member) in raw_members.iter().take(3).enumerate() {
+        let raw_name = member["name"].as_str().unwrap_or_default().trim();
+        let name = safe_storage_component(raw_name)
+            .filter(|name| !seen_members.contains(name))
+            .unwrap_or_else(|| format!("member{}", index + 1));
+        if !seen_members.insert(name.clone()) {
+            return Err("duplicate member names".to_string());
+        }
+        let role = member["role"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Worker");
+        members.push(json!({
+            "name": name,
+            "role": role,
+            "model": selection.model.as_str(),
+            "status": "active"
+        }));
+    }
+    if members.len() < 2 {
+        return Err("at least 2 members are required".to_string());
+    }
+    let member_names = members
+        .iter()
+        .filter_map(|member| member["name"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+
+    let mut task_ids = Vec::new();
+    let mut seen_task_ids = HashSet::new();
+    for (index, task) in raw_tasks.iter().enumerate() {
+        let raw_id = task["id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("t{}", index + 1));
+        let id = safe_storage_component(&raw_id).ok_or_else(|| "invalid task id".to_string())?;
+        if !seen_task_ids.insert(id.clone()) {
+            return Err("duplicate task ids".to_string());
+        }
+        task_ids.push(id);
+    }
+    let task_id_set = task_ids.iter().cloned().collect::<HashSet<_>>();
+
+    let mut tasks = Vec::new();
+    for (index, task) in raw_tasks.iter().enumerate() {
+        let title = task["title"]
+            .as_str()
+            .map(str::trim)
+            .ok_or_else(|| "no valid tasks found".to_string())?
+            .to_string();
+        if title.is_empty() {
+            return Err("no valid tasks found".to_string());
+        }
+        let description = task["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(title.as_str());
+        let owner = task["owner"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| member_names.contains(*value))
+            .map(|value| json!(value))
+            .unwrap_or(Value::Null);
+        let depends_on = task["depends_on"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::trim))
+            .filter(|value| task_id_set.contains(*value))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        tasks.push(json!({
+            "id": task_ids[index],
+            "title": title,
+            "description": description,
+            "owner": owner,
+            "status": "pending",
+            "depends_on": depends_on,
+            "plan": null,
+            "result": null,
+            "requires_approval": task["requires_approval"].as_bool().unwrap_or(false)
+        }));
+    }
+    if tutorbot_team_plan_has_dependency_cycle(&tasks) {
+        return Err("task dependency graph has a cycle".to_string());
+    }
+    Ok(TutorbotTeamPlan {
+        mission: payload["mission"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Complete the requested mission.")
+            .to_string(),
+        members,
+        tasks,
+        notes: payload["notes"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.ends_with('\n') {
+                    value.to_string()
+                } else {
+                    format!("{value}\n")
+                }
+            })
+            .unwrap_or_else(|| "# Team Notes\n".to_string()),
+        planning: json!({
+            "source": "provider",
+            "profile_id": selection.profile_id.as_str(),
+            "model_id": selection.model_id.as_str(),
+            "model": selection.model.as_str(),
+            "provider": selection.binding.as_str()
+        }),
+    })
+}
+
+fn tutorbot_team_plan_body(
+    selection: &ChatRuntimeSelection,
+    mission: &str,
+    repair_error: Option<&str>,
+) -> Value {
+    let mut user = format!("Goal:\n{mission}");
+    if let Some(repair_error) = repair_error.filter(|value| !value.trim().is_empty()) {
+        user.push_str(&format!(
+            "\n\nPrevious output error: {repair_error}\nFix and output valid JSON only."
+        ));
+    }
+    json!({
+        "model": selection.model.as_str(),
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are planning a tiny Socartes execution team. Return only JSON. Return strict JSON only. Schema: {\"mission\": string, \"members\": [{\"name\": string, \"role\": string, \"model\": string?}], \"tasks\": [{\"id\": string, \"title\": string, \"description\": string, \"owner\": string?, \"depends_on\": [string]?, \"requires_approval\": boolean?}], \"notes\": string}. Rules: 2-3 members only. Tasks must be actionable and coherent."
+            },
+            {
+                "role": "user",
+                "content": user
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1400,
+        "stream": false
+    })
+}
+
+async fn tutorbot_provider_team_plan(
+    state: &AppState,
+    config: &Value,
+    mission: &str,
+) -> Option<TutorbotTeamPlan> {
+    let selection =
+        active_chat_selection(&load_settings_catalog(state), &config["llm_selection"]).ok()??;
+    let mut repair_error: Option<String> = None;
+    for _ in 0..2 {
+        let body = tutorbot_team_plan_body(&selection, mission, repair_error.as_deref());
+        let response = call_chat_completion_provider(&selection, body).await.ok()?;
+        let content = response.content.as_deref().unwrap_or_default();
+        let Some(payload) = parse_tutorbot_team_plan_json(content) else {
+            repair_error = Some("Malformed JSON.".to_string());
+            continue;
+        };
+        match normalize_tutorbot_team_plan_payload(&payload, &selection) {
+            Ok(plan) => return Some(plan),
+            Err(error) => repair_error = Some(error),
+        }
+    }
+    None
+}
+
+async fn start_tutorbot_team(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    config: &Value,
+    mission: &str,
+) -> Result<TutorbotCommandResponse, ApiError> {
+    let mission = mission.trim();
+    if mission.is_empty() {
+        return Ok(tutorbot_team_command_text(tutorbot_team_usage_text()));
+    }
+
+    let plan = tutorbot_provider_team_plan(state, config, mission)
+        .await
+        .unwrap_or_else(|| deterministic_tutorbot_team_plan(mission));
+    let session_dir = tutorbot_team_session_dir(state, bot_id, session_key);
+    let run_id = format!("run-{}", current_epoch_millis());
+    let mut id_suffix = uuid::Uuid::new_v4().simple().to_string();
+    id_suffix.truncate(8);
+    let team_id = format!("nano-{id_suffix}");
+    let run_dir = session_dir.join(&run_id);
+    for member in &plan.members {
+        let Some(name) = member["name"].as_str().and_then(safe_storage_component) else {
+            continue;
+        };
+        fs::create_dir_all(run_dir.join("workers").join(name))
+            .map_err(|error| tutorbot_team_runtime_error("create", error))?;
+    }
+
+    let now = now_rfc3339();
+    let config = json!({
+        "team_id": team_id,
+        "run_id": run_id,
+        "mission": plan.mission,
+        "lead": "lead",
+        "members": plan.members,
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+        "session_key": session_key,
+        "planning": plan.planning
+    });
+    let tasks = Value::Array(plan.tasks);
+    write_pretty_json_file(&run_dir.join("config.json"), &config, "write config for")?;
+    write_pretty_json_file(&run_dir.join("tasks.json"), &tasks, "write tasks for")?;
+    fs::write(run_dir.join("NOTES.md"), plan.notes)
+        .map_err(|error| tutorbot_team_runtime_error("write notes for", error))?;
+    append_tutorbot_team_event(
+        &run_dir,
+        "team_started",
+        &format!(
+            "Started nano team for goal: {}",
+            config["mission"].as_str().unwrap_or(mission)
+        ),
+        json!({
+            "team_id": config["team_id"],
+            "mission": config["mission"],
+            "plan_source": config["planning"]["source"]
+        }),
+    )?;
+    update_tutorbot_team_metadata(state, bot_id, session_key, Some(true))?;
+
+    let team_id = config["team_id"].as_str().unwrap_or("nano-team");
+    let worker_count = config["members"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    Ok(tutorbot_team_command_with_prelude(
+        vec![TutorbotCommandEvent {
+            content: format!(
+                "Team lead: started `{team_id}` with {worker_count} workers for `{mission}`."
+            ),
+            metadata: json!({ "team_event": true }),
+        }],
+        format!(
+            "Nano team started: `{}` ({} workers).\nUse `/team status`, `/team log`, `/team stop`.",
+            team_id, worker_count
+        ),
+    ))
+}
+
+fn tutorbot_team_status_text(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+) -> Result<TutorbotCommandResponse, ApiError> {
+    let Some((run_dir, config)) = latest_tutorbot_team_run(state, bot_id, session_key, true) else {
+        update_tutorbot_team_metadata(state, bot_id, session_key, Some(false))?;
+        return Ok(tutorbot_team_command_text(
+            "No active nano team. Start with `/team <goal>`.",
+        ));
+    };
+    update_tutorbot_team_metadata(state, bot_id, session_key, Some(true))?;
+    let members = config["members"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|member| {
+                    let name = member["name"].as_str()?;
+                    let status = member["status"].as_str().unwrap_or("unknown");
+                    Some(format!("{name}={status}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "(none)".to_string());
+    let tasks = tutorbot_team_tasks(&run_dir);
+    let total = tasks.len();
+    let completed = tasks
+        .iter()
+        .filter(|task| task["status"].as_str() == Some("completed"))
+        .count();
+    let active = tasks
+        .iter()
+        .filter(|task| matches!(task["status"].as_str(), Some("planning" | "in_progress")))
+        .count();
+    let pending_approval = tasks
+        .iter()
+        .filter(|task| task["status"].as_str() == Some("awaiting_approval"))
+        .count();
+    let approvals = tasks
+        .iter()
+        .filter(|task| task["status"].as_str() == Some("awaiting_approval"))
+        .filter_map(|task| task["id"].as_str())
+        .take(5)
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format!(
+            "Team `{}` · {}",
+            config["team_id"].as_str().unwrap_or("nano-team"),
+            config["status"].as_str().unwrap_or("active")
+        ),
+        format!(
+            "Mission: {}",
+            config["mission"].as_str().unwrap_or("(none)")
+        ),
+        format!("Members: {members}"),
+        format!(
+            "Tasks: {}/{} completed · {} active · {} awaiting approval",
+            completed, total, active, pending_approval
+        ),
+    ];
+    if !approvals.is_empty() {
+        lines.push(format!("Approval queue: {}", approvals.join(", ")));
+        lines
+            .push("Approve with `/team approve <id>` or `/team reject <id> <reason>`.".to_string());
+    }
+    Ok(tutorbot_team_command_text(lines.join("\n")))
+}
+
+fn update_tutorbot_team_task_approval(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    action: &str,
+    task_id: &str,
+    detail: Option<&str>,
+) -> Result<TutorbotCommandResponse, ApiError> {
+    let Some((run_dir, config)) = latest_tutorbot_team_run(state, bot_id, session_key, true) else {
+        return Ok(tutorbot_team_command_text("Error: no active team"));
+    };
+    let mut tasks = tutorbot_team_tasks(&run_dir);
+    let Some(index) = tasks
+        .iter()
+        .position(|task| task["id"].as_str() == Some(task_id))
+    else {
+        return Ok(tutorbot_team_command_text(format!(
+            "Error: task {task_id} not found"
+        )));
+    };
+
+    let owner = tasks[index]["owner"].as_str().map(ToString::to_string);
+    let response = match action {
+        "approve" => {
+            tasks[index]["status"] = json!("in_progress");
+            append_tutorbot_team_event(
+                &run_dir,
+                "task_approved",
+                &format!("Approved task {task_id}"),
+                Value::Null,
+            )?;
+            format!("Updated task {task_id} to in_progress")
+        }
+        "reject" => {
+            let reason = detail.unwrap_or("").trim();
+            tasks[index]["status"] = json!("planning");
+            tasks[index]["result"] = json!(reason);
+            append_tutorbot_team_event(
+                &run_dir,
+                "task_rejected",
+                &format!(
+                    "Rejected task {task_id}: {}",
+                    reason.chars().take(100).collect::<String>()
+                ),
+                Value::Null,
+            )?;
+            format!("Updated task {task_id} to planning")
+        }
+        "manual" => {
+            let instruction = detail.unwrap_or("").trim();
+            tasks[index]["status"] = json!("planning");
+            tasks[index]["result"] = json!(instruction);
+            if let Some(owner) = owner.as_deref().filter(|owner| !owner.is_empty()) {
+                fs::create_dir_all(run_dir.join("workers").join(owner))
+                    .map_err(|error| tutorbot_team_runtime_error("create worker for", error))?;
+                append_tutorbot_team_mail(
+                    &run_dir,
+                    config["lead"].as_str().unwrap_or("lead"),
+                    owner,
+                    &format!("Please revise {task_id}: {instruction}"),
+                )?;
+            }
+            append_tutorbot_team_event(
+                &run_dir,
+                "task_change_requested",
+                &format!(
+                    "Requested changes on {task_id}: {}",
+                    instruction.chars().take(100).collect::<String>()
+                ),
+                Value::Null,
+            )?;
+            format!("Requested changes for {task_id}.")
+        }
+        _ => "Unsupported team action.".to_string(),
+    };
+    write_tutorbot_team_tasks(&run_dir, &tasks)?;
+    update_tutorbot_team_metadata(state, bot_id, session_key, Some(true))?;
+    Ok(tutorbot_team_command_text(response))
+}
+
+fn tutorbot_pending_approval_ids(run_dir: &FsPath) -> Vec<String> {
+    tutorbot_team_tasks(run_dir)
+        .into_iter()
+        .filter(|task| task["status"].as_str() == Some("awaiting_approval"))
+        .filter_map(|task| task["id"].as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn extract_tutorbot_approval_task_id(text: &str, pending_ids: &[String]) -> Option<String> {
+    for token in text.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let mut chars = token.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let rest = chars.as_str();
+        if !first.eq_ignore_ascii_case(&'t')
+            || rest.is_empty()
+            || !rest.chars().all(|ch| ch.is_ascii_digit())
+        {
+            continue;
+        }
+        if let Some(id) = pending_ids.iter().find(|id| id.eq_ignore_ascii_case(token)) {
+            return Some(id.clone());
+        }
+    }
+    (pending_ids.len() == 1).then(|| pending_ids[0].clone())
+}
+
+fn tutorbot_text_contains_any(text: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| text.contains(keyword))
+}
+
+fn clean_tutorbot_approval_feedback(text: &str, task_id: &str) -> String {
+    const STRIP_CHARS: &[char] = &[' ', '\t', '\r', '\n', ':', '：', ',', '，', '.', '。'];
+    const REMOVED_TOKENS: &[&str] = &[
+        "批准", "同意", "通过", "approve", "approved", "拒绝", "驳回", "reject", "decline", "补充",
+        "调整", "修改", "指示", "manual", "change",
+    ];
+
+    text.split_whitespace()
+        .filter(|token| {
+            let normalized = token.trim_matches(|ch| STRIP_CHARS.contains(&ch));
+            let lowered = normalized.to_lowercase();
+            !task_id.eq_ignore_ascii_case(normalized)
+                && !REMOVED_TOKENS.iter().any(|removed| lowered == *removed)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch| STRIP_CHARS.contains(&ch))
+        .to_string()
+}
+
+fn handle_tutorbot_approval_reply(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    raw: &str,
+) -> Result<Option<TutorbotCommandResponse>, ApiError> {
+    let Some((run_dir, _config)) = latest_tutorbot_team_run(state, bot_id, session_key, true)
+    else {
+        return Ok(None);
+    };
+    let pending_ids = tutorbot_pending_approval_ids(&run_dir);
+    if pending_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(task_id) = extract_tutorbot_approval_task_id(raw, &pending_ids) else {
+        return Ok(Some(tutorbot_team_command_text(format!(
+            "I found pending approvals but couldn't map your reply to a task. Pending: {}. Please mention the task id in natural language.",
+            pending_ids.join(", ")
+        ))));
+    };
+
+    let lowered = raw.to_lowercase();
+    let approve_hit = tutorbot_text_contains_any(
+        &lowered,
+        &[
+            "批准", "同意", "通过", "approve", "approved", "accept", "ok",
+        ],
+    );
+    let reject_hit = tutorbot_text_contains_any(&lowered, &["拒绝", "驳回", "reject", "decline"]);
+    let manual_hit = tutorbot_text_contains_any(
+        &lowered,
+        &["补充", "调整", "修改", "指示", "manual", "change", "revise"],
+    );
+
+    if approve_hit && !reject_hit {
+        return update_tutorbot_team_task_approval(
+            state,
+            bot_id,
+            session_key,
+            "approve",
+            &task_id,
+            None,
+        )
+        .map(Some);
+    }
+
+    let feedback = clean_tutorbot_approval_feedback(raw, &task_id);
+    if reject_hit && !manual_hit {
+        if feedback.is_empty() {
+            return Ok(Some(tutorbot_team_command_text(
+                "I can reject it, but I still need a reason in natural language.",
+            )));
+        }
+        return update_tutorbot_team_task_approval(
+            state,
+            bot_id,
+            session_key,
+            "reject",
+            &task_id,
+            Some(&feedback),
+        )
+        .map(Some);
+    }
+    if manual_hit || reject_hit {
+        if feedback.is_empty() {
+            return Ok(Some(tutorbot_team_command_text(
+                "I can send change instructions, but I still need your guidance text.",
+            )));
+        }
+        return update_tutorbot_team_task_approval(
+            state,
+            bot_id,
+            session_key,
+            "manual",
+            &task_id,
+            Some(&feedback),
+        )
+        .map(Some);
+    }
+
+    Ok(Some(tutorbot_team_command_text(
+        "I detected approval context but couldn't infer intent. Reply naturally with approve/reject/change + task id.",
+    )))
+}
+
+fn tutorbot_team_log_text(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    limit_text: Option<&str>,
+) -> TutorbotCommandResponse {
+    let limit = limit_text
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let Some((run_dir, _config)) = latest_tutorbot_team_run(state, bot_id, session_key, false)
+    else {
+        return tutorbot_team_command_text("No team logs.");
+    };
+    let Ok(text) = fs::read_to_string(run_dir.join("events.jsonl")) else {
+        return tutorbot_team_command_text("No team logs.");
+    };
+    let mut lines = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| {
+            let ts = event["ts"].as_str()?.to_string();
+            let kind = event["kind"].as_str()?.to_string();
+            let message = event["message"].as_str().unwrap_or("").to_string();
+            Some(format!("- [{ts}] {kind}: {message}"))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return tutorbot_team_command_text("No team logs.");
+    }
+    let start = lines.len().saturating_sub(limit);
+    lines = lines[start..].to_vec();
+    tutorbot_team_command_text(lines.join("\n"))
+}
+
+fn stop_tutorbot_team(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+) -> Result<TutorbotCommandResponse, ApiError> {
+    let Some((run_dir, mut config)) = latest_tutorbot_team_run(state, bot_id, session_key, true)
+    else {
+        update_tutorbot_team_metadata(state, bot_id, session_key, None)?;
+        return Ok(tutorbot_team_command_text("No active team."));
+    };
+    let tasks = tutorbot_team_tasks(&run_dir);
+    let all_completed = !tasks.is_empty()
+        && tasks
+            .iter()
+            .all(|task| task["status"].as_str() == Some("completed"));
+    config["status"] = json!(if all_completed { "completed" } else { "paused" });
+    config["updated_at"] = json!(now_rfc3339());
+    if let Some(members) = config["members"].as_array_mut() {
+        for member in members {
+            member["status"] = json!(if all_completed { "stopped" } else { "idle" });
+        }
+    }
+    write_pretty_json_file(
+        &run_dir.join("config.json"),
+        &config,
+        "write stopped config for",
+    )?;
+    let stopped_status = config["status"].as_str().unwrap_or("paused").to_string();
+    append_tutorbot_team_event(
+        &run_dir,
+        "team_stopped",
+        &format!("Stopped team with status {stopped_status}"),
+        json!({ "team_id": config["team_id"], "status": config["status"] }),
+    )?;
+    update_tutorbot_team_metadata(state, bot_id, session_key, None)?;
+    Ok(tutorbot_team_command_text(format!(
+        "Team `{}` stopped.",
+        config["team_id"].as_str().unwrap_or("nano-team")
+    )))
+}
+
+async fn handle_tutorbot_slash_command(
+    state: &AppState,
+    bot_id: &str,
+    session_key: &str,
+    config: &Value,
+    content: &str,
+) -> Option<Result<TutorbotCommandResponse, ApiError>> {
+    let raw = content.trim();
+    let cmd = raw.to_ascii_lowercase();
+    if cmd.starts_with("/btw") {
+        let arg = raw.get(4..).unwrap_or("").trim();
+        return Some(Ok(if arg.is_empty() {
+            tutorbot_command_text("Usage: /btw <instruction>")
+        } else {
+            let task_id = tutorbot_short_task_id();
+            spawn_tutorbot_btw_task(state, bot_id, &task_id, arg, config).await;
+            tutorbot_command_text(tutorbot_btw_accepted_text(&task_id))
+        }));
+    }
+    if cmd == "/team" {
+        return Some(Ok(tutorbot_team_command_text(tutorbot_team_usage_text())));
+    }
+    if cmd == "/team status" {
+        return Some(tutorbot_team_status_text(state, bot_id, session_key));
+    }
+    if cmd == "/team stop" {
+        return Some(stop_tutorbot_team(state, bot_id, session_key));
+    }
+    if cmd == "/team log" || cmd.starts_with("/team log ") {
+        let limit = raw
+            .get(9..)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        return Some(Ok(tutorbot_team_log_text(
+            state,
+            bot_id,
+            session_key,
+            limit,
+        )));
+    }
+    if cmd == "/team approve" || cmd.starts_with("/team approve ") {
+        let task_id = raw.get("/team approve".len()..).unwrap_or("").trim();
+        return Some(if task_id.is_empty() {
+            Ok(tutorbot_command_text("Usage: /team approve <task_id>"))
+        } else {
+            update_tutorbot_team_task_approval(state, bot_id, session_key, "approve", task_id, None)
+        });
+    }
+    if cmd == "/team reject" || cmd.starts_with("/team reject ") {
+        let rest = raw.get("/team reject".len()..).unwrap_or("").trim();
+        let mut parts = rest.splitn(2, |ch: char| ch.is_whitespace());
+        let task_id = parts.next().unwrap_or("").trim();
+        let reason = parts.next().unwrap_or("").trim();
+        return Some(if task_id.is_empty() || reason.is_empty() {
+            Ok(tutorbot_command_text(
+                "Usage: /team reject <task_id> <reason>",
+            ))
+        } else {
+            update_tutorbot_team_task_approval(
+                state,
+                bot_id,
+                session_key,
+                "reject",
+                task_id,
+                Some(reason),
+            )
+        });
+    }
+    if cmd == "/team manual" || cmd.starts_with("/team manual ") {
+        let rest = raw.get("/team manual".len()..).unwrap_or("").trim();
+        let mut parts = rest.splitn(2, |ch: char| ch.is_whitespace());
+        let task_id = parts.next().unwrap_or("").trim();
+        let instruction = parts.next().unwrap_or("").trim();
+        return Some(if task_id.is_empty() || instruction.is_empty() {
+            Ok(tutorbot_command_text(
+                "Usage: /team manual <task_id> <instruction>",
+            ))
+        } else {
+            update_tutorbot_team_task_approval(
+                state,
+                bot_id,
+                session_key,
+                "manual",
+                task_id,
+                Some(instruction),
+            )
+        });
+    }
+    if cmd.starts_with("/team ") || cmd.starts_with("/teams ") {
+        let offset = if cmd.starts_with("/teams ") { 7 } else { 6 };
+        let mission = raw.get(offset..).unwrap_or("").trim();
+        return Some(start_tutorbot_team(state, bot_id, session_key, config, mission).await);
+    }
+    match cmd.as_str() {
+        "/help" => Some(Ok(tutorbot_command_text(tutorbot_help_text()))),
+        "/new" => Some(
+            match archive_tutorbot_session_for_new(state, bot_id, session_key) {
+                Ok(()) => reset_tutorbot_session(state, bot_id, session_key)
+                    .map(|()| tutorbot_command_text("New session started.")),
+                Err(_) => Ok(tutorbot_command_text(
+                    "Memory archival failed, session not cleared. Please try again.",
+                )),
+            },
+        ),
+        "/stop" => {
+            let stopped = state.tutorbot_runtime.cancel_btw_tasks(bot_id).await;
+            Some(Ok(tutorbot_command_text(if stopped == 0 {
+                "No active task to stop.".to_string()
+            } else {
+                format!("Stopped {stopped} task(s).")
+            })))
+        }
+        "/restart" => Some(Ok(tutorbot_command_text("Restarting..."))),
+        _ => None,
+    }
 }
 
 async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: String) {
@@ -7221,7 +17758,30 @@ async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: 
         let _ = write_tutorbot_config(&state, &bot_id, &config);
     }
 
-    while let Some(Ok(message)) = socket.recv().await {
+    let mut notification_rx = state.tutorbot_runtime.subscribe(&bot_id).await;
+    loop {
+        let message = tokio::select! {
+            notification = notification_rx.recv() => {
+                match notification {
+                    Ok(event) => {
+                        if socket
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => continue,
+                }
+            }
+            message = socket.recv() => message,
+        };
+        let Some(Ok(message)) = message else {
+            break;
+        };
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
                 break;
@@ -7242,8 +17802,83 @@ async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: 
         if content.is_empty() {
             continue;
         }
-        let chat_id = payload["chat_id"].as_str().unwrap_or("web");
-        let _ = append_tutorbot_history(&state, &bot_id, chat_id, "user", content);
+        let session_key = tutorbot_canonical_session_key(&bot_id);
+        let command_result =
+            handle_tutorbot_slash_command(&state, &bot_id, &session_key, &config, content)
+                .await
+                .or_else(|| {
+                    if content.starts_with('/') {
+                        return None;
+                    }
+                    match handle_tutorbot_approval_reply(&state, &bot_id, &session_key, content) {
+                        Ok(Some(response)) => Some(Ok(response)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                });
+        if let Some(command_result) = command_result {
+            match command_result {
+                Ok(response) => {
+                    for event in response.prelude {
+                        if socket
+                            .send(Message::Text(
+                                json!({
+                                    "type": "content",
+                                    "content": event.content,
+                                    "metadata": event.metadata
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if socket
+                        .send(Message::Text(
+                            json!({
+                                "type": "content",
+                                "content": response.content,
+                                "metadata": response.metadata
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if socket
+                        .send(Message::Text(json!({"type": "done"}).to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let detail = error.1.0["detail"]
+                        .as_str()
+                        .unwrap_or("TutorBot command failed");
+                    if socket
+                        .send(Message::Text(
+                            json!({"type": "error", "content": detail})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let _ = append_tutorbot_history(&state, &bot_id, &session_key, "user", content);
         let _ = socket
             .send(Message::Text(
                 json!({"type": "thinking", "content": "TutorBot is reading the local profile and conversation history."})
@@ -7251,30 +17886,247 @@ async fn handle_tutorbot_socket(mut socket: WebSocket, state: AppState, bot_id: 
                     .into(),
             ))
             .await;
-        let response = tutorbot_chat_response(&bot_id, &config, content);
-        let _ = append_tutorbot_history(&state, &bot_id, chat_id, "assistant", &response);
-        if socket
-            .send(Message::Text(
-                json!({"type": "content", "content": response})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if socket
-            .send(Message::Text(json!({"type": "done"}).to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
+        match tutorbot_chat_response(&state, &bot_id, &config, &payload, content).await {
+            Ok(result) => {
+                let _ = append_tutorbot_history(
+                    &state,
+                    &bot_id,
+                    &session_key,
+                    "assistant",
+                    &result.content,
+                );
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "type": "content",
+                            "content": result.content,
+                            "metadata": result.metadata
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if socket
+                    .send(Message::Text(json!({"type": "done"}).to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                if socket
+                    .send(Message::Text(
+                        json!({"type": "error", "content": error})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
 }
 
-fn tutorbot_chat_response(bot_id: &str, config: &Value, content: &str) -> String {
+#[derive(Debug, Clone)]
+struct TutorBotTurnResult {
+    content: String,
+    metadata: Value,
+}
+
+async fn tutorbot_chat_response(
+    state: &AppState,
+    bot_id: &str,
+    config: &Value,
+    payload: &Value,
+    content: &str,
+) -> Result<TutorBotTurnResult, String> {
+    let selection_value = payload
+        .get("llm_selection")
+        .filter(|value| !value.is_null())
+        .unwrap_or(&config["llm_selection"]);
+    let selection = active_chat_selection(&load_settings_catalog(state), selection_value)?;
+    let Some(selection) = selection else {
+        return Ok(TutorBotTurnResult {
+            content: tutorbot_fallback_response(bot_id, config, content),
+            metadata: json!({ "provider": "deterministic", "model": "deterministic-agent-loop" }),
+        });
+    };
+
+    let enabled_tools = requested_chat_tool_names(payload);
+    let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
+    let mut metadata = json!({
+        "profile_id": selection.profile_id.as_str(),
+        "model_id": selection.model_id.as_str(),
+        "model": selection.model.as_str(),
+        "provider": selection.binding.as_str()
+    });
+    let body = tutorbot_chat_completion_body(
+        &selection,
+        state,
+        bot_id,
+        config,
+        content,
+        &enabled_tools,
+        &[],
+    );
+    let response = call_chat_completion_provider(&selection, body).await?;
+    let answer = if response.tool_calls.is_empty() {
+        merge_chat_provider_response_metadata(&mut metadata, &response);
+        response
+            .content
+            .clone()
+            .ok_or_else(|| "TutorBot LLM response did not include assistant content".to_string())?
+    } else {
+        let tool_calls = normalized_chat_tool_calls(&response.tool_calls);
+        let (tool_messages, _trace_results, raw_tool_results) = execute_chat_provider_tool_calls(
+            state,
+            &enabled_tools,
+            &knowledge_bases,
+            content,
+            &tool_calls,
+            None,
+        )
+        .await;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("tool_calls".to_string(), json!(tool_calls.len()));
+            object.insert("tool_results".to_string(), Value::Array(raw_tool_results));
+        }
+        let mut additional_messages = vec![assistant_tool_call_message(&response, &tool_calls)];
+        additional_messages.extend(tool_messages);
+        let body = tutorbot_chat_completion_body(
+            &selection,
+            state,
+            bot_id,
+            config,
+            content,
+            &[],
+            &additional_messages,
+        );
+        let final_response = call_chat_completion_provider(&selection, body).await?;
+        merge_chat_provider_response_metadata(&mut metadata, &final_response);
+        final_response.content.clone().ok_or_else(|| {
+            "TutorBot LLM response after tool execution did not include assistant content"
+                .to_string()
+        })?
+    };
+
+    Ok(TutorBotTurnResult {
+        content: answer,
+        metadata,
+    })
+}
+
+fn tutorbot_chat_completion_body(
+    selection: &ChatRuntimeSelection,
+    state: &AppState,
+    bot_id: &str,
+    config: &Value,
+    content: &str,
+    enabled_tools: &[String],
+    additional_messages: &[Value],
+) -> Value {
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": tutorbot_system_prompt(state, bot_id, config)
+    })];
+    messages.extend(tutorbot_provider_history_messages(
+        state, bot_id, content, 12,
+    ));
+    messages.push(json!({
+        "role": "user",
+        "content": content
+    }));
+    messages.extend(additional_messages.iter().cloned());
+    let mut body = json!({
+        "model": selection.model.as_str(),
+        "messages": messages,
+        "stream": false
+    });
+    let tool_definitions = openai_chat_tool_definitions(selection, enabled_tools);
+    if !tool_definitions.is_empty() {
+        body["tools"] = Value::Array(tool_definitions);
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+fn tutorbot_system_prompt(state: &AppState, bot_id: &str, config: &Value) -> String {
+    let name = config["name"].as_str().unwrap_or(bot_id);
+    let mut prompt = format!(
+        "You are {name}, a Socartes TutorBot. Answer directly, use selected course evidence when relevant, and avoid inventing facts outside the available context."
+    );
+    if let Some(description) = config["description"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("\n\nDescription:\n");
+        prompt.push_str(description);
+    }
+    if let Some(persona) = config["persona"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("\n\nSoul:\n");
+        prompt.push_str(persona);
+    }
+    for filename in ["USER.md", "TOOLS.md", "AGENTS.md"] {
+        let Some(text) = read_tutorbot_workspace_file(state, bot_id, filename)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        prompt.push_str("\n\n");
+        prompt.push_str(filename);
+        prompt.push_str(":\n");
+        prompt.push_str(&truncate_for_prompt(&text, 1800));
+    }
+    prompt
+}
+
+fn tutorbot_provider_history_messages(
+    state: &AppState,
+    bot_id: &str,
+    current_content: &str,
+    limit: usize,
+) -> Vec<Value> {
+    let mut history = tutorbot_history_messages(state, bot_id, limit)
+        .into_iter()
+        .filter_map(|message| {
+            let role = message["role"].as_str()?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content = message["content"].as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "role": role,
+                "content": truncate_for_prompt(content, 6000)
+            }))
+        })
+        .collect::<Vec<_>>();
+    if history.last().is_some_and(|message| {
+        message["role"] == "user"
+            && message["content"].as_str().unwrap_or("").trim() == current_content.trim()
+    }) {
+        history.pop();
+    }
+    history
+}
+
+fn tutorbot_fallback_response(bot_id: &str, config: &Value, content: &str) -> String {
     let name = config["name"].as_str().unwrap_or(bot_id);
     let persona = config["persona"].as_str().unwrap_or("").trim();
     let persona_clause = if persona.is_empty() {
@@ -7300,11 +18152,32 @@ fn current_epoch_millis() -> u64 {
 
 fn knowledge_base_dir(state: &AppState, name: &str) -> PathBuf {
     let component = safe_storage_component(name).unwrap_or_else(|| "invalid".to_string());
-    state.knowledge_root.join("bases").join(component)
+    let modern = state.knowledge_root.join("bases").join(&component);
+    if modern.is_dir() {
+        return modern;
+    }
+    let legacy = state.knowledge_root.join(&component);
+    if legacy.is_dir() {
+        return legacy;
+    }
+    modern
 }
 
 fn knowledge_files_dir(state: &AppState, name: &str) -> PathBuf {
-    knowledge_base_dir(state, name).join("files")
+    let base_dir = knowledge_base_dir(state, name);
+    knowledge_files_dir_at_dir(&base_dir)
+}
+
+fn knowledge_files_dir_at_dir(base_dir: &FsPath) -> PathBuf {
+    let modern = base_dir.join("files");
+    if modern.is_dir() {
+        return modern;
+    }
+    let legacy = base_dir.join("raw");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    modern
 }
 
 fn knowledge_metadata_path(state: &AppState, name: &str) -> PathBuf {
@@ -7320,7 +18193,16 @@ fn knowledge_config_path(state: &AppState) -> PathBuf {
 }
 
 fn knowledge_progress_path(state: &AppState, name: &str) -> PathBuf {
-    knowledge_base_dir(state, name).join("progress.json")
+    let base_dir = knowledge_base_dir(state, name);
+    let modern = base_dir.join("progress.json");
+    if modern.exists() {
+        return modern;
+    }
+    let legacy = base_dir.join(".progress.json");
+    if legacy.exists() {
+        return legacy;
+    }
+    modern
 }
 
 fn linked_knowledge_folders_path(state: &AppState, name: &str) -> PathBuf {
@@ -7332,6 +18214,19 @@ fn read_default_knowledge_base(state: &AppState) -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| knowledge_base_exists(state, value))
+        .or_else(|| {
+            fs::read_to_string(knowledge_config_path(state))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|store| {
+                    store["defaults"]["default_kb"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                })
+                .filter(|value| knowledge_base_exists(state, value))
+        })
         .unwrap_or_else(|| BUILTIN_KNOWLEDGE_BASE.to_string())
 }
 
@@ -7482,6 +18377,57 @@ fn write_linked_knowledge_folders(
     })
 }
 
+fn linked_folder_changes(folder: &Value, source_dir: &FsPath) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let synced_files = folder["synced_files"].as_object();
+    let mut new_files = Vec::new();
+    let mut modified_files = Vec::new();
+    for path in supported_files_in_dir(source_dir) {
+        let key = path.to_string_lossy();
+        let current_modified = file_modified_rfc3339(&path);
+        match synced_files.and_then(|files| files.get(key.as_ref()).and_then(Value::as_str)) {
+            Some(previous_modified) if current_modified.as_deref() == Some(previous_modified) => {}
+            Some(_) => modified_files.push(path),
+            None => new_files.push(path),
+        }
+    }
+    (new_files, modified_files)
+}
+
+fn update_linked_folder_sync_state(
+    state: &AppState,
+    name: &str,
+    folders: &mut [Value],
+    folder_index: usize,
+    synced_paths: &[PathBuf],
+) -> Result<(), ApiError> {
+    let Some(folder) = folders.get_mut(folder_index).and_then(Value::as_object_mut) else {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Linked folder metadata is invalid",
+        ));
+    };
+    let mut file_states = folder
+        .get("synced_files")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(Map::new);
+    for path in synced_paths {
+        if let Some(modified_at) = file_modified_rfc3339(path) {
+            file_states.insert(path.to_string_lossy().to_string(), json!(modified_at));
+        }
+    }
+    folder.insert("last_sync".to_string(), json!(now_rfc3339()));
+    folder.insert("file_count".to_string(), json!(file_states.len()));
+    folder.insert("synced_files".to_string(), Value::Object(file_states));
+    write_linked_knowledge_folders(state, name, folders)
+}
+
+fn file_modified_rfc3339(path: &FsPath) -> Option<String> {
+    let modified = path.metadata().ok()?.modified().ok()?;
+    let datetime: chrono::DateTime<Utc> = modified.into();
+    Some(datetime.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
 fn expand_user_path(path: &str) -> PathBuf {
     if path == "~" {
         return env::var_os("HOME")
@@ -7498,41 +18444,193 @@ fn expand_user_path(path: &str) -> PathBuf {
 }
 
 fn count_supported_files_in_dir(path: &FsPath) -> usize {
-    fs::read_dir(path)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_file())
-        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
-        .filter(|name| is_supported_knowledge_file(name))
-        .count()
+    supported_files_in_dir(path).len()
+}
+
+fn supported_files_in_dir(path: &FsPath) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_supported_files_in_dir(path, &mut files);
+    files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    files
+}
+
+fn collect_supported_files_in_dir(path: &FsPath, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_supported_files_in_dir(&path, files);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_supported_knowledge_file(name) {
+            files.push(path);
+        }
+    }
 }
 
 fn knowledge_base_exists(state: &AppState, name: &str) -> bool {
     name == BUILTIN_KNOWLEDGE_BASE || knowledge_base_dir(state, name).is_dir()
 }
 
+fn local_knowledge_base_names(state: &AppState) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    names.extend(directory_child_names(&state.knowledge_root.join("bases")));
+    for name in directory_child_names(&state.knowledge_root) {
+        if name == "bases" {
+            continue;
+        }
+        let candidate = state.knowledge_root.join(&name);
+        if candidate.join("raw").is_dir()
+            || candidate.join("files").is_dir()
+            || candidate.join("metadata.json").is_file()
+            || candidate.join("version-1").is_dir()
+        {
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
 fn now_label() -> String {
     format!("{:.0}", now_seconds())
+}
+
+fn knowledge_task_id(task_type: &str) -> String {
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let suffix = format!("{:08x}", unique_id() & 0xffff_ffff);
+    format!("{task_type}_{timestamp}_{suffix}")
 }
 
 fn knowledge_base_summaries(state: &AppState) -> Vec<Value> {
     let default_name = read_default_knowledge_base(state);
     let mut summaries = vec![builtin_knowledge_summary(&default_name)];
 
-    let bases_dir = state.knowledge_root.join("bases");
-    if let Ok(entries) = fs::read_dir(bases_dir) {
-        let mut local_names = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect::<Vec<_>>();
-        local_names.sort();
-        for name in local_names {
-            summaries.push(local_knowledge_summary(state, &name, &default_name));
-        }
+    for name in local_knowledge_base_names(state) {
+        summaries.push(local_knowledge_summary(state, &name, &default_name));
     }
 
+    summaries
+}
+
+fn annotate_knowledge_summary(mut summary: Value, access: &KnowledgeAccess) -> Value {
+    summary["id"] = json!(access.id());
+    summary["source"] = json!(access.source());
+    summary["assigned"] = json!(access.assigned());
+    summary["read_only"] = json!(access.read_only());
+    if access.assigned() {
+        summary
+            .as_object_mut()
+            .expect("summary object")
+            .remove("path");
+        summary["provenance_label"] = json!("Assigned by admin");
+    }
+    summary
+}
+
+fn knowledge_summary_for_access(state: &AppState, access: &KnowledgeAccess) -> Value {
+    let default_name = read_default_knowledge_base(state);
+    let summary = match access {
+        KnowledgeAccess::Builtin => builtin_knowledge_summary(&default_name),
+        KnowledgeAccess::Admin { name, .. } => local_knowledge_summary(state, name, &default_name),
+        KnowledgeAccess::User { name, user_id } => local_knowledge_summary_at_dir(
+            state,
+            name,
+            &default_name,
+            &user_knowledge_base_dir(state, user_id, name),
+        ),
+    };
+    annotate_knowledge_summary(summary, access)
+}
+
+fn scoped_knowledge_base_summaries(state: &AppState, payload: &AuthTokenPayload) -> Vec<Value> {
+    if payload.role == "admin" {
+        return knowledge_base_summaries(state)
+            .into_iter()
+            .map(|summary| {
+                let name = summary["name"].as_str().unwrap_or("").to_string();
+                let access = if name == BUILTIN_KNOWLEDGE_BASE {
+                    KnowledgeAccess::Builtin
+                } else {
+                    KnowledgeAccess::Admin {
+                        name,
+                        assigned: false,
+                    }
+                };
+                annotate_knowledge_summary(summary, &access)
+            })
+            .collect();
+    }
+
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for name in user_knowledge_base_names(state, &payload.user_id) {
+        let access = KnowledgeAccess::User {
+            name: name.clone(),
+            user_id: payload.user_id.clone(),
+        };
+        seen.insert(access.id());
+        summaries.push(knowledge_summary_for_access(state, &access));
+    }
+
+    let grant = load_settings_grant(state, &payload.user_id);
+    let admin_names = admin_knowledge_base_names(state)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut granted = grant["knowledge_bases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            knowledge_grant_name(item).map(|name| {
+                (
+                    name,
+                    item["needs_admin_reindex"].as_bool().unwrap_or(false),
+                    item["embedding_signature"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    granted.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, needs_admin_reindex, embedding_signature) in granted {
+        let access = KnowledgeAccess::Admin {
+            name: name.clone(),
+            assigned: true,
+        };
+        if !seen.insert(access.id()) {
+            continue;
+        }
+        if admin_names.contains(&name) {
+            let mut summary = knowledge_summary_for_access(state, &access);
+            summary["available"] = json!(true);
+            summary["needs_admin_reindex"] = json!(needs_admin_reindex);
+            summary["embedding_signature"] = json!(embedding_signature);
+            summaries.push(summary);
+        } else {
+            summaries.push(json!({
+                "id": access.id(),
+                "name": name,
+                "source": "admin",
+                "assigned": true,
+                "read_only": true,
+                "available": false,
+                "status": "unavailable",
+                "provenance_label": "Assigned by admin",
+                "needs_admin_reindex": needs_admin_reindex,
+                "embedding_signature": embedding_signature
+            }));
+        }
+    }
     summaries
 }
 
@@ -7574,8 +18672,17 @@ fn builtin_knowledge_summary(default_name: &str) -> Value {
 }
 
 fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> Value {
-    let files = knowledge_files(state, name).unwrap_or_default();
-    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| {
+    local_knowledge_summary_at_dir(state, name, default_name, &knowledge_base_dir(state, name))
+}
+
+fn local_knowledge_summary_at_dir(
+    state: &AppState,
+    name: &str,
+    default_name: &str,
+    kb_dir: &FsPath,
+) -> Value {
+    let files = knowledge_files_at_dir(&knowledge_files_dir_at_dir(kb_dir)).unwrap_or_default();
+    let metadata = read_knowledge_metadata_at_dir(kb_dir).unwrap_or_else(|| {
         json!({
             "created_at": now_label(),
             "last_updated": now_label(),
@@ -7583,7 +18690,7 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
             "needs_reindex": true
         })
     });
-    let index_versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
+    let index_versions = knowledge_index_versions(kb_dir, &metadata);
     let active_signature = active_knowledge_signature(state);
     let active_match = index_versions.iter().any(|version| {
         version["signature"].as_str() == Some(active_signature.as_str())
@@ -7605,7 +18712,7 @@ fn local_knowledge_summary(state: &AppState, name: &str, default_name: &str) -> 
         "name": name,
         "is_default": default_name == name,
         "status": status,
-        "path": knowledge_base_dir(state, name).to_string_lossy(),
+        "path": kb_dir.to_string_lossy(),
         "metadata": metadata,
         "statistics": {
             "raw_documents": files.len(),
@@ -8052,10 +19159,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{digest:x}")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SavedKnowledgeFile {
     filename: String,
     hash: String,
+}
+
+fn saved_files_with_extractable_knowledge_content(
+    state: &AppState,
+    name: &str,
+    saved_files: &[SavedKnowledgeFile],
+) -> Vec<SavedKnowledgeFile> {
+    let files_dir = knowledge_files_dir(state, name);
+    saved_files
+        .iter()
+        .filter_map(|file| {
+            let bytes = fs::read(files_dir.join(&file.filename)).ok()?;
+            let text = extract_knowledge_file_text(&file.filename, &bytes).ok()?;
+            (!chunk_text_by_words(&text).is_empty()).then(|| file.clone())
+        })
+        .collect()
 }
 
 fn existing_file_hashes(metadata: &Value) -> Map<String, Value> {
@@ -8175,7 +19298,11 @@ fn write_upload_metadata(
 }
 
 fn read_knowledge_metadata(state: &AppState, name: &str) -> Option<Value> {
-    let text = fs::read_to_string(knowledge_metadata_path(state, name)).ok()?;
+    read_knowledge_metadata_at_dir(&knowledge_base_dir(state, name))
+}
+
+fn read_knowledge_metadata_at_dir(kb_dir: &FsPath) -> Option<Value> {
+    let text = fs::read_to_string(kb_dir.join("metadata.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -8279,7 +19406,10 @@ fn knowledge_files(state: &AppState, name: &str) -> Result<Vec<Value>, ApiError>
         return Err(api_error(StatusCode::NOT_FOUND, "Knowledge base not found"));
     }
 
-    let dir = knowledge_files_dir(state, name);
+    knowledge_files_at_dir(&knowledge_files_dir(state, name))
+}
+
+fn knowledge_files_at_dir(dir: &FsPath) -> Result<Vec<Value>, ApiError> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.filter_map(Result::ok) {
@@ -8326,6 +19456,13 @@ fn mime_type_for(name: &str) -> &'static str {
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "htm" | "html" => "text/html",
         "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
         "yaml" | "yml" => "application/x-yaml",
         "tsv" => "text/tab-separated-values",
         _ => "text/plain",
@@ -8766,7 +19903,7 @@ async fn save_knowledge_base_from_multipart(
     state: &AppState,
     mut multipart: Multipart,
     target_name: Option<String>,
-) -> Result<(String, String), ApiError> {
+) -> Result<(String, String, Vec<String>), ApiError> {
     let is_upload = target_name.is_some();
     let mut name = target_name;
     let mut provider = DEFAULT_RAG_PROVIDER.to_string();
@@ -8825,6 +19962,12 @@ async fn save_knowledge_base_from_multipart(
             "Cannot overwrite the built-in Socartes course",
         ));
     }
+    if !is_upload && knowledge_base_exists(state, &name) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Knowledge base '{name}' already exists"),
+        ));
+    }
     if files.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -8837,10 +19980,7 @@ async fn save_knowledge_base_from_multipart(
             return Err(api_error(StatusCode::NOT_FOUND, "Knowledge base not found"));
         }
         if knowledge_needs_reindex_for_upload(state, &name) {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                &format!("Knowledge base '{name}' needs reindex before uploading new files"),
-            ));
+            return Err(knowledge_needs_reindex_error(&name));
         }
         if !knowledge_has_active_index(state, &name) {
             return Err(api_error(
@@ -8860,6 +20000,7 @@ async fn save_knowledge_base_from_multipart(
         )
     })?;
 
+    let mut response_files = Vec::new();
     if is_upload {
         let metadata = read_knowledge_metadata(state, &name).unwrap_or_else(|| json!({}));
         let mut known_hashes = existing_file_hashes(&metadata)
@@ -8894,78 +20035,317 @@ async fn save_knowledge_base_from_multipart(
             }
             write_upload_metadata(state, &name, &saved_files)?;
         }
+        response_files = saved_files
+            .iter()
+            .map(|file| file.filename.clone())
+            .collect::<Vec<_>>();
     } else {
         for (filename, bytes) in files {
-            fs::write(files_dir.join(filename), bytes).map_err(|error| {
+            fs::write(files_dir.join(&filename), bytes).map_err(|error| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("Failed to write uploaded file: {error}"),
                 )
             })?;
+            response_files.push(filename);
         }
         write_knowledge_metadata(state, &name, &provider, None)?;
     }
 
-    Ok((name, format!("task-{}", unique_id())))
+    let task_type = if is_upload { "kb_upload" } else { "kb_init" };
+    let task_id = knowledge_task_id(task_type);
+    if !is_upload {
+        return Ok((name, task_id, response_files));
+    }
+    let indexed_count = knowledge_files(state, &name).unwrap_or_default().len();
+    let action = if is_upload { "upload" } else { "create" };
+    let progress = json!({
+        "task_id": task_id,
+        "stage": "completed",
+        "message": format!("Knowledge base '{name}' {action} complete"),
+        "percent": 100,
+        "progress_percent": 100,
+        "current": indexed_count,
+        "total": indexed_count,
+        "indexed_count": indexed_count,
+        "index_action": action,
+        "timestamp": now_label()
+    });
+    let _ = write_knowledge_progress(state, &name, &progress);
+    state
+        .knowledge_tasks
+        .record_completed(
+            &task_id,
+            task_type,
+            format!("Knowledge base '{name}' {action} complete"),
+            progress,
+        )
+        .await;
+
+    Ok((name, task_id, response_files))
 }
 
-async fn llm_options() -> Json<Value> {
-    Json(json!({
-        "active": {
-            "profile_id": "socartes-rust",
-            "model_id": "deterministic-agent-loop"
-        },
-        "options": [
-            {
-                "profile_id": "socartes-rust",
-                "profile_name": "Socartes Rust",
-                "model_id": "deterministic-agent-loop",
-                "model_name": "Deterministic Agent Loop",
-                "model": "deterministic-agent-loop",
-                "provider": "rust",
-                "context_window": 8192,
-                "is_active_default": true
+async fn save_knowledge_upload_files_from_multipart(
+    state: &AppState,
+    name: &str,
+    mut multipart: Multipart,
+) -> Result<Vec<SavedKnowledgeFile>, ApiError> {
+    let mut files = Vec::<(String, Vec<u8>)>::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid multipart form: {error}"),
+        )
+    })? {
+        let field_name = field.name().unwrap_or_default().to_string();
+        let file_name = field.file_name().and_then(safe_filename);
+        let bytes = field.bytes().await.map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read multipart field: {error}"),
+            )
+        })?;
+
+        if field_name == "files" {
+            let Some(file_name) = file_name else {
+                return Err(api_error(StatusCode::BAD_REQUEST, "Missing filename"));
+            };
+            if !is_supported_knowledge_file(&file_name) {
+                return Err(api_error(StatusCode::BAD_REQUEST, "Unsupported file type"));
             }
-        ]
-    }))
+            files.push((file_name, bytes.to_vec()));
+        }
+    }
+
+    if files.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "At least one supported file is required",
+        ));
+    }
+
+    let files_dir = knowledge_files_dir(state, name);
+    fs::create_dir_all(&files_dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create knowledge file directory: {error}"),
+        )
+    })?;
+
+    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
+    let mut known_hashes = existing_file_hashes(&metadata)
+        .values()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    known_hashes.extend(existing_knowledge_content_hashes(state, name)?);
+    let mut saved_files = Vec::new();
+    for (filename, bytes) in files {
+        let hash = sha256_hex(&bytes);
+        if known_hashes.contains(&hash) {
+            continue;
+        }
+        fs::write(files_dir.join(&filename), bytes).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write uploaded file: {error}"),
+            )
+        })?;
+        known_hashes.insert(hash.clone());
+        saved_files.push(SavedKnowledgeFile { filename, hash });
+    }
+    Ok(saved_files)
 }
 
-async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+async fn llm_options(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    if payload.role != "admin" {
+        return Json(allowed_llm_options_for_user(&state, &payload.user_id)).into_response();
+    }
+    Json(llm_options_from_catalog(&load_settings_catalog(&state))).into_response()
+}
+
+fn llm_options_from_catalog(catalog: &Value) -> Value {
+    let service = &catalog["services"]["llm"];
+    let active_profile_id = trimmed_json_string(&service["active_profile_id"]).unwrap_or_default();
+    let active_model_id = trimmed_json_string(&service["active_model_id"]).unwrap_or_default();
+    let mut options = Vec::new();
+
+    if let Some(profiles) = service["profiles"].as_array() {
+        for profile in profiles {
+            let Some(profile_id) = trimmed_json_string(&profile["id"]) else {
+                continue;
+            };
+            let provider = trimmed_json_string(&profile["binding"]).unwrap_or_default();
+            let profile_name = trimmed_json_string(&profile["name"])
+                .or_else(|| (!provider.is_empty()).then(|| provider.clone()))
+                .unwrap_or_else(|| "LLM".to_string());
+
+            let Some(models) = profile["models"].as_array() else {
+                continue;
+            };
+            for model in models {
+                let Some(model_id) = trimmed_json_string(&model["id"]) else {
+                    continue;
+                };
+                let Some(model_value) = trimmed_json_string(&model["model"]) else {
+                    continue;
+                };
+                let mut option = Map::new();
+                let is_active_default =
+                    profile_id == active_profile_id && model_id == active_model_id;
+                option.insert("profile_id".to_string(), json!(profile_id));
+                option.insert("model_id".to_string(), json!(model_id));
+                option.insert("profile_name".to_string(), json!(profile_name));
+                option.insert(
+                    "model_name".to_string(),
+                    json!(
+                        trimmed_json_string(&model["name"]).unwrap_or_else(|| model_value.clone())
+                    ),
+                );
+                option.insert("model".to_string(), json!(model_value));
+                option.insert("provider".to_string(), json!(provider));
+                option.insert("is_active_default".to_string(), json!(is_active_default));
+                if let Some(context_window) = positive_i64_field(&model["context_window"])
+                    .or_else(|| positive_i64_field(&model["context_window_tokens"]))
+                {
+                    option.insert("context_window".to_string(), json!(context_window));
+                }
+                options.push(Value::Object(option));
+            }
+        }
+    }
+
+    json!({
+        "active": if active_profile_id.is_empty() || active_model_id.is_empty() {
+            Value::Null
+        } else {
+            json!({"profile_id": active_profile_id, "model_id": active_model_id})
+        },
+        "options": options
+    })
+}
+
+fn allowed_llm_options_for_user(state: &AppState, user_id: &str) -> Value {
+    let model_access = redacted_model_access_for_user(state, user_id);
+    let options = model_access["llm"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["available"].as_bool().unwrap_or(false))
+        .map(|item| {
+            let profile_id = trimmed_json_string(&item["profile_id"]).unwrap_or_default();
+            let model_id = trimmed_json_string(&item["model_id"]).unwrap_or_default();
+            let name = trimmed_json_string(&item["name"])
+                .or_else(|| (!profile_id.is_empty()).then(|| profile_id.clone()))
+                .unwrap_or_else(|| "LLM".to_string());
+            let model = trimmed_json_string(&item["model"]).unwrap_or_default();
+            let label = trimmed_json_string(&item["name"])
+                .or_else(|| trimmed_json_string(&item["model"]))
+                .or_else(|| trimmed_json_string(&item["model_id"]))
+                .unwrap_or_default();
+            json!({
+                "profile_id": profile_id,
+                "model_id": model_id,
+                "profile_name": name,
+                "model_name": label,
+                "label": label,
+                "model": model,
+                "provider": "",
+                "source": "admin",
+                "is_active_default": false
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "active": Value::Null,
+        "options": options
+    })
+}
+
+fn trimmed_json_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn positive_i64_field(value: &Value) -> Option<i64> {
+    parse_i64_field(value).filter(|value| *value > 0)
+}
+
+async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    if payload.role != "admin" {
+        return Json(json!({
+            "ui": load_ui_settings(&state),
+            "model_access": redacted_model_access_for_user(&state, &payload.user_id)
+        }))
+        .into_response();
+    }
     Json(json!({
         "ui": load_ui_settings(&state),
-        "catalog": load_settings_catalog(&state),
+        "catalog": redact_settings_catalog(&load_settings_catalog(&state)),
         "providers": settings_provider_choices()
     }))
+    .into_response()
 }
 
-async fn get_settings_catalog(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "catalog": load_settings_catalog(&state) }))
+async fn get_settings_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_settings_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    Json(json!({ "catalog": redact_settings_catalog(&load_settings_catalog(&state)) }))
+        .into_response()
 }
 
 async fn update_settings_catalog(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let catalog = payload
+    if let Err(response) = require_settings_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    let incoming_catalog = payload
         .get("catalog")
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(default_settings_catalog);
+    let catalog =
+        restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
     match write_settings_json(&state, "catalog.json", &catalog) {
-        Ok(()) => Json(json!({ "catalog": catalog })).into_response(),
+        Ok(()) => Json(json!({ "catalog": redact_settings_catalog(&catalog) })).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
 async fn apply_settings_catalog(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let catalog = payload
+    if let Err(response) = require_settings_admin(&state, &headers) {
+        return (*response).into_response();
+    }
+    let incoming_catalog = payload
         .get("catalog")
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| load_settings_catalog(&state));
+    let catalog =
+        restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
     if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
         return error.into_response();
     }
@@ -8973,8 +20353,8 @@ async fn apply_settings_catalog(
     match write_settings_json(&state, "applied-env.json", &env) {
         Ok(()) => Json(json!({
             "message": "Catalog applied to the active .env configuration.",
-            "catalog": catalog,
-            "env": env
+            "catalog": redact_settings_catalog(&catalog),
+            "env": redact_settings_env(&env)
         }))
         .into_response(),
         Err(error) => error.into_response(),
@@ -9109,11 +20489,13 @@ async fn complete_settings_tour(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let catalog = payload
+    let incoming_catalog = payload
         .get("catalog")
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| load_settings_catalog(&state));
+    let catalog =
+        restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
     if let Err(error) = write_settings_json(&state, "catalog.json", &catalog) {
         return error.into_response();
     }
@@ -9133,7 +20515,7 @@ async fn complete_settings_tour(
         "message": "Configuration saved. DeepTutor will restart shortly.",
         "launch_at": now + 3,
         "redirect_at": now + 5,
-        "env": env
+        "env": redact_settings_env(&env)
     }))
     .into_response()
 }
@@ -9148,25 +20530,29 @@ async fn reopen_settings_tour() -> Json<Value> {
 async fn start_settings_test(
     State(state): State<AppState>,
     Path(service): Path<String>,
-    Json(payload): Json<Value>,
+    payload: Option<Json<Value>>,
 ) -> axum::response::Response {
+    let payload = payload
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| json!({}));
     let run_id = format!("{service}-{}", settings_test_run_suffix());
-    if service == "embedding" {
-        let catalog = payload
-            .get("catalog")
-            .cloned()
-            .unwrap_or_else(|| load_settings_catalog(&state));
-        let snapshot = json!({
-            "service": service,
-            "catalog": catalog
-        });
-        let path = match settings_test_run_path(&state, &run_id) {
-            Ok(path) => path,
-            Err(error) => return error.into_response(),
-        };
-        if let Err(error) = write_json_file(&path, &snapshot) {
-            return error.into_response();
-        }
+    let incoming_catalog = payload
+        .get("catalog")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| load_settings_catalog(&state));
+    let catalog =
+        restore_masked_settings_catalog_secrets(&incoming_catalog, &load_settings_catalog(&state));
+    let snapshot = json!({
+        "service": service,
+        "catalog": catalog
+    });
+    let path = match settings_test_run_path(&state, &run_id) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = write_json_file(&path, &snapshot) {
+        return error.into_response();
     }
     Json(json!({ "run_id": run_id })).into_response()
 }
@@ -9177,30 +20563,35 @@ async fn settings_test_events(
 ) -> axum::response::Response {
     let service = service.replace('"', "");
     let run_id = run_id.replace('"', "");
-    if service == "embedding" {
-        let path = match settings_test_run_path(&state, &run_id) {
-            Ok(path) => path,
-            Err(error) => return error.into_response(),
-        };
-        let snapshot = match read_json_file(&path, "Settings test run not found") {
-            Ok(snapshot) => snapshot,
-            Err(error) => return error.into_response(),
-        };
+    let path = match settings_test_run_path(&state, &run_id) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    let snapshot = match read_json_file(&path, "Settings test run not found") {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error.into_response(),
+    };
+    if matches!(service.as_str(), "embedding" | "llm" | "search") {
         let catalog = snapshot
             .get("catalog")
             .cloned()
             .unwrap_or_else(|| load_settings_catalog(&state));
-        return (
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            embedding_settings_events(&state, &catalog).await,
-        )
-            .into_response();
+        let body = match service.as_str() {
+            "llm" => llm_settings_events(&state, &catalog).await,
+            "search" => search_settings_events(&catalog).await,
+            _ => embedding_settings_events(&state, &catalog).await,
+        };
+        return ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response();
     }
-    let body = format!(
-        "data: {{\"type\":\"started\",\"message\":\"Socartes Rust {service} diagnostics started\",\"run_id\":\"{run_id}\"}}\n\n\
-data: {{\"type\":\"capabilities\",\"message\":\"Detected deterministic Rust compatibility capabilities\",\"detected_dim\":3072,\"default_dim\":3072,\"supported_dimensions\":[1536,3072],\"supports_variable_dimensions\":true,\"model_known\":true,\"active_dim\":3072,\"active_dim_source\":\"catalog\"}}\n\n\
-data: {{\"type\":\"completed\",\"message\":\"{service} diagnostics completed\"}}\n\n"
-    );
+    let mut body = String::new();
+    body.push_str(&settings_data_event(settings_event_payload(
+        "info",
+        "Preparing configuration snapshot.",
+    )));
+    body.push_str(&settings_data_event(settings_event_payload(
+        "failed",
+        format!("Unsupported service: {service}"),
+    )));
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
@@ -9212,7 +20603,6 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
     let catalog = load_settings_catalog(&state);
     let llm_model = active_catalog_model_name(&catalog, "llm");
     let embedding_model = active_catalog_model_name(&catalog, "embedding");
-    let search_provider = active_search_provider(&catalog);
     Json(json!({
         "backend": {
             "status": "online",
@@ -9228,12 +20618,48 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
             "model": embedding_model,
             "testable": true
         },
-        "search": {
-            "status": if search_provider.is_some() { "configured" } else { "optional" },
-            "provider": search_provider,
-            "testable": true
-        }
+        "search": system_status_search_payload(&catalog)
     }))
+}
+
+fn system_status_search_payload(catalog: &Value) -> Value {
+    let resolved = resolve_search_runtime_config(catalog);
+    let (status, provider, error) = if resolved.unsupported_provider {
+        (
+            "unsupported",
+            resolved.requested_provider.clone(),
+            Some(format!(
+                "{} is deprecated/unsupported. Switch to {}.",
+                resolved.requested_provider,
+                supported_search_provider_hint()
+            )),
+        )
+    } else if resolved.missing_credentials {
+        (
+            "not_configured",
+            resolved.requested_provider.clone(),
+            Some(search_missing_credentials_message(
+                &resolved.requested_provider,
+            )),
+        )
+    } else if let Some(reason) = resolved.fallback_reason.clone() {
+        ("fallback", resolved.provider.clone(), Some(reason))
+    } else if resolved.provider.is_empty() {
+        ("optional", resolved.provider.clone(), None)
+    } else {
+        ("configured", resolved.provider.clone(), None)
+    };
+    let mut payload = json!({
+        "status": status,
+        "provider": provider,
+        "testable": true
+    });
+    if let Some(error) = error
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("error".to_string(), json!(error));
+    }
+    payload
 }
 
 async fn system_runtime_topology() -> Json<Value> {
@@ -9256,13 +20682,74 @@ async fn system_runtime_topology() -> Json<Value> {
 }
 
 async fn system_test_llm(State(state): State<AppState>) -> Json<Value> {
-    let model = active_catalog_model_name(&load_settings_catalog(&state), "llm")
-        .unwrap_or_else(|| "deterministic-agent-loop".to_string());
+    let start = SystemTime::now();
+    let catalog = load_settings_catalog(&state);
+    let selection = match active_chat_selection(&catalog, &Value::Null) {
+        Ok(Some(selection)) => selection,
+        Ok(None) => {
+            return Json(json!({
+                "success": false,
+                "message": "LLM configuration error: No provider-backed LLM model is configured.",
+                "model": null,
+                "response_time_ms": elapsed_millis(start),
+                "error": "No provider-backed LLM model is configured."
+            }));
+        }
+        Err(error) => {
+            return Json(json!({
+                "success": false,
+                "message": format!("LLM configuration error: {error}"),
+                "model": null,
+                "response_time_ms": elapsed_millis(start),
+                "error": error
+            }));
+        }
+    };
+    let body = json!({
+        "model": selection.model.as_str(),
+        "stream": false,
+        "temperature": 0.1,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Respond briefly."
+            },
+            {
+                "role": "user",
+                "content": "Say 'OK' to confirm you are working. Do not produce long output."
+            }
+        ]
+    });
+    let payload = match call_raw_openai_chat_completion(&selection, body).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Json(json!({
+                "success": false,
+                "message": format!("LLM connection failed: {error}"),
+                "model": selection.model,
+                "response_time_ms": elapsed_millis(start),
+                "error": error
+            }));
+        }
+    };
+    let response = parse_chat_completion_content(&payload)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if response.is_empty() {
+        return Json(json!({
+            "success": false,
+            "message": "LLM connection failed: Empty response",
+            "model": selection.model,
+            "response_time_ms": elapsed_millis(start),
+            "error": "Empty response from API"
+        }));
+    }
     Json(json!({
         "success": true,
-        "message": "Socartes Rust deterministic LLM test completed.",
-        "model": model,
-        "response_time_ms": 1.0,
+        "message": "LLM connection successful",
+        "model": selection.model,
+        "response_time_ms": elapsed_millis(start),
         "error": null
     }))
 }
@@ -9282,21 +20769,80 @@ async fn system_test_embeddings(
 }
 
 async fn system_test_search(State(state): State<AppState>) -> Json<Value> {
-    let provider = active_search_provider(&load_settings_catalog(&state))
-        .unwrap_or_else(|| "duckduckgo".to_string());
+    let start = SystemTime::now();
+    let catalog = load_settings_catalog(&state);
+    let resolved = resolve_search_runtime_config(&catalog);
+    if resolved.requested_provider.is_empty() {
+        return Json(json!({
+            "success": false,
+            "message": "Search not configured",
+            "model": null,
+            "response_time_ms": elapsed_millis(start),
+            "error": "Missing SEARCH_PROVIDER"
+        }));
+    }
+    if resolved.unsupported_provider {
+        return Json(json!({
+            "success": false,
+            "message": format!(
+                "Search provider `{}` is deprecated/unsupported.",
+                resolved.requested_provider
+            ),
+            "model": null,
+            "response_time_ms": elapsed_millis(start),
+            "error": format!("Switch to {}", supported_search_provider_hint())
+        }));
+    }
+    if resolved.missing_credentials {
+        return Json(json!({
+            "success": false,
+            "message": format!(
+                "Search provider `{}` missing credentials.",
+                resolved.requested_provider
+            ),
+            "model": null,
+            "response_time_ms": elapsed_millis(start),
+            "error": search_missing_credentials_error(&resolved.requested_provider)
+        }));
+    }
+    let result = match run_search_health_check(&resolved, "Socartes health check").await {
+        Ok(result) => result,
+        Err(error) => {
+            return Json(json!({
+                "success": false,
+                "message": format!("Search connection check failed: {error}"),
+                "model": resolved.provider,
+                "response_time_ms": elapsed_millis(start),
+                "error": error
+            }));
+        }
+    };
+    if result.answer.is_empty() && result.search_result_count == 0 {
+        return Json(json!({
+            "success": false,
+            "message": "Search configuration error: Search provider returned no content",
+            "model": resolved.provider,
+            "response_time_ms": elapsed_millis(start),
+            "error": "Search provider returned no content"
+        }));
+    }
     Json(json!({
         "success": true,
-        "message": "Socartes Rust deterministic search test completed.",
-        "model": provider,
-        "response_time_ms": 1.0,
+        "message": "Search connection successful",
+        "model": resolved.provider,
+        "response_time_ms": elapsed_millis(start),
         "error": null
     }))
 }
 
-async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
+async fn vision_analyze(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
     if !payload["question"].is_string() {
         return api_error(StatusCode::UNPROCESSABLE_ENTITY, "question is required").into_response();
     }
+    let question = payload["question"].as_str().unwrap_or_default();
     let session_id = payload["session_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -9304,15 +20850,28 @@ async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
         .unwrap_or_else(|| format!("vision_{}", unique_id()));
     let image_base64 = payload["image_base64"].as_str().map(str::trim);
     let image_url = payload["image_url"].as_str().map(str::trim);
-    match resolve_vision_image_summary(image_base64, image_url).await {
-        Ok(Some(image_summary)) => Json(json!({
-            "session_id": session_id,
-            "has_image": true,
-            "final_ggb_commands": [],
-            "ggb_script": Value::Null,
-            "analysis_summary": image_summary
-        }))
-        .into_response(),
+    match resolve_vision_image_input(image_base64, image_url).await {
+        Ok(Some(image_input)) => {
+            match run_vision_provider_analysis(&state, question, &image_input).await {
+                Ok(Some(analysis)) => Json(json!({
+                    "session_id": session_id,
+                    "has_image": true,
+                    "final_ggb_commands": analysis.final_commands,
+                    "ggb_script": if analysis.ggb_script.is_empty() { Value::Null } else { json!(analysis.ggb_script) },
+                    "analysis_summary": analysis.summary
+                }))
+                .into_response(),
+                Ok(None) => Json(json!({
+                    "session_id": session_id,
+                    "has_image": true,
+                    "final_ggb_commands": [],
+                    "ggb_script": Value::Null,
+                    "analysis_summary": image_input.summary
+                }))
+                .into_response(),
+                Err(detail) => api_error(StatusCode::BAD_GATEWAY, &detail).into_response(),
+            }
+        }
         Ok(None) => Json(json!({
             "session_id": session_id,
             "has_image": false,
@@ -9325,11 +20884,19 @@ async fn vision_analyze(Json(payload): Json<Value>) -> impl IntoResponse {
     }
 }
 
-async fn vision_solve_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_vision_solve_socket)
+async fn vision_solve_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
+    ws.on_upgrade(move |socket| handle_vision_solve_socket(state, socket))
+        .into_response()
 }
 
-async fn handle_vision_solve_socket(mut socket: WebSocket) {
+async fn handle_vision_solve_socket(state: AppState, mut socket: WebSocket) {
     let Some(Ok(Message::Text(text))) = socket.recv().await else {
         let _ = vision_ws_send(
             &mut socket,
@@ -9370,8 +20937,8 @@ async fn handle_vision_solve_socket(mut socket: WebSocket) {
     .await;
     let image_base64 = payload["image_base64"].as_str().map(str::trim);
     let image_url = payload["image_url"].as_str().map(str::trim);
-    let image_summary = match resolve_vision_image_summary(image_base64, image_url).await {
-        Ok(Some(summary)) => summary,
+    let image_input = match resolve_vision_image_input(image_base64, image_url).await {
+        Ok(Some(input)) => input,
         Ok(None) => {
             let _ = vision_ws_send(&mut socket, json!({"type": "no_image", "data": {}})).await;
             let _ = vision_ws_send(&mut socket, json!({"type": "done"})).await;
@@ -9384,19 +20951,61 @@ async fn handle_vision_solve_socket(mut socket: WebSocket) {
             return;
         }
     };
-    let events = [
-        json!({"type": "analysis_start", "data": {"session_id": session_id}}),
-        json!({"type": "bbox_complete", "data": {"stage": "bbox", "elements_count": 0, "elements": []}}),
-        json!({"type": "analysis_complete", "data": {"stage": "analysis", "constraints_count": 0, "relations_count": 0, "image_is_reference": false, "constraints": []}}),
-        json!({"type": "ggbscript_complete", "data": {"stage": "ggbscript", "commands_count": 0, "commands": []}}),
-        json!({"type": "reflection_complete", "data": {"stage": "reflection", "issues_count": 0, "commands_count": 0, "final_commands": []}}),
-        json!({"type": "analysis_message_complete", "data": {"ggb_block": Value::Null, "analysis_summary": image_summary}}),
-        json!({"type": "answer_start", "data": {"has_image_analysis": true}}),
-        json!({"type": "done", "data": {}}),
-    ];
-    for event in events {
-        if vision_ws_send(&mut socket, event).await.is_err() {
-            return;
+
+    match run_vision_provider_analysis(&state, question, &image_input).await {
+        Ok(Some(analysis)) => {
+            let tutor_text = run_vision_tutor_response(&state, question, &analysis)
+                .await
+                .unwrap_or_default();
+            let mut events = vec![
+                json!({"type": "analysis_start", "data": {"session_id": session_id}}),
+                json!({"type": "bbox_complete", "data": vision_bbox_event_data(&analysis.bbox)}),
+                json!({"type": "analysis_complete", "data": vision_analysis_event_data(&analysis.analysis)}),
+                json!({"type": "ggbscript_complete", "data": vision_ggb_event_data(&analysis.ggbscript)}),
+                json!({"type": "reflection_complete", "data": vision_reflection_event_data(&analysis.reflection, &analysis.final_commands)}),
+                json!({"type": "analysis_message_complete", "data": {
+                    "ggb_block": if analysis.ggb_script.is_empty() {
+                        Value::Null
+                    } else {
+                        json!({
+                            "page_id": "image-analysis-restore",
+                            "title": "题目配图还原",
+                            "content": analysis.ggb_script
+                        })
+                    },
+                    "analysis_summary": analysis.summary
+                }}),
+                json!({"type": "answer_start", "data": {"has_image_analysis": true}}),
+            ];
+            if !tutor_text.is_empty() {
+                events.push(json!({"type": "text", "data": {"content": tutor_text}}));
+            }
+            events.push(json!({"type": "done", "data": {}}));
+            for event in events {
+                if vision_ws_send(&mut socket, event).await.is_err() {
+                    return;
+                }
+            }
+        }
+        Ok(None) => {
+            let events = [
+                json!({"type": "analysis_start", "data": {"session_id": session_id}}),
+                json!({"type": "bbox_complete", "data": {"stage": "bbox", "elements_count": 0, "elements": []}}),
+                json!({"type": "analysis_complete", "data": {"stage": "analysis", "constraints_count": 0, "relations_count": 0, "image_is_reference": false, "constraints": []}}),
+                json!({"type": "ggbscript_complete", "data": {"stage": "ggbscript", "commands_count": 0, "commands": []}}),
+                json!({"type": "reflection_complete", "data": {"stage": "reflection", "issues_count": 0, "commands_count": 0, "final_commands": []}}),
+                json!({"type": "analysis_message_complete", "data": {"ggb_block": Value::Null, "analysis_summary": image_input.summary}}),
+                json!({"type": "answer_start", "data": {"has_image_analysis": true}}),
+                json!({"type": "done", "data": {}}),
+            ];
+            for event in events {
+                if vision_ws_send(&mut socket, event).await.is_err() {
+                    return;
+                }
+            }
+        }
+        Err(detail) => {
+            let _ = vision_ws_send(&mut socket, json!({"type": "error", "content": detail})).await;
         }
     }
     let _ = socket.send(Message::Close(None)).await;
@@ -9406,17 +21015,36 @@ async fn vision_ws_send(socket: &mut WebSocket, event: Value) -> Result<(), axum
     socket.send(Message::Text(event.to_string().into())).await
 }
 
-async fn resolve_vision_image_summary(
+#[derive(Debug, Clone)]
+struct VisionImageInput {
+    data_uri: String,
+    summary: Value,
+}
+
+#[derive(Debug, Clone)]
+struct VisionProviderAnalysis {
+    bbox: Value,
+    analysis: Value,
+    ggbscript: Value,
+    reflection: Value,
+    final_commands: Vec<String>,
+    ggb_script: String,
+    summary: Value,
+}
+
+async fn resolve_vision_image_input(
     image_base64: Option<&str>,
     image_url: Option<&str>,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<VisionImageInput>, String> {
     if let Some(image_base64) = image_base64.filter(|value| !value.is_empty()) {
         let Some((mime_type, byte_count)) = parse_vision_image_data_uri(image_base64) else {
             return Err(
                 "Invalid base64 image format, should be data:image/...;base64,...".to_string(),
             );
         };
-        return Ok(Some(json!({
+        return Ok(Some(VisionImageInput {
+            data_uri: image_base64.to_string(),
+            summary: json!({
             "image_is_reference": false,
             "elements_count": 0,
             "commands_count": 0,
@@ -9424,27 +21052,317 @@ async fn resolve_vision_image_summary(
             "input_source": "image_base64",
             "mime_type": mime_type,
             "byte_count": byte_count
-        })));
+            }),
+        }));
     }
     if let Some(image_url) = image_url.filter(|value| !value.is_empty()) {
         if !is_valid_vision_image_url(image_url) {
             return Err(format!("Invalid image URL: {image_url}"));
         }
-        let (byte_count, mime_type) = fetch_vision_image_from_url(image_url).await?;
-        return Ok(Some(json!({
-            "image_is_reference": false,
-            "elements_count": 0,
-            "commands_count": 0,
-            "analysis_mode": "metadata_only",
-            "input_source": "image_url",
-            "mime_type": mime_type,
-            "byte_count": byte_count
-        })));
+        let (bytes, mime_type) = fetch_vision_image_from_url(image_url).await?;
+        let byte_count = bytes.len();
+        let encoded = general_purpose::STANDARD.encode(bytes);
+        return Ok(Some(VisionImageInput {
+            data_uri: format!("data:{mime_type};base64,{encoded}"),
+            summary: json!({
+                "image_is_reference": false,
+                "elements_count": 0,
+                "commands_count": 0,
+                "analysis_mode": "metadata_only",
+                "input_source": "image_url",
+                "mime_type": mime_type,
+                "byte_count": byte_count
+            }),
+        }));
     }
     Ok(None)
 }
 
-async fn fetch_vision_image_from_url(image_url: &str) -> Result<(usize, &'static str), String> {
+async fn run_vision_provider_analysis(
+    state: &AppState,
+    question: &str,
+    image: &VisionImageInput,
+) -> Result<Option<VisionProviderAnalysis>, String> {
+    let Some(selection) = active_chat_selection(&load_settings_catalog(state), &Value::Null)?
+    else {
+        return Ok(None);
+    };
+    let bbox = call_vision_stage(
+        &selection,
+        "bbox",
+        question,
+        &image.data_uri,
+        &[("image_summary", image.summary.clone())],
+    )
+    .await?;
+    let analysis = call_vision_stage(
+        &selection,
+        "analysis",
+        question,
+        &image.data_uri,
+        &[
+            ("image_summary", image.summary.clone()),
+            ("bbox", bbox.clone()),
+        ],
+    )
+    .await?;
+    let ggbscript = call_vision_stage(
+        &selection,
+        "ggbscript",
+        question,
+        &image.data_uri,
+        &[
+            ("image_summary", image.summary.clone()),
+            ("bbox", bbox.clone()),
+            ("analysis", analysis.clone()),
+        ],
+    )
+    .await?;
+    let reflection = call_vision_stage(
+        &selection,
+        "reflection",
+        question,
+        &image.data_uri,
+        &[
+            ("image_summary", image.summary.clone()),
+            ("bbox", bbox.clone()),
+            ("analysis", analysis.clone()),
+            ("ggbscript", ggbscript.clone()),
+        ],
+    )
+    .await?;
+    let final_commands = vision_final_commands(&reflection, &ggbscript);
+    let ggb_script = final_commands.join("\n");
+    let elements = bbox["elements"].as_array().cloned().unwrap_or_default();
+    let constraints = analysis["constraints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let relations = analysis["geometric_relations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let commands = vision_ggb_commands(&ggbscript);
+    let issues = reflection["issues_found"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut summary = image.summary.clone();
+    merge_object_value(
+        &mut summary,
+        &json!({
+            "analysis_mode": "provider",
+            "elements_count": elements.len(),
+            "commands_count": final_commands.len(),
+            "constraints_count": constraints.len(),
+            "relations_count": relations.len(),
+            "issues_count": issues.len(),
+            "image_is_reference": analysis["image_is_reference"].as_bool().unwrap_or(false),
+            "constraints": constraints,
+            "relations": relations,
+            "commands": commands,
+        }),
+    );
+    Ok(Some(VisionProviderAnalysis {
+        bbox,
+        analysis,
+        ggbscript,
+        reflection,
+        final_commands,
+        ggb_script,
+        summary,
+    }))
+}
+
+async fn run_vision_tutor_response(
+    state: &AppState,
+    question: &str,
+    analysis: &VisionProviderAnalysis,
+) -> Result<String, String> {
+    let Some(selection) = active_chat_selection(&load_settings_catalog(state), &Value::Null)?
+    else {
+        return Ok(String::new());
+    };
+    let body = json!({
+        "model": selection.model.as_str(),
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Socartes, a concise visual math tutor. Explain the solution using the restored GeoGebra commands when useful."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Question: {question}\nFinal GeoGebra commands:\n{}\nAnalysis JSON:\n{}",
+                    analysis.ggb_script,
+                    analysis.analysis
+                )
+            }
+        ]
+    });
+    call_chat_completion_provider(&selection, body)
+        .await
+        .map(|response| response.content.unwrap_or_default())
+}
+
+async fn call_vision_stage(
+    selection: &ChatRuntimeSelection,
+    stage: &str,
+    question: &str,
+    image_data_uri: &str,
+    context: &[(&str, Value)],
+) -> Result<Value, String> {
+    let prompt = vision_stage_prompt(stage, question, context);
+    let body = json!({
+        "model": selection.model.as_str(),
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Socartes VisionSolver. Return compact JSON only, with no markdown fences."
+            },
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url", "image_url": { "url": image_data_uri } }
+                ]
+            }
+        ]
+    });
+    let response = call_chat_completion_provider(selection, body).await?;
+    let content = response
+        .content
+        .ok_or_else(|| format!("Vision {stage} response did not include content"))?;
+    parse_vision_json(&content)
+        .ok_or_else(|| format!("Vision {stage} response was not JSON object content: {content}"))
+}
+
+fn vision_stage_prompt(stage: &str, question: &str, context: &[(&str, Value)]) -> String {
+    let schema = match stage {
+        "bbox" => {
+            r#"Return {"elements":[{"type":"point|line|circle|polygon|text|unknown","label":"..."}]}."#
+        }
+        "analysis" => {
+            r#"Return {"constraints":["..."],"geometric_relations":[{"description":"..."}],"image_is_reference":false}."#
+        }
+        "ggbscript" => {
+            r#"Return {"commands":[{"command":"GeoGebra command","description":"..."}]}."#
+        }
+        "reflection" => r#"Return {"issues_found":[],"final_commands":["GeoGebra command"]}."#,
+        _ => "Return a JSON object.",
+    };
+    let mut prompt = format!("Stage: {stage}\nQuestion: {question}\n{schema}");
+    for (name, value) in context {
+        prompt.push_str(&format!("\n{name}: {value}"));
+    }
+    prompt
+}
+
+fn parse_vision_json(content: &str) -> Option<Value> {
+    let trimmed = content.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return value.is_object().then_some(value);
+    }
+    let without_fence = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(value) = without_fence
+        && let Ok(parsed) = serde_json::from_str::<Value>(value)
+    {
+        return parsed.is_object().then_some(parsed);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    serde_json::from_str::<Value>(&trimmed[start..=end])
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn vision_final_commands(reflection: &Value, ggbscript: &Value) -> Vec<String> {
+    let reflected = as_string_array(&reflection["final_commands"]);
+    if !reflected.is_empty() {
+        return reflected;
+    }
+    vision_ggb_commands(ggbscript)
+        .into_iter()
+        .filter_map(|command| command["command"].as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn vision_ggb_commands(ggbscript: &Value) -> Vec<Value> {
+    ggbscript["commands"]
+        .as_array()
+        .map(|commands| {
+            commands
+                .iter()
+                .filter(|command| command["command"].as_str().is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn vision_bbox_event_data(bbox: &Value) -> Value {
+    let elements = bbox["elements"].as_array().cloned().unwrap_or_default();
+    json!({
+        "stage": "bbox",
+        "elements_count": elements.len(),
+        "elements": elements
+            .iter()
+            .take(10)
+            .map(|element| json!({
+                "type": element["type"].as_str().unwrap_or("unknown"),
+                "label": element["label"].as_str().unwrap_or("")
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn vision_analysis_event_data(analysis: &Value) -> Value {
+    let constraints = analysis["constraints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let relations = analysis["geometric_relations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "stage": "analysis",
+        "constraints_count": constraints.len(),
+        "relations_count": relations.len(),
+        "image_is_reference": analysis["image_is_reference"].as_bool().unwrap_or(false),
+        "constraints": constraints.into_iter().take(10).collect::<Vec<_>>()
+    })
+}
+
+fn vision_ggb_event_data(ggbscript: &Value) -> Value {
+    let commands = vision_ggb_commands(ggbscript);
+    json!({
+        "stage": "ggbscript",
+        "commands_count": commands.len(),
+        "commands": commands.into_iter().take(10).collect::<Vec<_>>()
+    })
+}
+
+fn vision_reflection_event_data(reflection: &Value, final_commands: &[String]) -> Value {
+    let issues = reflection["issues_found"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "stage": "reflection",
+        "issues_count": issues.len(),
+        "commands_count": final_commands.len(),
+        "final_commands": final_commands
+    })
+}
+
+async fn fetch_vision_image_from_url(image_url: &str) -> Result<(Vec<u8>, &'static str), String> {
     const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
     const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -9507,7 +21425,7 @@ async fn fetch_vision_image_from_url(image_url: &str) -> Result<(usize, &'static
             bytes.len() as f64 / 1024.0 / 1024.0
         ));
     }
-    Ok((bytes.len(), mime_type))
+    Ok((bytes.to_vec(), mime_type))
 }
 
 fn parse_vision_image_data_uri(value: &str) -> Option<(&str, usize)> {
@@ -9944,9 +21862,14 @@ async fn tutorbot_history(
 async fn tutorbot_ws(
     State(state): State<AppState>,
     Path(bot_id): Path<String>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(response) = require_ws_auth_response(&state, &headers) {
+        return *response;
+    }
     ws.on_upgrade(move |socket| handle_tutorbot_socket(socket, state, bot_id))
+        .into_response()
 }
 
 async fn dashboard_recent(
@@ -10006,14 +21929,26 @@ async fn get_solve_session(
     }
 }
 
-async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "sessions": session_summaries(&state) }))
+async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    if session_pocketbase_enabled(&state) {
+        return match session_summaries_pocketbase(&state).await {
+            Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
+    Json(json!({ "sessions": session_summaries(&state) })).into_response()
 }
 
 async fn get_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
+    if session_pocketbase_enabled(&state) {
+        return match read_session_pocketbase(&state, &session_id).await {
+            Ok(session) => Json(session).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     match read_session(&state, &session_id) {
         Ok(session) => Json(session).into_response(),
         Err(error) => error.into_response(),
@@ -10030,6 +21965,12 @@ async fn update_session_title(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Untitled chat");
+    if session_pocketbase_enabled(&state) {
+        return match update_session_title_pocketbase(&state, &session_id, title).await {
+            Ok(session) => Json(json!({ "session": session })).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     match read_session(&state, &session_id).and_then(|mut session| {
         session["title"] = json!(title);
         session["updated_at"] = json!(now_seconds());
@@ -10045,6 +21986,12 @@ async fn delete_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
+    if session_pocketbase_enabled(&state) {
+        return match delete_session_pocketbase(&state, &session_id).await {
+            Ok(()) => Json(json!({ "deleted": true })).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     let path = session_path(&state, &session_id);
     if !path.exists() {
         return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
@@ -10059,20 +22006,256 @@ async fn delete_session(
     }
 }
 
+async fn delete_legacy_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let path = session_path(&state, &session_id);
+    if !path.exists() {
+        return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Json(json!({
+            "status": "deleted",
+            "session_id": session_id
+        }))
+        .into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to delete session: {error}"),
+        )
+        .into_response(),
+    }
+}
+
 async fn record_quiz_results(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    match read_session(&state, &session_id).and_then(|mut session| {
-        session["quiz_results"] = payload["answers"].clone();
-        session["updated_at"] = json!(now_seconds());
-        write_session(&state, &session_id, &session)?;
-        Ok(())
-    }) {
-        Ok(()) => Json(json!({ "recorded": true })).into_response(),
-        Err(error) => error.into_response(),
+    let answers = match parse_quiz_results_answers(&payload) {
+        Ok(answers) => answers,
+        Err(error) => return error.into_response(),
+    };
+    let content = format_quiz_results_message(&answers);
+    if session_pocketbase_enabled(&state) {
+        let notebook_count =
+            match record_quiz_results_pocketbase(&state, &session_id, &answers, &content).await {
+                Ok(notebook_count) => notebook_count,
+                Err(error) => return error.into_response(),
+            };
+        return Json(json!({
+            "recorded": true,
+            "session_id": session_id,
+            "answer_count": answers.len(),
+            "notebook_count": notebook_count,
+            "content": content
+        }))
+        .into_response();
     }
+    let mut session = match read_session(&state, &session_id) {
+        Ok(session) => session,
+        Err(error) => return error.into_response(),
+    };
+    let session_title = session["title"].as_str().unwrap_or("").to_string();
+    append_quiz_results_message(&mut session, &session_id, &content);
+    if let Err(error) = write_session(&state, &session_id, &session) {
+        return error.into_response();
+    }
+    let notebook_count = upsert_quiz_result_entries(&state, &session_id, &session_title, &answers)
+        .unwrap_or_default();
+    Json(json!({
+        "recorded": true,
+        "session_id": session_id,
+        "answer_count": answers.len(),
+        "notebook_count": notebook_count,
+        "content": content
+    }))
+    .into_response()
+}
+
+async fn record_quiz_results_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    answers: &[Value],
+    content: &str,
+) -> Result<usize, ApiError> {
+    let session = read_session_pocketbase(state, session_id).await?;
+    append_quiz_results_message_pocketbase(state, session_id, content).await?;
+    let session_title = session["title"].as_str().unwrap_or("");
+    Ok(upsert_quiz_result_entries(state, session_id, session_title, answers).unwrap_or_default())
+}
+
+async fn append_quiz_results_message_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    content: &str,
+) -> Result<(), ApiError> {
+    pb_collection_create(
+        state,
+        "messages",
+        json!({
+            "session_id": session_id,
+            "role": "user",
+            "content": content,
+            "capability": "deep_question",
+            "events_json": [],
+            "attachments_json": [],
+            "metadata_json": {},
+            "msg_created_at": now_seconds(),
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn parse_quiz_results_answers(payload: &Value) -> Result<Vec<Value>, ApiError> {
+    let answers = payload["answers"].as_array().cloned().unwrap_or_default();
+    if answers.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Quiz results are required",
+        ));
+    }
+    Ok(answers)
+}
+
+fn format_quiz_results_message(answers: &[Value]) -> String {
+    let total = answers.len();
+    let correct = answers
+        .iter()
+        .filter(|answer| answer["is_correct"].as_bool().unwrap_or(false))
+        .count();
+    let mut lines = vec!["[Quiz Performance]".to_string()];
+    for (index, answer) in answers.iter().enumerate() {
+        let question = quiz_answer_string(answer, "question")
+            .trim()
+            .replace('\n', " ");
+        let user_answer = {
+            let value = quiz_answer_string(answer, "user_answer");
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                "(blank)".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let correct_answer = quiz_answer_string(answer, "correct_answer");
+        let correct_answer = correct_answer.trim();
+        let is_correct = answer["is_correct"].as_bool().unwrap_or(false);
+        let suffix = if is_correct {
+            " (Correct)".to_string()
+        } else if correct_answer.is_empty() {
+            " (Incorrect)".to_string()
+        } else {
+            format!(" (Incorrect, correct: {correct_answer})")
+        };
+        let question_id = quiz_answer_string(answer, "question_id");
+        let question_id = question_id.trim();
+        let prefix = if question_id.is_empty() {
+            String::new()
+        } else {
+            format!("[{question_id}] ")
+        };
+        lines.push(format!(
+            "{}. {}Q: {} -> Answered: {}{}",
+            index + 1,
+            prefix,
+            question,
+            user_answer,
+            suffix
+        ));
+    }
+    lines.push(format!(
+        "Score: {correct}/{total} ({}%)",
+        python_round_percentage(correct, total)
+    ));
+    lines.join("\n")
+}
+
+fn quiz_answer_string(answer: &Value, key: &str) -> String {
+    answer[key].as_str().unwrap_or_default().to_string()
+}
+
+fn python_round_percentage(correct: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let numerator = correct * 100;
+    let quotient = numerator / total;
+    let remainder = numerator % total;
+    match (remainder * 2).cmp(&total) {
+        std::cmp::Ordering::Less => quotient,
+        std::cmp::Ordering::Greater => quotient + 1,
+        std::cmp::Ordering::Equal => {
+            if quotient.is_multiple_of(2) {
+                quotient
+            } else {
+                quotient + 1
+            }
+        }
+    }
+}
+
+fn append_quiz_results_message(session: &mut Value, session_id: &str, content: &str) {
+    let now = now_seconds();
+    let message_id = session["messages"]
+        .as_array()
+        .map(|messages| messages.len() + 1)
+        .unwrap_or(1);
+    let message = json!({
+        "id": message_id,
+        "session_id": session_id,
+        "role": "user",
+        "content": content,
+        "capability": "deep_question",
+        "events": [],
+        "attachments": [],
+        "metadata": {},
+        "created_at": now
+    });
+    if let Some(messages) = session["messages"].as_array_mut() {
+        messages.push(message);
+    } else {
+        session["messages"] = json!([message]);
+    }
+    session["updated_at"] = json!(now);
+}
+
+fn upsert_quiz_result_entries(
+    state: &AppState,
+    session_id: &str,
+    session_title: &str,
+    answers: &[Value],
+) -> Result<usize, ApiError> {
+    let mut count = 0usize;
+    for answer in answers {
+        let question_id = quiz_answer_string(answer, "question_id");
+        let question_id = question_id.trim();
+        let question = quiz_answer_string(answer, "question");
+        let question = question.trim();
+        if question_id.is_empty() || question.is_empty() {
+            continue;
+        }
+        upsert_question_entry_value_for_session(
+            state,
+            &json!({
+                "session_id": session_id,
+                "question_id": question_id,
+                "question": question,
+                "question_type": quiz_answer_string(answer, "question_type"),
+                "options": if answer["options"].is_object() { answer["options"].clone() } else { json!({}) },
+                "correct_answer": quiz_answer_string(answer, "correct_answer"),
+                "explanation": quiz_answer_string(answer, "explanation"),
+                "difficulty": quiz_answer_string(answer, "difficulty"),
+                "user_answer": quiz_answer_string(answer, "user_answer"),
+                "is_correct": answer["is_correct"].as_bool().unwrap_or(false)
+            }),
+            session_title,
+        )?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 async fn get_memory(State(state): State<AppState>) -> impl IntoResponse {
@@ -10171,7 +22354,10 @@ async fn clear_memory(
     }
 }
 
-async fn page_agent_chat_completion(Json(payload): Json<Value>) -> impl IntoResponse {
+async fn page_agent_chat_completion(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
     if !matches!(payload.get("messages"), Some(Value::Array(_))) {
         return api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -10180,10 +22366,39 @@ async fn page_agent_chat_completion(Json(payload): Json<Value>) -> impl IntoResp
         .into_response();
     }
 
-    let model = payload["model"]
+    let requested_model = page_agent_requested_model(&payload);
+    let catalog = load_settings_catalog(&state);
+    let selection = active_chat_selection(&catalog, &Value::Null).unwrap_or_default();
+    let Some(selection) = selection.filter(supports_native_chat_tools) else {
+        return Json(page_agent_fallback_completion(requested_model.as_deref())).into_response();
+    };
+
+    let mut provider_payload = payload.clone();
+    provider_payload["model"] = json!(
+        requested_model
+            .as_deref()
+            .unwrap_or(selection.model.as_str())
+    );
+    match call_raw_openai_chat_completion(&selection, provider_payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("Page-agent LLM request failed: {error}"),
+        )
+        .into_response(),
+    }
+}
+
+fn page_agent_requested_model(payload: &Value) -> Option<String> {
+    payload["model"]
         .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("deeptutor-page-agent-fallback");
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn page_agent_fallback_completion(model: Option<&str>) -> Value {
+    let model = model.unwrap_or("deeptutor-page-agent-fallback");
     let arguments = json!({
         "type": "done",
         "message": "Page agent LLM tool-calling is not configured. Configure an OpenAI-compatible chat provider to enable page actions."
@@ -10192,7 +22407,7 @@ async fn page_agent_chat_completion(Json(payload): Json<Value>) -> impl IntoResp
         "{\"type\":\"done\",\"message\":\"Page agent unavailable\"}".to_string()
     });
 
-    Json(json!({
+    json!({
         "id": format!("chatcmpl-page-agent-{}", unique_id()),
         "object": "chat.completion",
         "created": now_seconds() as u64,
@@ -10222,8 +22437,65 @@ async fn page_agent_chat_completion(Json(payload): Json<Value>) -> impl IntoResp
             "completion_tokens": 0,
             "total_tokens": 0
         }
-    }))
-    .into_response()
+    })
+}
+
+async fn call_raw_openai_chat_completion(
+    selection: &ChatRuntimeSelection,
+    body: Value,
+) -> Result<Value, String> {
+    let use_responses_api = should_use_openai_responses_api(selection);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    if use_responses_api {
+        let responses_endpoint = openai_responses_endpoint(selection)?;
+        let responses_body = responses_body_from_chat_completion(selection, &body);
+        let (status, text) = send_openai_compatible_request(
+            &client,
+            selection,
+            &responses_endpoint,
+            &responses_body,
+        )
+        .await?;
+        if status.is_success() {
+            let payload = serde_json::from_str::<Value>(&text)
+                .map_err(|error| format!("Invalid JSON response: {error}"))?;
+            return responses_payload_as_chat_completion(selection, &payload).ok_or_else(|| {
+                "Responses API response did not include assistant content".to_string()
+            });
+        }
+        if should_fallback_from_responses_error(status, &text) {
+            let chat_endpoint = chat_completion_endpoint(selection)?;
+            let (chat_status, chat_text) =
+                send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+            if !chat_status.is_success() {
+                return Err(format!(
+                    "HTTP {} from {chat_endpoint}: {chat_text}",
+                    chat_status.as_u16()
+                ));
+            }
+            return serde_json::from_str::<Value>(&chat_text)
+                .map_err(|error| format!("Invalid JSON response: {error}"));
+        }
+        return Err(format!(
+            "HTTP {} from {responses_endpoint}: {text}",
+            status.as_u16()
+        ));
+    }
+
+    let chat_endpoint = chat_completion_endpoint(selection)?;
+    let (status, text) =
+        send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} from {chat_endpoint}: {text}",
+            status.as_u16()
+        ));
+    }
+    serde_json::from_str::<Value>(&text).map_err(|error| format!("Invalid JSON response: {error}"))
 }
 
 async fn list_plugins() -> Json<Value> {
@@ -10236,11 +22508,16 @@ async fn list_plugins() -> Json<Value> {
 
 async fn execute_plugin_tool(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(tool_name): Path<String>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let auth_payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
     let params = plugin_request_params(&payload);
-    match plugin_tool_result(&state, &tool_name, params).await {
+    match plugin_tool_result(&state, &tool_name, params, Some(&auth_payload)).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -10248,9 +22525,14 @@ async fn execute_plugin_tool(
 
 async fn execute_plugin_tool_stream(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(tool_name): Path<String>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let auth_payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
     let params = plugin_request_params(&payload);
     let mut body = String::new();
     body.push_str(&sse(
@@ -10264,7 +22546,7 @@ async fn execute_plugin_tool_stream(
         }),
     ));
 
-    match plugin_tool_result(&state, &tool_name, params).await {
+    match plugin_tool_result(&state, &tool_name, params, Some(&auth_payload)).await {
         Ok(mut result) => {
             result["elapsed_ms"] = json!(1);
             body.push_str(&sse("result", result));
@@ -10280,14 +22562,15 @@ async fn execute_plugin_tool_stream(
         }
     }
 
-    sse_response(body)
+    sse_response(body).into_response()
 }
 
 async fn execute_plugin_capability_stream(
     State(state): State<AppState>,
+    Extension(auth_payload): Extension<AuthTokenPayload>,
     Path(capability_name): Path<String>,
     Json(payload): Json<Value>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let mut body = String::new();
     body.push_str(&sse(
         "process_log",
@@ -10308,7 +22591,11 @@ async fn execute_plugin_capability_stream(
                 "elapsed_ms": 1
             }),
         ));
-        return sse_response(body);
+        return sse_response(body).into_response();
+    }
+
+    if capability_name == "deep_question" {
+        return execute_deep_question_capability_stream(&state, &payload, body).await;
     }
 
     let request = json!({
@@ -10317,9 +22604,12 @@ async fn execute_plugin_capability_stream(
         "tools": payload["tools"].clone(),
         "knowledge_bases": payload["knowledge_bases"].clone(),
         "language": payload["language"].as_str().unwrap_or("en"),
-        "capability": capability_name
+        "capability": capability_name,
+        "config": payload["config"].clone(),
+        "attachments": payload["attachments"].clone()
     });
-    let (_session_id, turn_id, events) = execute_chat_turn(&state, &request).await;
+    let (_session_id, turn_id, events) =
+        execute_chat_turn(&state, &request, Some(&auth_payload)).await;
     let mut final_data = json!({});
     for event in events {
         if event["type"] == "done" {
@@ -10342,7 +22632,365 @@ async fn execute_plugin_capability_stream(
         }),
     ));
 
-    sse_response(body)
+    sse_response(body).into_response()
+}
+
+async fn execute_deep_question_capability_stream(
+    state: &AppState,
+    payload: &Value,
+    mut body: String,
+) -> axum::response::Response {
+    let content = payload["content"].as_str().unwrap_or_default();
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    let turn_id = format!("rust-turn-{}", unique_id());
+    let request = json!({
+        "type": "start_turn",
+        "session_id": session_id,
+        "content": content,
+        "tools": payload["tools"].clone(),
+        "knowledge_bases": payload["knowledge_bases"].clone(),
+        "language": payload["language"].as_str().unwrap_or("en"),
+        "capability": "deep_question",
+        "config": payload["config"].clone(),
+        "attachments": payload["attachments"].clone()
+    });
+    let (persistence_payload, effective_content) =
+        prepare_chat_turn_payload(state, &session_id, &request, content);
+    let result = build_deep_question_followup_result(content, &request["config"])
+        .or_else(|| build_deep_question_answer_now_result(&effective_content, &request["config"]))
+        .unwrap_or_else(|| build_deep_question_result(&effective_content, &request["config"]));
+    let response = result["response"].as_str().unwrap_or_default().to_string();
+    let trace = deep_question_trace(&effective_content, &response, &result);
+    let ids = StreamIds::new(&session_id, &turn_id);
+    let events = vec![
+        stream_event(
+            "session",
+            "rust-backend",
+            "",
+            "",
+            json!({ "session_id": session_id, "turn_id": turn_id }),
+            ids,
+            1,
+        ),
+        stream_event(
+            "stage_start",
+            "question_ideation",
+            "ideation",
+            "Identifying the topic, mode, difficulty, and question blueprint.",
+            json!({
+                "mode": result["mode"].clone(),
+                "question_count": result["summary"]["requested"].clone()
+            }),
+            ids,
+            2,
+        ),
+        stream_event(
+            "stage_start",
+            "question_generation",
+            "generation",
+            "Generating quiz questions with answer keys and explanations.",
+            json!({
+                "mode": result["mode"].clone(),
+                "question_count": result["summary"]["completed"].clone()
+            }),
+            ids,
+            3,
+        ),
+        stream_event(
+            "content",
+            "question_generator",
+            "generation",
+            &response,
+            json!({
+                "capability": "deep_question",
+                "mode": result["mode"].clone(),
+                "summary": result["summary"].clone()
+            }),
+            ids,
+            4,
+        ),
+        stream_event(
+            "stage_end",
+            "question_review",
+            "generation",
+            "Question batch generated and normalized for the quiz viewer.",
+            json!({ "summary": result["summary"].clone() }),
+            ids,
+            5,
+        ),
+        stream_event(
+            "done",
+            "rust-backend",
+            "",
+            "",
+            json!({ "status": "completed" }),
+            ids,
+            6,
+        ),
+    ];
+    let _ = persist_chat_turn(
+        state,
+        &persistence_payload,
+        &session_id,
+        &turn_id,
+        &trace,
+        &events,
+    );
+
+    for event in &events {
+        if event["type"] != "done" {
+            body.push_str(&sse("stream", event.clone()));
+        }
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "turn_id": turn_id,
+                "result": result
+            },
+            "elapsed_ms": 1
+        }),
+    ));
+
+    sse_response(body).into_response()
+}
+
+fn build_deep_question_result(effective_content: &str, config: &Value) -> Value {
+    let mode = normalize_deep_question_mode(
+        config["mode"]
+            .as_str()
+            .or_else(|| config["question_mode"].as_str())
+            .unwrap_or("custom"),
+    );
+    let requested = deep_question_count(config);
+    let question_type = normalize_deep_question_type(
+        config["question_type"]
+            .as_str()
+            .or_else(|| config["type"].as_str())
+            .unwrap_or("choice"),
+    );
+    let difficulty = config["difficulty"].as_str().unwrap_or("medium");
+    let topic = deep_question_topic(effective_content, config, &mode);
+    let mut results = Vec::new();
+    let mut response_sections = Vec::new();
+    for index in 0..requested {
+        let number = index + 1;
+        let stem = format!(
+            "Question {number}: Which statement best reflects {topic} for a {difficulty} learner?"
+        );
+        let options = json!({
+            "A": format!("A focused explanation of {topic}"),
+            "B": "An unrelated distractor that ignores the supplied material",
+            "C": "A partial answer without evidence",
+            "D": "A response that changes the topic"
+        });
+        let explanation =
+            format!("The correct answer stays grounded in the requested topic: {topic}.");
+        response_sections.push(format!(
+            "### Question {number}\n{stem}\n\nA. {}\nB. {}\nC. {}\nD. {}\n\n**Answer:** A\n\n**Explanation:** {explanation}",
+            options["A"].as_str().unwrap_or_default(),
+            options["B"].as_str().unwrap_or_default(),
+            options["C"].as_str().unwrap_or_default(),
+            options["D"].as_str().unwrap_or_default()
+        ));
+        results.push(json!({
+            "status": "success",
+            "qa_pair": {
+                "question_id": format!("q_{number}"),
+                "question": stem,
+                "options": options,
+                "correct_answer": "A",
+                "explanation": explanation,
+                "question_type": question_type,
+                "difficulty": difficulty,
+                "concentration": topic,
+                "knowledge_context": topic,
+                "metadata": {
+                    "knowledge_context": topic,
+                    "mode": mode
+                }
+            }
+        }));
+    }
+    let response = response_sections.join("\n\n");
+    json!({
+        "response": response,
+        "content": response,
+        "mode": mode,
+        "summary": {
+            "success": true,
+            "requested": requested,
+            "completed": requested,
+            "failed": 0,
+            "results": results
+        }
+    })
+}
+
+fn build_deep_question_followup_result(user_question: &str, config: &Value) -> Option<Value> {
+    let context = config["followup_question_context"].as_object()?;
+    let question = context
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let question_id = context
+        .get("question_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("q_1");
+    let correct_answer = context
+        .get("correct_answer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the expected answer");
+    let user_answer = context
+        .get("user_answer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("your submitted answer");
+    let explanation = context
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(question);
+    let learner_question = user_question.trim();
+    let response = format!(
+        "Follow-up for {question_id}: {learner_question}\n\nThe referenced question was: {question}\n\nYour answer was {user_answer}. The expected answer is {correct_answer}. {explanation}"
+    );
+
+    Some(json!({
+        "response": response,
+        "content": response,
+        "mode": "followup",
+        "question_id": question_id,
+        "metadata": {
+            "cost_summary": {
+                "total_cost_usd": 0,
+                "total_tokens": 0,
+                "total_calls": 0
+            }
+        }
+    }))
+}
+
+fn build_deep_question_answer_now_result(effective_content: &str, config: &Value) -> Option<Value> {
+    config["answer_now_context"].as_object()?;
+    let base = build_deep_question_result(effective_content, config);
+    let base_response = base["response"].as_str().unwrap_or_default();
+    let response = format!(
+        "> Skipped ideation and generated the requested quiz immediately.\n\n{base_response}"
+    );
+    let mut summary = base["summary"].clone();
+    summary["mode"] = json!("answer_now");
+    if let Some(results) = summary["results"].as_array_mut() {
+        for item in results {
+            item["metadata"] = json!({ "answer_now": true });
+        }
+    }
+
+    Some(json!({
+        "response": response,
+        "content": response,
+        "mode": "answer_now",
+        "summary": summary,
+        "metadata": {
+            "answer_now": true,
+            "cost_summary": {
+                "total_cost_usd": 0,
+                "total_tokens": 0,
+                "total_calls": 0
+            }
+        }
+    }))
+}
+
+fn deep_question_count(config: &Value) -> usize {
+    config["num_questions"]
+        .as_u64()
+        .or_else(|| config["max_questions"].as_u64())
+        .or_else(|| config["count"].as_u64())
+        .unwrap_or(1)
+        .clamp(1, 50) as usize
+}
+
+fn normalize_deep_question_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mimic" => "mimic".to_string(),
+        "followup" | "follow_up" => "followup".to_string(),
+        _ => "custom".to_string(),
+    }
+}
+
+fn normalize_deep_question_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "multiple_choice" | "single_choice" | "mcq" | "choice" => "choice".to_string(),
+        "short_answer" | "short" => "short_answer".to_string(),
+        "true_false" | "boolean" => "true_false".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "choice".to_string(),
+    }
+}
+
+fn deep_question_topic(effective_content: &str, config: &Value, mode: &str) -> String {
+    let configured = config["topic"]
+        .as_str()
+        .or_else(|| config["requirement"].as_str())
+        .or_else(|| config["paper_path"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let source = if mode == "mimic" {
+        effective_content.trim()
+    } else {
+        configured.unwrap_or_else(|| effective_content.trim())
+    };
+    let cleaned = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && *line != "[Attached Documents]"
+                && *line != "[User Question]"
+                && !line.starts_with("Filename:")
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let topic = if cleaned.is_empty() {
+        "the requested topic"
+    } else {
+        cleaned.as_str()
+    };
+    truncate_for_prompt(topic, 180)
+}
+
+fn deep_question_trace(effective_content: &str, response: &str, result: &Value) -> StudyTrace {
+    let mut trace =
+        SocartesOrchestrator::new().run_with_retrieved_context(effective_content, "", Vec::new());
+    trace.final_answer = response.to_string();
+    trace.draft.content = response.to_string();
+    trace.draft.open_gaps = Vec::new();
+    trace.review.status = "approved".to_string();
+    trace.review.approved = true;
+    trace.reflection_events.push(ReflectionEvent {
+        event_type: "self_correction".to_string(),
+        agent: "question_critic".to_string(),
+        message: format!(
+            "Generated {} normalized quiz questions for deep_question.",
+            result["summary"]["completed"].as_u64().unwrap_or_default()
+        ),
+    });
+    trace
 }
 
 fn plugin_request_params(payload: &Value) -> Value {
@@ -10357,6 +23005,7 @@ async fn plugin_tool_result(
     state: &AppState,
     tool_name: &str,
     params: Value,
+    auth_payload: Option<&AuthTokenPayload>,
 ) -> Result<Value, ApiError> {
     if !plugin_tool_names().contains(&tool_name) {
         return Err(api_error(
@@ -10383,8 +23032,24 @@ async fn plugin_tool_result(
             let kb_names = string_param(&params, "kb_name")
                 .filter(|value| !value.is_empty())
                 .map(|value| vec![value.to_string()])
-                .unwrap_or_else(|| vec![read_default_knowledge_base(state)]);
-            let chunks = retrieve_chat_context(state, query, &kb_names).await;
+                .unwrap_or_else(|| {
+                    if auth_payload.is_some_and(|payload| payload.role != "admin") {
+                        Vec::new()
+                    } else {
+                        vec![read_default_knowledge_base(state)]
+                    }
+                });
+            if kb_names.is_empty() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "No knowledge base selected. Pass kb_name explicitly or set a default.",
+                ));
+            }
+            let chunks = if let Some(payload) = auth_payload {
+                retrieve_chat_context_for_auth(state, query, &kb_names, payload).await?
+            } else {
+                retrieve_chat_context(state, query, &kb_names).await
+            };
             let content = if chunks.is_empty() {
                 format!("No Socartes knowledge base passages matched query: {query}")
             } else {
@@ -10422,13 +23087,24 @@ async fn plugin_tool_result(
         }
         "web_search" => {
             let query = string_param(&params, "query").unwrap_or_default();
+            let catalog = load_settings_catalog(state);
+            let config = resolve_search_runtime_config(&catalog);
+            let result = run_web_search(&config, query).await.map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Web search provider request failed: {error}"),
+                )
+            })?;
+            let content = if result.answer.trim().is_empty() {
+                format_search_results_answer(query, &result.search_results)
+            } else {
+                result.answer.clone()
+            };
             (
                 true,
-                format!(
-                    "Web search compatibility result for '{query}'. Configure a live search provider for network retrieval."
-                ),
-                json!([{ "type": "web", "title": "Socartes Rust compatibility search", "url": "" }]),
-                json!({ "provider": "compatibility", "query": query }),
+                content,
+                web_search_sources(&result),
+                web_search_metadata(&config, &result, query),
             )
         }
         "code_execution" => {
@@ -10676,6 +23352,7 @@ async fn execute_chat_provider_tool_calls(
     knowledge_bases: &[String],
     fallback_query: &str,
     tool_calls: &[Value],
+    auth_payload: Option<&AuthTokenPayload>,
 ) -> (Vec<Value>, Vec<ToolResult>, Vec<Value>) {
     let enabled = enabled_tools
         .iter()
@@ -10699,7 +23376,7 @@ async fn execute_chat_provider_tool_calls(
             .unwrap_or_else(|| format!("call_{index}"));
         let params = chat_provider_tool_params(tool_call, name, knowledge_bases, fallback_query);
         let result = if enabled.contains(name) && allowed.contains(&name) {
-            match plugin_tool_result(state, name, params.clone()).await {
+            match plugin_tool_result(state, name, params.clone(), auth_payload).await {
                 Ok(value) => value,
                 Err((status, Json(error))) => {
                     let detail = error["detail"].as_str().unwrap_or("tool execution failed");
@@ -10982,15 +23659,41 @@ fn sse_response(body: String) -> impl IntoResponse {
     )
 }
 
-async fn list_skills(State(state): State<AppState>) -> impl IntoResponse {
-    match skill_summaries(&state) {
+fn sse_stream_response(
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>,
+) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn list_skills(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    match scoped_skill_summaries(&state, &payload) {
         Ok(skills) => Json(json!({ "skills": skills })).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn get_skill(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
-    match read_skill_detail(&state, &name) {
+async fn get_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    match read_scoped_skill_detail(&state, &payload, &name) {
         Ok(detail) => Json(detail).into_response(),
         Err(error) => error.into_response(),
     }
@@ -10998,9 +23701,15 @@ async fn get_skill(State(state): State<AppState>, Path(name): Path<String>) -> i
 
 async fn create_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    match create_skill_value(&state, &payload) {
+    let auth_payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let scoped_state = writable_skill_state(&state, &auth_payload);
+    match create_skill_value(&scoped_state, &payload) {
         Ok(info) => Json(info).into_response(),
         Err(error) => error.into_response(),
     }
@@ -11008,10 +23717,16 @@ async fn create_skill(
 
 async fn update_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    match update_skill_value(&state, &name, &payload) {
+    let auth_payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let scoped_state = writable_skill_state(&state, &auth_payload);
+    match update_skill_value(&scoped_state, &name, &payload) {
         Ok(info) => Json(info).into_response(),
         Err(error) => error.into_response(),
     }
@@ -11019,12 +23734,108 @@ async fn update_skill(
 
 async fn delete_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match delete_skill_value(&state, &name) {
+    let auth_payload = match require_auth(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return (*response).into_response(),
+    };
+    let scoped_state = writable_skill_state(&state, &auth_payload);
+    match delete_skill_value(&scoped_state, &name) {
         Ok(name) => Json(json!({ "status": "deleted", "name": name })).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn writable_skill_state(state: &AppState, payload: &AuthTokenPayload) -> AppState {
+    if payload.role == "admin" {
+        state.clone()
+    } else {
+        state_with_skills_root(state, user_skills_root(state, &payload.user_id))
+    }
+}
+
+fn annotate_skill_info(mut value: Value, source: &str, assigned: bool, read_only: bool) -> Value {
+    value["source"] = json!(source);
+    value["assigned"] = json!(assigned);
+    value["read_only"] = json!(read_only);
+    value
+}
+
+fn skill_info_from_detail(detail: &SkillDetailData) -> Value {
+    skill_info_json(&detail.name, &detail.description, &detail.tags)
+}
+
+fn scoped_skill_summaries(
+    state: &AppState,
+    payload: &AuthTokenPayload,
+) -> Result<Vec<Value>, ApiError> {
+    if payload.role == "admin" {
+        return skill_summaries(state).map(|items| {
+            items
+                .into_iter()
+                .map(|item| annotate_skill_info(item, "admin", false, false))
+                .collect()
+        });
+    }
+
+    let user_state = state_with_skills_root(state, user_skills_root(state, &payload.user_id));
+    let mut skills = skill_summaries(&user_state)?
+        .into_iter()
+        .map(|item| annotate_skill_info(item, "user", false, false))
+        .collect::<Vec<_>>();
+    let mut seen = skills
+        .iter()
+        .filter_map(|item| item["name"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+
+    let grant = load_settings_grant(state, &payload.user_id);
+    for skill_id in assigned_skill_ids_from_grant(&grant) {
+        let slug = validate_skill_name(&skill_id)?;
+        if seen.contains(&slug) {
+            continue;
+        }
+        if let Ok(detail) = read_skill_detail_data(state, &slug) {
+            seen.insert(slug);
+            skills.push(annotate_skill_info(
+                skill_info_from_detail(&detail),
+                "admin",
+                true,
+                true,
+            ));
+        }
+    }
+    Ok(skills)
+}
+
+fn read_scoped_skill_detail(
+    state: &AppState,
+    payload: &AuthTokenPayload,
+    name: &str,
+) -> Result<Value, ApiError> {
+    if payload.role == "admin" {
+        return read_skill_detail(state, name)
+            .map(|detail| annotate_skill_info(detail, "admin", false, false));
+    }
+
+    let user_state = state_with_skills_root(state, user_skills_root(state, &payload.user_id));
+    if let Ok(detail) = read_skill_detail(&user_state, name) {
+        return Ok(annotate_skill_info(detail, "user", false, false));
+    }
+
+    let slug = validate_skill_name(name)?;
+    let grant = load_settings_grant(state, &payload.user_id);
+    if !assigned_skill_ids_from_grant(&grant)
+        .iter()
+        .any(|id| id == &slug)
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Skill is not assigned to you",
+        ));
+    }
+    read_skill_detail(state, &slug).map(|detail| annotate_skill_info(detail, "admin", true, true))
 }
 
 async fn list_skill_tags(State(state): State<AppState>) -> impl IntoResponse {
@@ -12145,17 +24956,524 @@ fn memory_excerpt(value: &str, max_chars: usize) -> String {
 
 async fn run_test_chat_turn(
     State(state): State<AppState>,
+    Extension(auth_payload): Extension<AuthTokenPayload>,
     Json(payload): Json<Value>,
-) -> Json<Value> {
-    let (session_id, turn_id, _) = execute_chat_turn(&state, &payload).await;
-    Json(json!({ "session_id": session_id, "turn_id": turn_id }))
+) -> Response {
+    match execute_chat_turn_checked(&state, &payload, Some(&auth_payload)).await {
+        Ok((session_id, turn_id, _)) => {
+            Json(json!({ "session_id": session_id, "turn_id": turn_id })).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
 }
 
-async fn chat_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_chat_socket(socket, state))
+async fn chat_ws(
+    State(state): State<AppState>,
+    Query(query): Query<UnifiedWsAuthQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let auth_payload = if state.auth_enabled {
+        let token = extract_unified_ws_token(&headers, &query);
+        let payload = match token.as_deref() {
+            Some(token) => validate_auth_token(&state, token).await,
+            None => None,
+        };
+        let Some(payload) = payload else {
+            return ws.on_upgrade(close_unauthorized_ws);
+        };
+        Some(payload)
+    } else {
+        None
+    };
+    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, auth_payload))
 }
 
-async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
+async fn close_unauthorized_ws(mut socket: WebSocket) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 4001,
+            reason: "".into(),
+        })))
+        .await;
+}
+
+async fn legacy_chat_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let auth_payload = match require_ws_auth_response(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    ws.on_upgrade(move |socket| handle_legacy_chat_socket(socket, state, auth_payload))
+        .into_response()
+}
+
+async fn legacy_solve_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let auth_payload = match require_ws_auth_response(&state, &headers) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    ws.on_upgrade(move |socket| handle_legacy_solve_socket(socket, state, auth_payload))
+        .into_response()
+}
+
+async fn handle_legacy_chat_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    auth_payload: AuthTokenPayload,
+) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let Message::Text(text) = message else {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            continue;
+        };
+
+        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+            let _ = send_legacy_ws_json(
+                &mut socket,
+                json!({"type": "error", "message": "Invalid WebSocket JSON message."}),
+            )
+            .await;
+            continue;
+        };
+        let user_message = payload["message"].as_str().unwrap_or_default().trim();
+        if user_message.is_empty() {
+            let _ = send_legacy_ws_json(
+                &mut socket,
+                json!({"type": "error", "message": "Message is required"}),
+            )
+            .await;
+            continue;
+        }
+
+        let enable_rag = payload["enable_rag"].as_bool().unwrap_or(false);
+        let enable_web_search = payload["enable_web_search"].as_bool().unwrap_or(false);
+        let kb_name = payload["kb_name"].as_str().unwrap_or_default().trim();
+        let knowledge_bases = if enable_rag && !kb_name.is_empty() {
+            json!([kb_name])
+        } else {
+            json!([])
+        };
+        let mut tools = Vec::new();
+        if enable_rag {
+            tools.push("rag");
+        }
+        if enable_web_search {
+            tools.push("web_search");
+        }
+        let chat_payload = json!({
+            "type": "start_turn",
+            "content": user_message,
+            "session_id": payload.get("session_id").cloned().unwrap_or(Value::Null),
+            "language": payload.get("language").cloned().unwrap_or_else(|| json!("en")),
+            "history": payload.get("history").cloned().unwrap_or(Value::Null),
+            "capability": "chat",
+            "knowledge_bases": knowledge_bases,
+            "tools": tools
+        });
+        let (session_id, _, events) =
+            execute_chat_turn(&state, &chat_payload, Some(&auth_payload)).await;
+        if !send_legacy_ws_json(
+            &mut socket,
+            json!({"type": "session", "session_id": session_id}),
+        )
+        .await
+        {
+            break;
+        }
+        if enable_rag && !kb_name.is_empty() {
+            let _ = send_legacy_ws_json(
+                &mut socket,
+                json!({
+                    "type": "status",
+                    "stage": "rag",
+                    "message": format!("Searching knowledge base: {kb_name}...")
+                }),
+            )
+            .await;
+        }
+        if enable_web_search {
+            let _ = send_legacy_ws_json(
+                &mut socket,
+                json!({
+                    "type": "status",
+                    "stage": "web",
+                    "message": "Searching the web..."
+                }),
+            )
+            .await;
+        }
+        let _ = send_legacy_ws_json(
+            &mut socket,
+            json!({
+                "type": "status",
+                "stage": "generating",
+                "message": "Generating response..."
+            }),
+        )
+        .await;
+        if !emit_legacy_chat_events(&mut socket, &events).await {
+            break;
+        }
+    }
+}
+
+async fn handle_legacy_solve_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    auth_payload: AuthTokenPayload,
+) {
+    let Some(Ok(message)) = socket.recv().await else {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let Message::Text(text) = message else {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        let _ = send_legacy_ws_json(
+            &mut socket,
+            json!({"type": "error", "content": "Invalid WebSocket JSON message."}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let question = payload["question"].as_str().unwrap_or_default().trim();
+    if question.is_empty() {
+        let _ = send_legacy_ws_json(
+            &mut socket,
+            json!({"type": "error", "content": "Question is required"}),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
+    let enabled_tools = payload["tools"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            LEGACY_DEEP_SOLVE_DEFAULT_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect()
+        });
+    let rag_enabled = enabled_tools.iter().any(|tool| tool == "rag");
+    let kb_name = if rag_enabled {
+        if payload.get("kb_name").is_some() {
+            payload["kb_name"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            Some(LEGACY_DEEP_SOLVE_DEFAULT_KB)
+        }
+    } else {
+        None
+    };
+    let solve_payload = json!({
+        "type": "start_turn",
+        "content": question,
+        "session_id": payload.get("session_id").cloned().unwrap_or(Value::Null),
+        "language": payload.get("language").cloned().unwrap_or_else(|| json!("en")),
+        "capability": "deep_solve",
+        "knowledge_bases": if rag_enabled {
+            kb_name.map(|name| json!([name])).unwrap_or_else(|| json!([]))
+        } else {
+            json!([])
+        },
+        "tools": enabled_tools
+    });
+    let (session_id, turn_id, events) =
+        execute_chat_turn(&state, &solve_payload, Some(&auth_payload)).await;
+    let task_id = knowledge_task_id("solve");
+    let _ = send_legacy_ws_json(
+        &mut socket,
+        json!({"type": "session", "session_id": session_id}),
+    )
+    .await;
+    let _ = send_legacy_ws_json(&mut socket, json!({"type": "task_id", "task_id": task_id})).await;
+    let _ = send_legacy_ws_json(&mut socket, json!({"type": "status", "content": "started"})).await;
+    for event in legacy_solve_initial_events() {
+        let _ = send_legacy_ws_json(&mut socket, event).await;
+    }
+
+    if let Some(error) = terminal_error_message(&events) {
+        let _ = send_legacy_ws_json(&mut socket, json!({"type": "error", "content": error})).await;
+    } else {
+        for event in legacy_solve_success_phase_events(&events) {
+            let _ = send_legacy_ws_json(&mut socket, event).await;
+        }
+        let final_answer = events
+            .iter()
+            .find(|event| event["type"] == "content")
+            .and_then(|event| event["content"].as_str())
+            .unwrap_or_default();
+        let status = final_turn_status(&events);
+        let (output_dir, output_dir_name, metadata, public_final_answer) =
+            match write_legacy_solve_output(&state, final_answer, &task_id, &turn_id, &status) {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = send_legacy_ws_json(
+                        &mut socket,
+                        json!({"type": "error", "content": api_error_detail(&error)}),
+                    )
+                    .await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+            };
+        let _ = send_legacy_ws_json(
+            &mut socket,
+            json!({
+                "type": "result",
+                "session_id": session_id,
+                "final_answer": public_final_answer,
+                "output_dir": output_dir,
+                "output_dir_name": output_dir_name,
+                "metadata": metadata
+            }),
+        )
+        .await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn write_legacy_solve_output(
+    state: &AppState,
+    final_answer: &str,
+    task_id: &str,
+    turn_id: &str,
+    status: &str,
+) -> Result<(String, String, Value, String), ApiError> {
+    let output_dir_name = Utc::now().format("solve_%Y%m%d_%H%M%S").to_string();
+    let output_dir = state
+        .output_root
+        .join("workspace")
+        .join("chat")
+        .join("deep_solve")
+        .join(&output_dir_name);
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create solve output directory: {error}"),
+        )
+    })?;
+    fs::write(output_dir.join("final_answer.md"), final_answer).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write solve final answer: {error}"),
+        )
+    })?;
+    fs::write(
+        output_dir.join("task.log"),
+        format!("Problem solving completed\nTask: {task_id}\nTurn: {turn_id}\n"),
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write solve task log: {error}"),
+        )
+    })?;
+
+    let output_dir_string = output_dir.to_string_lossy().to_string();
+    let public_final_answer = legacy_solve_public_artifact_links(final_answer, &output_dir_name);
+    let metadata = json!({
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "status": status,
+        "mode": "plan_react_write",
+        "timestamp": output_dir_name.trim_start_matches("solve_"),
+        "output_dir": output_dir_string,
+        "total_steps": 1,
+        "completed_steps": if final_answer.trim().is_empty() { 0 } else { 1 },
+        "plan_revisions": 0
+    });
+    Ok((
+        output_dir_string,
+        output_dir_name,
+        metadata,
+        public_final_answer,
+    ))
+}
+
+fn legacy_solve_public_artifact_links(final_answer: &str, output_dir_name: &str) -> String {
+    final_answer.replace(
+        "](artifacts/",
+        &format!("](/api/outputs/workspace/chat/deep_solve/{output_dir_name}/artifacts/"),
+    )
+}
+
+fn legacy_solve_initial_events() -> Vec<Value> {
+    vec![
+        legacy_solve_agent_status_event("all", "initial", "pending", "pending", "pending"),
+        json!({"type": "token_stats", "stats": legacy_solve_empty_token_stats()}),
+    ]
+}
+
+fn legacy_solve_success_phase_events(events: &[Value]) -> Vec<Value> {
+    vec![
+        legacy_solve_agent_status_event("PlannerAgent", "running", "running", "pending", "pending"),
+        json!({"type": "progress", "stage": "plan", "progress": {"status": "planning"}}),
+        legacy_solve_agent_status_event("PlannerAgent", "done", "done", "pending", "pending"),
+        legacy_solve_agent_status_event("SolverAgent", "running", "done", "running", "pending"),
+        json!({"type": "progress", "stage": "solve", "progress": {"status": "starting"}}),
+        legacy_solve_agent_status_event("SolverAgent", "done", "done", "done", "pending"),
+        legacy_solve_agent_status_event("WriterAgent", "running", "done", "done", "running"),
+        json!({"type": "progress", "stage": "write", "progress": {"status": "writing"}}),
+        json!({"type": "token_stats", "stats": legacy_solve_token_stats(events)}),
+        legacy_solve_agent_status_event("WriterAgent", "done", "done", "done", "done"),
+        legacy_solve_agent_status_event("all", "complete", "done", "done", "done"),
+    ]
+}
+
+fn legacy_solve_agent_status_event(
+    agent: &str,
+    status: &str,
+    planner_status: &str,
+    solver_status: &str,
+    writer_status: &str,
+) -> Value {
+    json!({
+        "type": "agent_status",
+        "agent": agent,
+        "status": status,
+        "all_agents": {
+            "PlannerAgent": planner_status,
+            "SolverAgent": solver_status,
+            "WriterAgent": writer_status
+        }
+    })
+}
+
+fn legacy_solve_empty_token_stats() -> Value {
+    json!({
+        "model": "Unknown",
+        "calls": 0,
+        "tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost": 0.0
+    })
+}
+
+fn legacy_solve_token_stats(events: &[Value]) -> Value {
+    let mut stats = legacy_solve_empty_token_stats();
+
+    for event in events {
+        let usage = &event["metadata"]["usage"];
+        if !usage.is_object() {
+            continue;
+        }
+        let input_tokens = parse_i64_field(&usage["prompt_tokens"])
+            .or_else(|| parse_i64_field(&usage["input_tokens"]))
+            .unwrap_or(0);
+        let output_tokens = parse_i64_field(&usage["completion_tokens"])
+            .or_else(|| parse_i64_field(&usage["output_tokens"]))
+            .unwrap_or(0);
+        let tokens =
+            parse_i64_field(&usage["total_tokens"]).unwrap_or(input_tokens + output_tokens);
+        if tokens <= 0 && input_tokens <= 0 && output_tokens <= 0 {
+            continue;
+        }
+        stats = json!({
+            "model": event["metadata"]["model"]
+                .as_str()
+                .unwrap_or("Unknown"),
+            "calls": 1,
+            "tokens": tokens,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": usage["cost"]["total_cost"]
+                .as_f64()
+                .or_else(|| usage["total_cost_usd"].as_f64())
+                .unwrap_or(0.0)
+        });
+        break;
+    }
+
+    stats
+}
+
+async fn emit_legacy_chat_events(socket: &mut WebSocket, events: &[Value]) -> bool {
+    let mut final_content = String::new();
+    for event in events {
+        match event["type"].as_str().unwrap_or_default() {
+            "sources" => {
+                let rag_sources = event["metadata"]["sources"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let web_sources = event["metadata"]["web_sources"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if (!rag_sources.is_empty() || !web_sources.is_empty())
+                    && !send_legacy_ws_json(
+                        socket,
+                        json!({"type": "sources", "rag": rag_sources, "web": web_sources}),
+                    )
+                    .await
+                {
+                    return false;
+                }
+            }
+            "content" => {
+                let content = event["content"].as_str().unwrap_or_default();
+                final_content.push_str(content);
+                if !send_legacy_ws_json(socket, json!({"type": "stream", "content": content})).await
+                {
+                    return false;
+                }
+            }
+            "error" => {
+                let message = event["content"].as_str().unwrap_or("Chat turn failed");
+                return send_legacy_ws_json(socket, json!({"type": "error", "message": message}))
+                    .await;
+            }
+            "done" => {
+                if event["metadata"]["status"].as_str() == Some("completed") {
+                    return send_legacy_ws_json(
+                        socket,
+                        json!({"type": "result", "content": final_content}),
+                    )
+                    .await;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+async fn send_legacy_ws_json(socket: &mut WebSocket, value: Value) -> bool {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .is_ok()
+}
+
+async fn handle_chat_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    auth_payload: Option<AuthTokenPayload>,
+) {
     while let Some(Ok(message)) = socket.recv().await {
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
@@ -12183,11 +25501,17 @@ async fn handle_chat_socket(mut socket: WebSocket, state: AppState) {
 
         match payload["type"].as_str().unwrap_or_default() {
             "start_turn" | "message" => {
-                run_chat_turn(&mut socket, &state, &payload).await;
+                run_chat_turn(&mut socket, &state, &payload, auth_payload.as_ref()).await;
             }
             "regenerate" => match regenerate_chat_payload(&state, &payload).await {
                 Ok(regenerate_payload) => {
-                    run_chat_turn(&mut socket, &state, &regenerate_payload).await;
+                    run_chat_turn(
+                        &mut socket,
+                        &state,
+                        &regenerate_payload,
+                        auth_payload.as_ref(),
+                    )
+                    .await;
                 }
                 Err(reason) => {
                     let _ = send_rejected_turn_error(&mut socket, &payload, &reason, true).await;
@@ -12285,7 +25609,7 @@ async fn replay_turn_events(socket: &mut WebSocket, state: &AppState, payload: &
         replay_live_turn_events(socket, state, turn_id, live_turn, after_seq).await;
         return;
     }
-    match read_turn_events(state, turn_id, after_seq) {
+    match read_turn_events(state, turn_id, after_seq).await {
         Ok(events) => {
             for event in events {
                 if send_stream_event(socket, event).await.is_err() {
@@ -12312,7 +25636,7 @@ async fn replay_session_events(socket: &mut WebSocket, state: &AppState, payload
         replay_live_turn_events(socket, state, &turn_id, live_turn, after_seq).await;
         return;
     }
-    match latest_session_turn_events(state, session_id, after_seq) {
+    match latest_session_turn_events(state, session_id, after_seq).await {
         Ok(events) => {
             for event in events {
                 if send_stream_event(socket, event).await.is_err() {
@@ -12334,7 +25658,7 @@ async fn replay_live_turn_events(
     after_seq: u64,
 ) {
     let mut last_seq = after_seq;
-    if let Ok(events) = read_turn_events(state, turn_id, after_seq) {
+    if let Ok(events) = read_turn_events(state, turn_id, after_seq).await {
         for event in events {
             last_seq = last_seq.max(event["seq"].as_u64().unwrap_or_default());
             if send_stream_event(socket, event).await.is_err() {
@@ -12371,7 +25695,7 @@ async fn replay_live_turn_events(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
-                if let Ok(events) = read_turn_events(state, turn_id, last_seq) {
+                if let Ok(events) = read_turn_events(state, turn_id, last_seq).await {
                     for event in events {
                         let seq = event["seq"].as_u64().unwrap_or_default();
                         if seq <= last_seq {
@@ -12403,7 +25727,7 @@ async fn cancel_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Va
         return;
     }
 
-    match mark_stored_turn_cancelled(state, turn_id) {
+    match mark_stored_turn_cancelled(state, turn_id).await {
         Ok(true) => {}
         Ok(false) => {
             let _ = send_protocol_error(socket, &format!("Turn not found: {turn_id}")).await;
@@ -12428,7 +25752,14 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
         return Err("regenerate_busy".to_string());
     }
 
-    let mut session = read_session(state, session_id).map_err(|_| "nothing_to_regenerate")?;
+    let pocketbase_session = session_pocketbase_enabled(state);
+    let mut session = if pocketbase_session {
+        read_session_pocketbase(state, session_id)
+            .await
+            .map_err(|_| "nothing_to_regenerate")?
+    } else {
+        read_session(state, session_id).map_err(|_| "nothing_to_regenerate")?
+    };
     if session["active_turn_id"].as_str().is_some()
         || session["active_turns"]
             .as_array()
@@ -12438,20 +25769,7 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
     }
 
     let overrides = payload["overrides"].as_object();
-    let override_llm_selection = overrides
-        .and_then(|object| object.get("llm_selection"))
-        .filter(|value| !value.is_null())
-        .cloned();
-    let preference_llm_selection = {
-        let value = session["preferences"]["llm_selection"].clone();
-        (!value.is_null()).then_some(value)
-    };
-    let llm_selection = override_llm_selection.or(preference_llm_selection);
-    if let Some(selection) = &llm_selection {
-        validate_llm_selection_value(state, selection)?;
-    }
-
-    let Some(messages) = session["messages"].as_array_mut() else {
+    let Some(messages) = session["messages"].as_array() else {
         return Err("nothing_to_regenerate".to_string());
     };
     let Some(last_user_index) = messages
@@ -12461,7 +25779,8 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
         return Err("nothing_to_regenerate".to_string());
     };
     let last_user = messages[last_user_index].clone();
-    let last_user_id = last_user["id"].as_u64().unwrap_or_default();
+    let last_user_id = last_user["id"].clone();
+    let request_snapshot = chat_message_request_snapshot(&last_user);
     let previous_turn_id = messages.last().and_then(|message| {
         if message["role"] != "assistant" {
             return None;
@@ -12477,13 +25796,45 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
                     .find_map(|event| event["turn_id"].as_str().map(ToString::to_string))
             })
     });
-    if messages
-        .last()
-        .is_some_and(|message| message["role"] == "assistant")
-    {
-        messages.pop();
+
+    let snapshot_value = |key: &str| -> Option<Value> {
+        request_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(key))
+            .cloned()
+    };
+    let override_llm_selection = overrides
+        .and_then(|object| object.get("llm_selection"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let snapshot_llm_selection = snapshot_value("llmSelection").filter(|value| !value.is_null());
+    let preference_llm_selection = {
+        let value = session["preferences"]["llm_selection"].clone();
+        (!value.is_null()).then_some(value)
+    };
+    let llm_selection = override_llm_selection
+        .or(snapshot_llm_selection)
+        .or(preference_llm_selection);
+    if let Some(selection) = &llm_selection {
+        validate_llm_selection_value(state, selection)?;
     }
-    write_session(state, session_id, &session).map_err(|_| "nothing_to_regenerate")?;
+
+    if pocketbase_session {
+        delete_tail_assistant_message_pocketbase(state, &session)
+            .await
+            .map_err(|_| "nothing_to_regenerate".to_string())?;
+    } else {
+        let Some(messages) = session["messages"].as_array_mut() else {
+            return Err("nothing_to_regenerate".to_string());
+        };
+        if messages
+            .last()
+            .is_some_and(|message| message["role"] == "assistant")
+        {
+            messages.pop();
+        }
+        write_session(state, session_id, &session).map_err(|_| "nothing_to_regenerate")?;
+    }
 
     let preferences = session["preferences"].as_object();
     let override_value =
@@ -12496,7 +25847,7 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
     }
     config["_persist_user_message"] = json!(false);
     config["_regenerate"] = json!(true);
-    config["_regenerated_from_message_id"] = json!(last_user_id);
+    config["_regenerated_from_message_id"] = last_user_id;
     if let Some(previous_turn_id) = previous_turn_id {
         config["_superseded_turn_id"] = json!(previous_turn_id);
     }
@@ -12525,13 +25876,22 @@ async fn regenerate_chat_payload(state: &AppState, payload: &Value) -> Result<Va
         "history_references": override_value("history_references")
             .or_else(|| preference_value("history_references"))
             .unwrap_or_else(|| json!([])),
-        "book_references": override_value("book_references").unwrap_or_else(|| json!([])),
+        "book_references": override_value("book_references")
+            .or_else(|| snapshot_value("bookReferences"))
+            .unwrap_or_else(|| json!([])),
         "config": config
     });
     if let Some(llm_selection) = llm_selection {
         regenerate["llm_selection"] = llm_selection;
     }
     Ok(regenerate)
+}
+
+fn chat_message_request_snapshot(message: &Value) -> Option<Map<String, Value>> {
+    message["metadata"]["request_snapshot"]
+        .as_object()
+        .cloned()
+        .or_else(|| message["metadata"]["requestSnapshot"].as_object().cloned())
 }
 
 async fn send_api_error_as_stream(
@@ -12630,7 +25990,12 @@ async fn drain_chat_control_messages(
     }
 }
 
-async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value) {
+async fn run_chat_turn(
+    socket: &mut WebSocket,
+    state: &AppState,
+    payload: &Value,
+    auth_payload: Option<&AuthTokenPayload>,
+) {
     let mut payload = payload.clone();
     resolve_chat_llm_selection(state, &mut payload);
     if let Err(reason) = validate_llm_selection(state, &payload) {
@@ -12639,19 +26004,72 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         return;
     }
 
-    let turn = build_chat_turn(state, &payload).await;
-    let live_turn = state
-        .chat_runtime
-        .register_turn(&turn.turn_id, &turn.session_id)
-        .await;
-    let persistence_payload = &turn.persistence_payload;
+    let stream_process = should_stream_chat_process(&payload);
+    let seeded_identity = stream_process.then(|| {
+        let identity = chat_turn_identity_from_payload(&payload);
+        if payload["session_id"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            payload["session_id"] = json!(identity.session_id.clone());
+        }
+        identity
+    });
+    let live_turn = if let Some(identity) = seeded_identity.as_ref() {
+        state
+            .chat_runtime
+            .register_turn(&identity.turn_id, &identity.session_id)
+            .await
+    } else {
+        LiveChatTurn::placeholder()
+    };
     let delay_ms = payload["config"]["debug_stream_delay_ms"]
         .as_u64()
         .unwrap_or_default();
     let mut delivered_events = Vec::new();
     let mut socket_open = true;
     let mut final_persisted = false;
-    for event in turn.events {
+
+    if let Some(identity) = seeded_identity.as_ref() {
+        for event in chat_process_prelude_events(&payload, identity) {
+            let control =
+                drain_chat_control_messages(socket, state, &identity.turn_id, &live_turn).await;
+            socket_open &= !control.socket_closed;
+            if live_turn.cancel_requested.load(Ordering::SeqCst) {
+                break;
+            }
+            let _ = publish_chat_event(state, &payload, &live_turn, event.clone()).await;
+            delivered_events.push(event.clone());
+            if socket_open && send_stream_event(socket, event).await.is_err() {
+                socket_open = false;
+            }
+        }
+    }
+
+    let turn = build_chat_turn_with_identity(state, &payload, auth_payload, seeded_identity).await;
+    let live_turn = if stream_process {
+        live_turn
+    } else {
+        state
+            .chat_runtime
+            .register_turn(&turn.turn_id, &turn.session_id)
+            .await
+    };
+    let persistence_payload = &turn.persistence_payload;
+    let next_seq = delivered_events
+        .iter()
+        .filter_map(|event| event["seq"].as_u64())
+        .max()
+        .unwrap_or_default()
+        + 1;
+    let events = delivery_chat_events(
+        turn.events,
+        &turn.session_id,
+        &turn.turn_id,
+        next_seq,
+        stream_process,
+    );
+    for event in events {
         let control = drain_chat_control_messages(socket, state, &turn.turn_id, &live_turn).await;
         socket_open &= !control.socket_closed;
         if live_turn.cancel_requested.load(Ordering::SeqCst) {
@@ -12665,14 +26083,15 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
         }
         delivered_events.push(event.clone());
         if event["type"] == "done" {
-            let _ = persist_chat_turn(
+            let _ = persist_chat_turn_async(
                 state,
                 persistence_payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &turn.trace,
                 &delivered_events,
-            );
+            )
+            .await;
             final_persisted = true;
         }
         if socket_open && send_stream_event(socket, event).await.is_err() {
@@ -12716,13 +26135,14 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
             let _ = publish_chat_event(state, persistence_payload, &live_turn, event.clone()).await;
             delivered_events.push(event.clone());
             if event["type"] == "done" {
-                let _ = persist_cancelled_chat_turn(
+                let _ = persist_cancelled_chat_turn_async(
                     state,
                     persistence_payload,
                     &turn.session_id,
                     &turn.turn_id,
                     &delivered_events,
-                );
+                )
+                .await;
                 final_persisted = true;
             }
             if socket_open && send_stream_event(socket, event).await.is_err() {
@@ -12730,38 +26150,63 @@ async fn run_chat_turn(socket: &mut WebSocket, state: &AppState, payload: &Value
             }
         }
         if !final_persisted {
-            let _ = persist_cancelled_chat_turn(
+            let _ = persist_cancelled_chat_turn_async(
                 state,
                 persistence_payload,
                 &turn.session_id,
                 &turn.turn_id,
                 &delivered_events,
-            );
+            )
+            .await;
         }
     } else if !final_persisted {
-        let _ = persist_chat_turn(
+        let _ = persist_chat_turn_async(
             state,
             persistence_payload,
             &turn.session_id,
             &turn.turn_id,
             &turn.trace,
             &delivered_events,
-        );
+        )
+        .await;
     }
     state.chat_runtime.remove_turn(&turn.turn_id).await;
 }
 
-async fn execute_chat_turn(state: &AppState, payload: &Value) -> (String, String, Vec<Value>) {
-    let turn = build_chat_turn(state, payload).await;
-    let _ = persist_chat_turn(
+async fn execute_chat_turn(
+    state: &AppState,
+    payload: &Value,
+    auth_payload: Option<&AuthTokenPayload>,
+) -> (String, String, Vec<Value>) {
+    let turn = build_chat_turn(state, payload, auth_payload).await;
+    let _ = persist_chat_turn_async(
         state,
         &turn.persistence_payload,
         &turn.session_id,
         &turn.turn_id,
         &turn.trace,
         &turn.events,
-    );
+    )
+    .await;
     (turn.session_id, turn.turn_id, turn.events)
+}
+
+async fn execute_chat_turn_checked(
+    state: &AppState,
+    payload: &Value,
+    auth_payload: Option<&AuthTokenPayload>,
+) -> Result<(String, String, Vec<Value>), ApiError> {
+    let turn = build_chat_turn(state, payload, auth_payload).await;
+    persist_chat_turn_async(
+        state,
+        &turn.persistence_payload,
+        &turn.session_id,
+        &turn.turn_id,
+        &turn.trace,
+        &turn.events,
+    )
+    .await?;
+    Ok((turn.session_id, turn.turn_id, turn.events))
 }
 
 struct BuiltChatTurn {
@@ -12772,16 +26217,143 @@ struct BuiltChatTurn {
     events: Vec<Value>,
 }
 
-async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
+#[derive(Clone)]
+struct ChatTurnIdentity {
+    session_id: String,
+    turn_id: String,
+}
+
+fn chat_turn_identity_from_payload(payload: &Value) -> ChatTurnIdentity {
+    let session_id = payload["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
+    ChatTurnIdentity {
+        session_id,
+        turn_id: format!("rust-turn-{}", unique_id()),
+    }
+}
+
+fn should_stream_chat_process(payload: &Value) -> bool {
+    requested_chat_tool_names(payload)
+        .iter()
+        .any(|tool| tool == "rag")
+}
+
+fn chat_process_prelude_events(payload: &Value, identity: &ChatTurnIdentity) -> Vec<Value> {
+    let ids = StreamIds::new(&identity.session_id, &identity.turn_id);
+    let content = payload["content"].as_str().unwrap_or_default();
+    let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
+    vec![
+        stream_event(
+            "session",
+            "rust-backend",
+            "",
+            "",
+            chat_session_metadata(payload, &identity.session_id, &identity.turn_id),
+            ids,
+            1,
+        ),
+        stream_event(
+            "thinking",
+            "planner",
+            "planning",
+            "Checking selected tools and preparing a grounded answer.",
+            json!({ "status": "running" }),
+            ids,
+            2,
+        ),
+        stream_event(
+            "tool_call",
+            "retriever",
+            "rag",
+            "rag",
+            json!({
+                "args": {
+                    "query": content,
+                    "knowledge_bases": knowledge_bases
+                },
+                "status": "running"
+            }),
+            ids,
+            3,
+        ),
+        stream_event(
+            "progress",
+            "retriever",
+            "rag",
+            "Searching selected knowledge bases before drafting the answer.",
+            json!({
+                "current": 0,
+                "total": knowledge_bases.len(),
+                "knowledge_bases": knowledge_bases,
+                "status": "running"
+            }),
+            ids,
+            4,
+        ),
+    ]
+}
+
+fn chat_session_metadata(payload: &Value, session_id: &str, turn_id: &str) -> Value {
+    let mut session_metadata = json!({ "session_id": session_id, "turn_id": turn_id });
+    if payload["config"]["_regenerate"].as_bool().unwrap_or(false) {
+        session_metadata["regenerate"] = json!(true);
+    }
+    if let Some(message_id) = payload["config"]["_regenerated_from_message_id"].as_u64() {
+        session_metadata["regenerated_from_message_id"] = json!(message_id);
+    } else if let Some(message_id) = payload["config"]["_regenerated_from_message_id"].as_str() {
+        session_metadata["regenerated_from_message_id"] = json!(message_id);
+    }
+    if let Some(superseded_turn_id) = payload["config"]["_superseded_turn_id"].as_str() {
+        session_metadata["superseded_turn_id"] = json!(superseded_turn_id);
+    }
+    session_metadata
+}
+
+fn delivery_chat_events(
+    events: Vec<Value>,
+    session_id: &str,
+    turn_id: &str,
+    mut next_seq: u64,
+    skip_session: bool,
+) -> Vec<Value> {
+    events
+        .into_iter()
+        .filter_map(|mut event| {
+            if skip_session && event["type"] == "session" {
+                return None;
+            }
+            event["session_id"] = json!(session_id);
+            event["turn_id"] = json!(turn_id);
+            event["seq"] = json!(next_seq);
+            next_seq += 1;
+            Some(event)
+        })
+        .collect()
+}
+
+async fn build_chat_turn(
+    state: &AppState,
+    payload: &Value,
+    auth_payload: Option<&AuthTokenPayload>,
+) -> BuiltChatTurn {
+    build_chat_turn_with_identity(state, payload, auth_payload, None).await
+}
+
+async fn build_chat_turn_with_identity(
+    state: &AppState,
+    payload: &Value,
+    auth_payload: Option<&AuthTokenPayload>,
+    identity: Option<ChatTurnIdentity>,
+) -> BuiltChatTurn {
     let content = payload["content"]
         .as_str()
         .unwrap_or("Explain the Socartes Rust agent loop.");
-    let session_id = payload["session_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("rust-session-{}", unique_id()));
-    let turn_id = format!("rust-turn-{}", unique_id());
+    let identity = identity.unwrap_or_else(|| chat_turn_identity_from_payload(payload));
+    let session_id = identity.session_id;
+    let turn_id = identity.turn_id;
     let (persistence_payload, effective_content) =
         prepare_chat_turn_payload(state, &session_id, payload, content);
     let learner_context = payload["language"]
@@ -12790,13 +26362,119 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         .unwrap_or_default();
     let knowledge_bases = as_string_array(&payload["knowledge_bases"]);
     let enabled_tools = requested_chat_tool_names(payload);
-    let retrieved_context =
-        retrieve_chat_context(state, &effective_content, &knowledge_bases).await;
+    let retrieved_context = if let Some(auth_payload) = auth_payload {
+        if knowledge_bases.is_empty() && !enabled_tools.iter().any(|tool| tool == "rag") {
+            Vec::new()
+        } else {
+            match retrieve_chat_context_for_auth(
+                state,
+                &effective_content,
+                &knowledge_bases,
+                auth_payload,
+            )
+            .await
+            {
+                Ok(chunks) => chunks,
+                Err((status, Json(error))) => {
+                    let detail = error["detail"]
+                        .as_str()
+                        .unwrap_or("Knowledge retrieval failed")
+                        .to_string();
+                    let mut trace = SocartesOrchestrator::new().run_with_retrieved_context(
+                        &effective_content,
+                        &learner_context,
+                        Vec::new(),
+                    );
+                    trace.review.status = "retrieval_error".to_string();
+                    trace.review.approved = false;
+                    trace.review.issues.push(CriticIssue {
+                        issue_type: "rag_access".to_string(),
+                        claim: "The requested knowledge base could not be retrieved.".to_string(),
+                        instruction: detail.clone(),
+                    });
+                    let ids = StreamIds::new(&session_id, &turn_id);
+                    let events = vec![
+                        stream_event(
+                            "session",
+                            "rust-backend",
+                            "",
+                            "",
+                            json!({ "session_id": session_id, "turn_id": turn_id }),
+                            ids,
+                            1,
+                        ),
+                        stream_event(
+                            "error",
+                            "retriever",
+                            "retriever",
+                            &detail,
+                            json!({
+                                "turn_terminal": true,
+                                "status": "failed",
+                                "http_status": status.as_u16()
+                            }),
+                            ids,
+                            2,
+                        ),
+                        stream_event(
+                            "done",
+                            "rust-backend",
+                            "",
+                            "",
+                            json!({ "status": "failed" }),
+                            ids,
+                            3,
+                        ),
+                    ];
+                    return BuiltChatTurn {
+                        session_id,
+                        turn_id,
+                        persistence_payload,
+                        trace,
+                        events,
+                    };
+                }
+            }
+        }
+    } else {
+        retrieve_chat_context(state, &effective_content, &knowledge_bases).await
+    };
     let mut trace = SocartesOrchestrator::new().run_with_retrieved_context(
         &effective_content,
         &learner_context,
         retrieved_context,
     );
+    let mut web_sources = Vec::new();
+    if enabled_tools.iter().any(|tool| tool == "web_search") {
+        match plugin_tool_result(
+            state,
+            "web_search",
+            json!({ "query": effective_content }),
+            auth_payload,
+        )
+        .await
+        {
+            Ok(result) => {
+                let content = result["content"].as_str().unwrap_or_default().to_string();
+                web_sources = result["sources"].as_array().cloned().unwrap_or_default();
+                trace.tool_results.push(ToolResult {
+                    adapter: "web_search".to_string(),
+                    action: "search".to_string(),
+                    output: content,
+                    safe: result["success"].as_bool().unwrap_or(false),
+                });
+            }
+            Err((status, Json(error))) => {
+                let detail = error["detail"].as_str().unwrap_or("web search failed");
+                trace.tool_results.push(ToolResult {
+                    adapter: "web_search".to_string(),
+                    action: "search".to_string(),
+                    output: format!("Error executing web_search: {detail}"),
+                    safe: status.is_success(),
+                });
+            }
+        }
+    }
     let chat_selection =
         match active_chat_selection(&load_settings_catalog(state), &payload["llm_selection"]) {
             Ok(selection) => selection,
@@ -12848,6 +26526,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
                             &knowledge_bases,
                             &effective_content,
                             &tool_calls,
+                            auth_payload,
                         )
                         .await;
                     if let Some(object) = metadata.as_object_mut() {
@@ -12921,16 +26600,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
         }
     }
     let ids = StreamIds::new(&session_id, &turn_id);
-    let mut session_metadata = json!({ "session_id": session_id, "turn_id": turn_id });
-    if payload["config"]["_regenerate"].as_bool().unwrap_or(false) {
-        session_metadata["regenerate"] = json!(true);
-    }
-    if let Some(message_id) = payload["config"]["_regenerated_from_message_id"].as_u64() {
-        session_metadata["regenerated_from_message_id"] = json!(message_id);
-    }
-    if let Some(superseded_turn_id) = payload["config"]["_superseded_turn_id"].as_str() {
-        session_metadata["superseded_turn_id"] = json!(superseded_turn_id);
-    }
+    let session_metadata = chat_session_metadata(payload, &session_id, &turn_id);
 
     let mut content_metadata = json!({ "citations": trace.draft.citations });
     if let Some(metadata) = provider_metadata.as_ref()
@@ -12958,7 +26628,7 @@ async fn build_chat_turn(state: &AppState, payload: &Value) -> BuiltChatTurn {
             "retriever",
             "retriever",
             "Retrieved Socartes RAG context.",
-            json!({ "sources": trace.retrieved_context }),
+            json!({ "sources": trace.retrieved_context, "web_sources": web_sources }),
             ids,
             3,
         ),
@@ -13109,11 +26779,14 @@ fn write_session(state: &AppState, session_id: &str, session: &Value) -> Result<
     })
 }
 
-fn read_turn_events(
+async fn read_turn_events(
     state: &AppState,
     turn_id: &str,
     after_seq: u64,
 ) -> Result<Vec<Value>, ApiError> {
+    if session_pocketbase_enabled(state) {
+        return read_turn_events_pocketbase(state, turn_id, after_seq).await;
+    }
     for session in session_records(state) {
         if let Some(events) = turn_events_from_session(&session, turn_id, after_seq) {
             return Ok(events);
@@ -13122,7 +26795,10 @@ fn read_turn_events(
     Err(api_error(StatusCode::NOT_FOUND, "Turn not found"))
 }
 
-fn mark_stored_turn_cancelled(state: &AppState, turn_id: &str) -> Result<bool, ApiError> {
+async fn mark_stored_turn_cancelled(state: &AppState, turn_id: &str) -> Result<bool, ApiError> {
+    if session_pocketbase_enabled(state) {
+        return mark_stored_turn_cancelled_pocketbase(state, turn_id).await;
+    }
     for mut session in session_records(state) {
         let session_id = session["session_id"]
             .as_str()
@@ -13187,11 +26863,14 @@ fn mark_stored_turn_cancelled(state: &AppState, turn_id: &str) -> Result<bool, A
     Ok(false)
 }
 
-fn latest_session_turn_events(
+async fn latest_session_turn_events(
     state: &AppState,
     session_id: &str,
     after_seq: u64,
 ) -> Result<Vec<Value>, ApiError> {
+    if session_pocketbase_enabled(state) {
+        return latest_session_turn_events_pocketbase(state, session_id, after_seq).await;
+    }
     let session = read_session(state, session_id)?;
     let Some(turn_id) = latest_turn_id(&session) else {
         return Err(api_error(StatusCode::NOT_FOUND, "Turn not found"));
@@ -13252,6 +26931,77 @@ fn session_summaries(state: &AppState) -> Vec<Value> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     summaries
+}
+
+async fn session_summaries_pocketbase(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let records =
+        pb_collection_list(state, "sessions", &[("sort", "-updated".to_string())]).await?;
+    let mut summaries = Vec::new();
+    for record in records {
+        let session_id = record["session_id"]
+            .as_str()
+            .or_else(|| record["id"].as_str())
+            .unwrap_or_default();
+        if session_id.is_empty() {
+            continue;
+        }
+        let messages = pb_collection_list(
+            state,
+            "messages",
+            &[
+                ("filter", format!("session_id=\"{session_id}\"")),
+                ("sort", "msg_created_at".to_string()),
+            ],
+        )
+        .await?;
+        let turns = pb_collection_list(
+            state,
+            "turns",
+            &[("filter", format!("session_id=\"{session_id}\""))],
+        )
+        .await?;
+        let active_turn_id = turns
+            .iter()
+            .find(|turn| turn["status"] == "running")
+            .and_then(|turn| turn["turn_id"].as_str().or_else(|| turn["id"].as_str()))
+            .map(|turn_id| json!(turn_id))
+            .unwrap_or(Value::Null);
+        let status = turns
+            .iter()
+            .max_by(|left, right| {
+                left["turn_updated_at"]
+                    .as_f64()
+                    .partial_cmp(&right["turn_updated_at"].as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|turn| turn["status"].as_str())
+            .or_else(|| record["status"].as_str())
+            .unwrap_or("idle");
+        let last_message = messages
+            .iter()
+            .rev()
+            .find_map(|message| message["content"].as_str())
+            .unwrap_or_default();
+        summaries.push(json!({
+            "id": session_id,
+            "session_id": session_id,
+            "title": record["title"].as_str().unwrap_or("New conversation"),
+            "created_at": pb_timestamp_field(&record, "created_at", "created"),
+            "updated_at": pb_timestamp_field(&record, "updated_at", "updated"),
+            "message_count": messages.len(),
+            "last_message": last_message,
+            "status": status,
+            "active_turn_id": active_turn_id,
+            "preferences": pb_json_field(&record["preferences_json"], json!({}))
+        }));
+    }
+    summaries.sort_by(|left, right| {
+        right["updated_at"]
+            .as_f64()
+            .partial_cmp(&left["updated_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(summaries)
 }
 
 fn session_records(state: &AppState) -> Vec<Value> {
@@ -13435,19 +27185,23 @@ async fn publish_chat_event(
     event: Value,
 ) -> Result<(), ApiError> {
     let turn_id = event["turn_id"].as_str().unwrap_or_default();
-    persist_partial_chat_event(state, payload, &live_turn.session_id, turn_id, &event)?;
+    persist_partial_chat_event(state, payload, &live_turn.session_id, turn_id, &event).await?;
     live_turn.events.lock().await.push(event.clone());
     let _ = live_turn.sender.send(event);
     Ok(())
 }
 
-fn persist_partial_chat_event(
+async fn persist_partial_chat_event(
     state: &AppState,
     payload: &Value,
     session_id: &str,
     turn_id: &str,
     event: &Value,
 ) -> Result<(), ApiError> {
+    if session_pocketbase_enabled(state) {
+        return persist_partial_chat_event_pocketbase(state, payload, session_id, turn_id, event)
+            .await;
+    }
     let now = now_seconds();
     let mut session = read_session(state, session_id).unwrap_or_else(|_| {
         json!({
@@ -13547,7 +27301,13 @@ fn persist_cancelled_chat_turn(
             "capability": payload["capability"].as_str().unwrap_or_default(),
             "events": [],
             "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
-            "metadata": { "turn_id": turn_id },
+            "metadata": user_message_metadata(
+                turn_id,
+                payload,
+                payload["content"].as_str().unwrap_or_default(),
+                payload["capability"].as_str().unwrap_or_default(),
+                payload.get("attachments").unwrap_or(&Value::Null)
+            ),
             "created_at": now
         }]);
     }
@@ -13604,7 +27364,13 @@ fn persist_failed_chat_turn(
             "capability": payload["capability"].as_str().unwrap_or_default(),
             "events": [],
             "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
-            "metadata": { "turn_id": turn_id },
+            "metadata": user_message_metadata(
+                turn_id,
+                payload,
+                payload["content"].as_str().unwrap_or_default(),
+                payload["capability"].as_str().unwrap_or_default(),
+                payload.get("attachments").unwrap_or(&Value::Null)
+            ),
             "created_at": now
         });
         if let Some(messages) = session["messages"].as_array_mut() {
@@ -13671,6 +27437,1066 @@ fn session_summary(session: &Value) -> Value {
     })
 }
 
+async fn persist_chat_turn_async(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    trace: &StudyTrace,
+    events: &[Value],
+) -> Result<(), ApiError> {
+    if session_pocketbase_enabled(state) {
+        return persist_terminal_chat_turn_pocketbase(
+            state,
+            payload,
+            session_id,
+            turn_id,
+            Some(trace),
+            events,
+        )
+        .await;
+    }
+    persist_chat_turn(state, payload, session_id, turn_id, trace, events)
+}
+
+async fn persist_cancelled_chat_turn_async(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    events: &[Value],
+) -> Result<(), ApiError> {
+    if session_pocketbase_enabled(state) {
+        return persist_terminal_chat_turn_pocketbase(
+            state, payload, session_id, turn_id, None, events,
+        )
+        .await;
+    }
+    persist_cancelled_chat_turn(state, payload, session_id, turn_id, events)
+}
+
+fn session_pocketbase_enabled(state: &AppState) -> bool {
+    !state.auth_pocketbase_url.trim().is_empty()
+}
+
+async fn persist_terminal_chat_turn_pocketbase(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    trace: Option<&StudyTrace>,
+    events: &[Value],
+) -> Result<(), ApiError> {
+    let now = now_seconds();
+    let capability = payload["capability"].as_str().unwrap_or_default();
+    let status = final_turn_status(events);
+    let error = terminal_error_message(events).unwrap_or_default();
+    let session_existed = pocketbase_session_exists(state, session_id).await?;
+    let result = async {
+        ensure_chat_session_pocketbase(state, payload, session_id, capability).await?;
+
+        let attachments = if payload["attachments"].is_array() {
+            payload["attachments"].clone()
+        } else {
+            json!([])
+        };
+        let mut next_message_id = 1_u64;
+        if should_persist_user_message(payload)
+            && !message_exists_for_turn_pocketbase(state, session_id, "user", turn_id).await?
+        {
+            pb_collection_create(
+                state,
+                "messages",
+                json!({
+                    "session_id": session_id,
+                    "role": "user",
+                    "content": payload["content"].as_str().unwrap_or_default(),
+                    "capability": capability,
+                    "events_json": [],
+                    "attachments_json": attachments,
+                    "metadata_json": user_message_metadata(
+                        turn_id,
+                        payload,
+                        payload["content"].as_str().unwrap_or_default(),
+                        capability,
+                        &attachments
+                    ),
+                    "msg_created_at": now,
+                }),
+            )
+            .await?;
+            next_message_id += 1;
+        }
+
+        if status == "completed"
+            && let Some(trace) = trace
+            && !message_exists_for_turn_pocketbase(state, session_id, "assistant", turn_id).await?
+        {
+            pb_collection_create(
+                state,
+                "messages",
+                json!({
+                    "session_id": session_id,
+                    "role": "assistant",
+                    "content": trace.final_answer,
+                    "capability": capability,
+                    "events_json": events
+                        .iter()
+                        .filter(|event| event["type"] != "session" && event["type"] != "done")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "attachments_json": [],
+                    "metadata_json": assistant_message_metadata(turn_id, events),
+                    "msg_created_at": now + (next_message_id as f64 * 0.001),
+                }),
+            )
+            .await?;
+        }
+
+        upsert_chat_turn_pocketbase(
+            state,
+            PocketbaseTurnUpsert {
+                turn_id,
+                session_id,
+                capability,
+                status: &status,
+                error: &error,
+                now,
+                finished_at: Some(now),
+            },
+        )
+        .await?;
+
+        for event in events {
+            create_turn_event_if_absent_pocketbase(state, session_id, turn_id, event, now).await?;
+        }
+
+        update_session_status_pocketbase(state, session_id, &status).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        cleanup_failed_terminal_turn_pocketbase(state, session_id, turn_id, !session_existed).await;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+struct PocketbaseTurnUpsert<'a> {
+    turn_id: &'a str,
+    session_id: &'a str,
+    capability: &'a str,
+    status: &'a str,
+    error: &'a str,
+    now: f64,
+    finished_at: Option<f64>,
+}
+
+async fn persist_partial_chat_event_pocketbase(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    turn_id: &str,
+    event: &Value,
+) -> Result<(), ApiError> {
+    let now = now_seconds();
+    let capability = payload["capability"].as_str().unwrap_or_default();
+    upsert_chat_session_pocketbase(state, payload, session_id, capability, "running").await?;
+    upsert_chat_turn_pocketbase(
+        state,
+        PocketbaseTurnUpsert {
+            turn_id,
+            session_id,
+            capability,
+            status: "running",
+            error: "",
+            now,
+            finished_at: None,
+        },
+    )
+    .await?;
+    create_turn_event_if_absent_pocketbase(state, session_id, turn_id, event, now).await?;
+    Ok(())
+}
+
+async fn upsert_chat_session_pocketbase(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    capability: &str,
+    status: &str,
+) -> Result<Value, ApiError> {
+    let title = title_from_content(payload["content"].as_str().unwrap_or("Socartes chat"));
+    let create_body = json!({
+        "session_id": session_id,
+        "title": title,
+        "compressed_summary": "",
+        "summary_up_to_msg_id": 0,
+        "preferences_json": chat_preferences_from_payload(payload),
+        "capability": capability,
+        "status": status,
+    });
+    let filter = format!("session_id=\"{}\"", pocketbase_filter_escape(session_id));
+    let records = pb_collection_list(state, "sessions", &[("filter", filter)]).await?;
+    let Some(existing) = records.first() else {
+        return pb_collection_create(state, "sessions", create_body).await;
+    };
+    let Some(record_id) = existing["id"].as_str() else {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "PocketBase session record is missing an id",
+        ));
+    };
+    let mut update_body = json!({
+        "preferences_json": chat_preferences_from_payload(payload),
+        "capability": capability,
+        "status": status,
+    });
+    if existing["title"].as_str().unwrap_or_default() == "New conversation" {
+        update_body["title"] = json!(title);
+    }
+    pb_collection_update(state, "sessions", record_id, update_body).await
+}
+
+async fn ensure_chat_session_pocketbase(
+    state: &AppState,
+    payload: &Value,
+    session_id: &str,
+    capability: &str,
+) -> Result<Value, ApiError> {
+    let title = title_from_content(payload["content"].as_str().unwrap_or("Socartes chat"));
+    let create_body = json!({
+        "session_id": session_id,
+        "title": title,
+        "compressed_summary": "",
+        "summary_up_to_msg_id": 0,
+        "preferences_json": chat_preferences_from_payload(payload),
+        "capability": capability,
+        "status": "running",
+    });
+    let filter = format!("session_id=\"{}\"", pocketbase_filter_escape(session_id));
+    let records = pb_collection_list(state, "sessions", &[("filter", filter)]).await?;
+    let Some(existing) = records.first() else {
+        return pb_collection_create(state, "sessions", create_body).await;
+    };
+    let Some(record_id) = existing["id"].as_str() else {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "PocketBase session record is missing an id",
+        ));
+    };
+    let mut update_body = json!({
+        "preferences_json": chat_preferences_from_payload(payload),
+        "capability": capability,
+    });
+    if existing["title"].as_str().unwrap_or_default() == "New conversation" {
+        update_body["title"] = json!(title);
+    }
+    pb_collection_update(state, "sessions", record_id, update_body).await
+}
+
+async fn pocketbase_session_exists(state: &AppState, session_id: &str) -> Result<bool, ApiError> {
+    let filter = format!("session_id=\"{}\"", pocketbase_filter_escape(session_id));
+    Ok(
+        !pb_collection_list(state, "sessions", &[("filter", filter)])
+            .await?
+            .is_empty(),
+    )
+}
+
+async fn cleanup_failed_terminal_turn_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    turn_id: &str,
+    delete_session_shell: bool,
+) {
+    if delete_session_shell {
+        let _ = delete_session_pocketbase(state, session_id).await;
+        return;
+    }
+
+    if let Ok(messages) = pb_collection_list(
+        state,
+        "messages",
+        &[(
+            "filter",
+            format!("session_id=\"{}\"", pocketbase_filter_escape(session_id)),
+        )],
+    )
+    .await
+    {
+        for record_id in messages
+            .iter()
+            .filter(|record| {
+                pb_json_field(&record["metadata_json"], json!({}))["turn_id"].as_str()
+                    == Some(turn_id)
+            })
+            .filter_map(|record| record["id"].as_str())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+        {
+            let _ = pb_collection_delete(state, "messages", &record_id).await;
+        }
+    }
+
+    for collection in ["turn_events", "turns"] {
+        if let Ok(records) = pb_collection_list(
+            state,
+            collection,
+            &[(
+                "filter",
+                format!("turn_id=\"{}\"", pocketbase_filter_escape(turn_id)),
+            )],
+        )
+        .await
+        {
+            for record_id in records
+                .iter()
+                .filter_map(|record| record["id"].as_str())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+            {
+                let _ = pb_collection_delete(state, collection, &record_id).await;
+            }
+        }
+    }
+}
+
+async fn upsert_chat_turn_pocketbase(
+    state: &AppState,
+    record: PocketbaseTurnUpsert<'_>,
+) -> Result<Value, ApiError> {
+    let mut create_body = json!({
+        "turn_id": record.turn_id,
+        "session_id": record.session_id,
+        "capability": record.capability,
+        "status": record.status,
+        "error": record.error,
+        "turn_created_at": record.now,
+        "turn_updated_at": record.now,
+    });
+    if let Some(finished_at) = record.finished_at {
+        create_body["finished_at"] = json!(finished_at);
+    }
+    let mut update_body = json!({
+        "session_id": record.session_id,
+        "capability": record.capability,
+        "status": record.status,
+        "error": record.error,
+        "turn_updated_at": record.now,
+    });
+    if let Some(finished_at) = record.finished_at {
+        update_body["finished_at"] = json!(finished_at);
+    }
+    pb_upsert_by_filter(
+        state,
+        "turns",
+        &format!("turn_id=\"{}\"", pocketbase_filter_escape(record.turn_id)),
+        create_body,
+        update_body,
+    )
+    .await
+}
+
+async fn create_turn_event_if_absent_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    turn_id: &str,
+    event: &Value,
+    now: f64,
+) -> Result<Value, ApiError> {
+    let seq = event["seq"].as_u64().unwrap_or_default();
+    let existing = pb_collection_list(
+        state,
+        "turn_events",
+        &[
+            (
+                "filter",
+                format!("turn_id=\"{}\"", pocketbase_filter_escape(turn_id)),
+            ),
+            ("sort", "seq".to_string()),
+            ("perPage", "500".to_string()),
+        ],
+    )
+    .await?;
+    if let Some(record) = existing
+        .into_iter()
+        .find(|record| record["seq"].as_u64().unwrap_or_default() == seq)
+    {
+        return Ok(record);
+    }
+    pb_collection_create(
+        state,
+        "turn_events",
+        turn_event_pocketbase_body(session_id, turn_id, event, now),
+    )
+    .await
+}
+
+fn turn_event_pocketbase_body(session_id: &str, turn_id: &str, event: &Value, now: f64) -> Value {
+    json!({
+        "turn_id": turn_id,
+        "session_id": event["session_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(session_id),
+        "seq": event["seq"].as_u64().unwrap_or_default(),
+        "type": event["type"].as_str().unwrap_or_default(),
+        "source": event["source"].as_str().unwrap_or_default(),
+        "stage": event["stage"].as_str().unwrap_or_default(),
+        "content": truncate_chars(event["content"].as_str().unwrap_or_default(), 10_000),
+        "metadata_json": event.get("metadata").cloned().unwrap_or_else(|| json!({})),
+        "event_timestamp": event["timestamp"].as_f64().unwrap_or(now),
+    })
+}
+
+async fn read_turn_events_pocketbase(
+    state: &AppState,
+    turn_id: &str,
+    after_seq: u64,
+) -> Result<Vec<Value>, ApiError> {
+    let records = pb_collection_list(
+        state,
+        "turn_events",
+        &[
+            (
+                "filter",
+                format!(
+                    "turn_id=\"{}\" && seq > {after_seq}",
+                    pocketbase_filter_escape(turn_id)
+                ),
+            ),
+            ("sort", "seq".to_string()),
+            ("perPage", "500".to_string()),
+        ],
+    )
+    .await?;
+    if records.is_empty() {
+        let turn_exists = pb_collection_list(
+            state,
+            "turns",
+            &[(
+                "filter",
+                format!("turn_id=\"{}\"", pocketbase_filter_escape(turn_id)),
+            )],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .is_some();
+        if !turn_exists {
+            return Err(api_error(StatusCode::NOT_FOUND, "Turn not found"));
+        }
+    }
+    Ok(records
+        .into_iter()
+        .map(|record| pb_turn_event_record_to_session_event(&record, turn_id))
+        .collect())
+}
+
+async fn latest_session_turn_events_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    after_seq: u64,
+) -> Result<Vec<Value>, ApiError> {
+    let turns = pb_collection_list(
+        state,
+        "turns",
+        &[
+            (
+                "filter",
+                format!("session_id=\"{}\"", pocketbase_filter_escape(session_id)),
+            ),
+            ("sort", "-turn_updated_at".to_string()),
+            ("perPage", "1".to_string()),
+        ],
+    )
+    .await?;
+    let Some(turn_id) = turns
+        .first()
+        .and_then(|turn| turn["turn_id"].as_str().or_else(|| turn["id"].as_str()))
+        .map(ToString::to_string)
+    else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Turn not found"));
+    };
+    read_turn_events_pocketbase(state, &turn_id, after_seq).await
+}
+
+async fn mark_stored_turn_cancelled_pocketbase(
+    state: &AppState,
+    turn_id: &str,
+) -> Result<bool, ApiError> {
+    let turns = pb_collection_list(
+        state,
+        "turns",
+        &[(
+            "filter",
+            format!("turn_id=\"{}\"", pocketbase_filter_escape(turn_id)),
+        )],
+    )
+    .await?;
+    let Some(turn) = turns.first() else {
+        return Ok(false);
+    };
+    if turn["status"] != "running" {
+        return Ok(false);
+    }
+    let session_id = turn["session_id"].as_str().unwrap_or_default();
+    let now = now_seconds();
+    let records = pb_collection_list(
+        state,
+        "turn_events",
+        &[
+            (
+                "filter",
+                format!("turn_id=\"{}\"", pocketbase_filter_escape(turn_id)),
+            ),
+            ("sort", "seq".to_string()),
+        ],
+    )
+    .await?;
+    let next_seq = records
+        .iter()
+        .filter_map(|event| event["seq"].as_u64())
+        .max()
+        .unwrap_or_default()
+        + 1;
+    let ids = StreamIds::new(session_id, turn_id);
+    let error_event = stream_event(
+        "error",
+        "rust-backend",
+        "",
+        "Turn cancelled",
+        json!({ "turn_terminal": true, "status": "cancelled" }),
+        ids,
+        next_seq,
+    );
+    let done_event = stream_event(
+        "done",
+        "rust-backend",
+        "",
+        "",
+        json!({ "status": "cancelled" }),
+        ids,
+        next_seq + 1,
+    );
+    create_turn_event_if_absent_pocketbase(state, session_id, turn_id, &error_event, now).await?;
+    create_turn_event_if_absent_pocketbase(state, session_id, turn_id, &done_event, now).await?;
+    let record_id = turn["id"].as_str().unwrap_or_default();
+    if !record_id.is_empty() {
+        pb_collection_update(
+            state,
+            "turns",
+            record_id,
+            json!({
+                "status": "cancelled",
+                "error": "Turn cancelled",
+                "turn_updated_at": now,
+                "finished_at": now,
+            }),
+        )
+        .await?;
+    }
+    update_session_status_pocketbase(state, session_id, "cancelled").await?;
+    Ok(true)
+}
+
+async fn update_session_status_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    status: &str,
+) -> Result<(), ApiError> {
+    let records = pb_collection_list(
+        state,
+        "sessions",
+        &[(
+            "filter",
+            format!("session_id=\"{}\"", pocketbase_filter_escape(session_id)),
+        )],
+    )
+    .await?;
+    if let Some(record_id) = records.first().and_then(|record| record["id"].as_str()) {
+        pb_collection_update(state, "sessions", record_id, json!({ "status": status })).await?;
+    }
+    Ok(())
+}
+
+async fn message_exists_for_turn_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    role: &str,
+    turn_id: &str,
+) -> Result<bool, ApiError> {
+    let records = pb_collection_list(
+        state,
+        "messages",
+        &[(
+            "filter",
+            format!(
+                "session_id=\"{}\" && role=\"{}\"",
+                pocketbase_filter_escape(session_id),
+                pocketbase_filter_escape(role)
+            ),
+        )],
+    )
+    .await?;
+    Ok(records.into_iter().any(|record| {
+        pb_json_field(&record["metadata_json"], json!({}))["turn_id"].as_str() == Some(turn_id)
+    }))
+}
+
+async fn delete_tail_assistant_message_pocketbase(
+    state: &AppState,
+    session: &Value,
+) -> Result<(), ApiError> {
+    let Some(message) = session["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+    else {
+        return Ok(());
+    };
+    if message["role"] != "assistant" {
+        return Ok(());
+    }
+    let Some(record_id) = message["id"].as_str().filter(|value| !value.is_empty()) else {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "PocketBase assistant message record is missing an id",
+        ));
+    };
+    pb_collection_delete(state, "messages", record_id).await
+}
+
+async fn pb_upsert_by_filter(
+    state: &AppState,
+    collection: &str,
+    filter: &str,
+    create_body: Value,
+    update_body: Value,
+) -> Result<Value, ApiError> {
+    let records = pb_collection_list(state, collection, &[("filter", filter.to_string())]).await?;
+    if let Some(record_id) = records.first().and_then(|record| record["id"].as_str()) {
+        return pb_collection_update(state, collection, record_id, update_body).await;
+    }
+    pb_collection_create(state, collection, create_body).await
+}
+
+fn pocketbase_filter_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn pb_collection_create(
+    state: &AppState,
+    collection: &str,
+    body: Value,
+) -> Result<Value, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create PocketBase client: {error}"),
+            )
+        })?;
+    let response = client
+        .post(pocketbase_url(
+            state,
+            &format!("/api/collections/{collection}/records"),
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("PocketBase {collection} create failed: {error}"),
+            )
+        })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} create returned {status}: {text}"),
+        ));
+    }
+    serde_json::from_str::<Value>(&text).map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} create returned invalid JSON: {error}"),
+        )
+    })
+}
+
+async fn read_session_pocketbase(state: &AppState, session_id: &str) -> Result<Value, ApiError> {
+    let escaped_session_id = pocketbase_filter_escape(session_id);
+    let sessions = pb_collection_list(
+        state,
+        "sessions",
+        &[("filter", format!("session_id=\"{escaped_session_id}\""))],
+    )
+    .await?;
+    let Some(session_record) = sessions.first() else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Session not found"));
+    };
+
+    let messages = pb_collection_list(
+        state,
+        "messages",
+        &[
+            ("filter", format!("session_id=\"{escaped_session_id}\"")),
+            ("sort", "msg_created_at".to_string()),
+        ],
+    )
+    .await?
+    .into_iter()
+    .map(pb_message_record_to_session_message)
+    .collect::<Vec<_>>();
+
+    let mut turns = pb_collection_list(
+        state,
+        "turns",
+        &[("filter", format!("session_id=\"{escaped_session_id}\""))],
+    )
+    .await?
+    .into_iter()
+    .map(pb_turn_record_to_session_turn)
+    .collect::<Vec<_>>();
+    turns.sort_by(|left, right| {
+        left["started_at"]
+            .as_f64()
+            .partial_cmp(&right["started_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut turn_events = Map::new();
+    for turn in turns.iter_mut() {
+        let turn_id = turn["id"].as_str().unwrap_or_default().to_string();
+        let events = pb_collection_list(
+            state,
+            "turn_events",
+            &[
+                ("filter", format!("turn_id=\"{turn_id}\"")),
+                ("sort", "seq".to_string()),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|record| pb_turn_event_record_to_session_event(&record, &turn_id))
+        .collect::<Vec<_>>();
+        turn["event_count"] = json!(events.len());
+        turn_events.insert(turn_id, Value::Array(events));
+    }
+
+    let active_turns = turns
+        .iter()
+        .filter(|turn| turn["status"] == "running")
+        .cloned()
+        .collect::<Vec<_>>();
+    let active_turn_id = active_turns
+        .first()
+        .and_then(|turn| turn["id"].as_str())
+        .map(|turn_id| json!(turn_id))
+        .unwrap_or(Value::Null);
+    let status = turns
+        .last()
+        .and_then(|turn| turn["status"].as_str())
+        .or_else(|| session_record["status"].as_str())
+        .unwrap_or("idle");
+
+    Ok(json!({
+        "id": session_record["session_id"].as_str().unwrap_or(session_id),
+        "session_id": session_record["session_id"].as_str().unwrap_or(session_id),
+        "title": session_record["title"].as_str().unwrap_or("New conversation"),
+        "created_at": pb_timestamp_field(session_record, "created_at", "created"),
+        "updated_at": pb_timestamp_field(session_record, "updated_at", "updated"),
+        "status": status,
+        "compressed_summary": session_record["compressed_summary"].as_str().unwrap_or_default(),
+        "summary_up_to_msg_id": session_record["summary_up_to_msg_id"].as_u64().unwrap_or_default(),
+        "preferences": pb_json_field(&session_record["preferences_json"], json!({})),
+        "messages": messages,
+        "active_turns": active_turns,
+        "active_turn_id": active_turn_id,
+        "turns": turns,
+        "turn_events": Value::Object(turn_events)
+    }))
+}
+
+async fn pb_collection_list(
+    state: &AppState,
+    collection: &str,
+    query: &[(&str, String)],
+) -> Result<Vec<Value>, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create PocketBase client: {error}"),
+            )
+        })?;
+    let mut request = client.get(pocketbase_url(
+        state,
+        &format!("/api/collections/{collection}/records"),
+    ));
+    for (key, value) in query {
+        request = request.query(&[(*key, value.as_str())]);
+    }
+    let response = request.send().await.map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} list failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} list returned {status}: {text}"),
+        ));
+    }
+    let value = serde_json::from_str::<Value>(&text).map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} list returned invalid JSON: {error}"),
+        )
+    })?;
+    Ok(value["items"].as_array().cloned().unwrap_or_default())
+}
+
+async fn update_session_title_pocketbase(
+    state: &AppState,
+    session_id: &str,
+    title: &str,
+) -> Result<Value, ApiError> {
+    let records = pb_collection_list(
+        state,
+        "sessions",
+        &[("filter", format!("session_id=\"{session_id}\""))],
+    )
+    .await?;
+    let Some(record_id) = records
+        .first()
+        .and_then(|record| record["id"].as_str())
+        .map(ToString::to_string)
+    else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Session not found"));
+    };
+    pb_collection_update(
+        state,
+        "sessions",
+        &record_id,
+        json!({"title": title.chars().take(100).collect::<String>()}),
+    )
+    .await?;
+    read_session_pocketbase(state, session_id).await
+}
+
+async fn delete_session_pocketbase(state: &AppState, session_id: &str) -> Result<(), ApiError> {
+    let sessions = pb_collection_list(
+        state,
+        "sessions",
+        &[("filter", format!("session_id=\"{session_id}\""))],
+    )
+    .await?;
+    let Some(session_record_id) = sessions
+        .first()
+        .and_then(|record| record["id"].as_str())
+        .map(ToString::to_string)
+    else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Session not found"));
+    };
+
+    for collection in ["messages", "turns", "turn_events"] {
+        let records = pb_collection_list(
+            state,
+            collection,
+            &[("filter", format!("session_id=\"{session_id}\""))],
+        )
+        .await?;
+        for record_id in records
+            .iter()
+            .filter_map(|record| record["id"].as_str())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+        {
+            pb_collection_delete(state, collection, &record_id).await?;
+        }
+    }
+    pb_collection_delete(state, "sessions", &session_record_id).await
+}
+
+async fn pb_collection_update(
+    state: &AppState,
+    collection: &str,
+    record_id: &str,
+    body: Value,
+) -> Result<Value, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create PocketBase client: {error}"),
+            )
+        })?;
+    let response = client
+        .patch(pocketbase_url(
+            state,
+            &format!("/api/collections/{collection}/records/{record_id}"),
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("PocketBase {collection} update failed: {error}"),
+            )
+        })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} update returned {status}: {text}"),
+        ));
+    }
+    serde_json::from_str::<Value>(&text).map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("PocketBase {collection} update returned invalid JSON: {error}"),
+        )
+    })
+}
+
+async fn pb_collection_delete(
+    state: &AppState,
+    collection: &str,
+    record_id: &str,
+) -> Result<(), ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create PocketBase client: {error}"),
+            )
+        })?;
+    let response = client
+        .delete(pocketbase_url(
+            state,
+            &format!("/api/collections/{collection}/records/{record_id}"),
+        ))
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("PocketBase {collection} delete failed: {error}"),
+            )
+        })?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    Err(api_error(
+        StatusCode::BAD_GATEWAY,
+        &format!("PocketBase {collection} delete returned {status}: {text}"),
+    ))
+}
+
+fn pb_message_record_to_session_message(record: Value) -> Value {
+    json!({
+        "id": record["id"].clone(),
+        "session_id": record["session_id"].clone(),
+        "role": record["role"].clone(),
+        "content": record["content"].as_str().unwrap_or_default(),
+        "capability": record["capability"].as_str().unwrap_or_default(),
+        "events": pb_json_field(&record["events_json"], json!([])),
+        "attachments": pb_json_field(&record["attachments_json"], json!([])),
+        "metadata": pb_json_field(&record["metadata_json"], json!({})),
+        "created_at": record["msg_created_at"].as_f64().unwrap_or_default()
+    })
+}
+
+fn pb_turn_record_to_session_turn(record: Value) -> Value {
+    let turn_id = record["turn_id"]
+        .as_str()
+        .or_else(|| record["id"].as_str())
+        .unwrap_or_default();
+    let status = record["status"].as_str().unwrap_or("running");
+    json!({
+        "id": turn_id,
+        "turn_id": turn_id,
+        "session_id": record["session_id"].clone(),
+        "capability": record["capability"].as_str().unwrap_or_default(),
+        "status": status,
+        "error": record["error"].as_str().unwrap_or_default(),
+        "started_at": record["turn_created_at"].as_f64().unwrap_or_default(),
+        "created_at": record["turn_created_at"].as_f64().unwrap_or_default(),
+        "updated_at": record["turn_updated_at"].as_f64().unwrap_or_default(),
+        "completed_at": if matches!(status, "completed" | "failed" | "cancelled") {
+            record["finished_at"].clone()
+        } else {
+            Value::Null
+        },
+        "finished_at": record["finished_at"].clone(),
+        "event_count": 0
+    })
+}
+
+fn pb_turn_event_record_to_session_event(record: &Value, turn_id: &str) -> Value {
+    json!({
+        "type": record["type"].as_str().unwrap_or_default(),
+        "source": record["source"].as_str().unwrap_or_default(),
+        "stage": record["stage"].as_str().unwrap_or_default(),
+        "content": record["content"].as_str().unwrap_or_default(),
+        "metadata": pb_json_field(&record["metadata_json"], json!({})),
+        "session_id": record["session_id"].as_str().unwrap_or_default(),
+        "turn_id": turn_id,
+        "seq": record["seq"].as_u64().unwrap_or_default(),
+        "timestamp": record["event_timestamp"].as_f64().unwrap_or_default()
+    })
+}
+
+fn pb_json_field(value: &Value, default_value: Value) -> Value {
+    if value.is_null() {
+        return default_value;
+    }
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str(text).unwrap_or(default_value);
+    }
+    value.clone()
+}
+
+fn pb_timestamp_field(record: &Value, numeric_key: &str, fallback_key: &str) -> Value {
+    if let Some(value) = record[numeric_key].as_f64() {
+        return json!(value);
+    }
+    if let Some(value) = record[fallback_key].as_f64() {
+        return json!(value);
+    }
+    json!(now_seconds())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
+}
+
 fn persist_chat_turn(
     state: &AppState,
     payload: &Value,
@@ -13723,7 +28549,13 @@ fn persist_chat_turn(
         "capability": capability,
         "events": [],
         "attachments": attachments,
-        "metadata": { "turn_id": turn_id },
+        "metadata": user_message_metadata(
+            turn_id,
+            payload,
+            payload["content"].as_str().unwrap_or_default(),
+            capability,
+            &attachments
+        ),
         "created_at": now
     });
     let assistant_id = if should_persist_user_message(payload) {
@@ -13781,6 +28613,119 @@ fn persist_chat_turn(
     }
 
     write_session(state, session_id, &session)
+}
+
+fn user_message_metadata(
+    turn_id: &str,
+    payload: &Value,
+    content: &str,
+    capability: &str,
+    attachments: &Value,
+) -> Value {
+    json!({
+        "turn_id": turn_id,
+        "request_snapshot": chat_request_snapshot(payload, content, capability, attachments)
+    })
+}
+
+fn chat_request_snapshot(
+    payload: &Value,
+    content: &str,
+    capability: &str,
+    attachments: &Value,
+) -> Value {
+    let mut snapshot = Map::new();
+    snapshot.insert("content".to_string(), json!(content));
+    snapshot.insert("capability".to_string(), json!(capability));
+    snapshot.insert(
+        "enabledTools".to_string(),
+        json!(as_string_array(&payload["tools"])),
+    );
+    snapshot.insert(
+        "knowledgeBases".to_string(),
+        json!(as_string_array(&payload["knowledge_bases"])),
+    );
+    snapshot.insert(
+        "language".to_string(),
+        json!(payload["language"].as_str().unwrap_or("en")),
+    );
+
+    insert_non_empty_array(&mut snapshot, "attachments", attachments);
+    if let Some(config) = public_chat_request_config(payload) {
+        snapshot.insert("config".to_string(), config);
+    }
+    insert_non_empty_array(
+        &mut snapshot,
+        "notebookReferences",
+        &payload["notebook_references"],
+    );
+    insert_non_empty_array(
+        &mut snapshot,
+        "historyReferences",
+        &payload["history_references"],
+    );
+    insert_non_empty_array(
+        &mut snapshot,
+        "questionNotebookReferences",
+        &payload["question_notebook_references"],
+    );
+    insert_non_empty_array(&mut snapshot, "bookReferences", &payload["book_references"]);
+
+    let skills = as_string_array(&payload["skills"]);
+    if !skills.is_empty() {
+        snapshot.insert("skills".to_string(), json!(skills));
+    }
+    let memory_references = memory_references_from_payload(payload);
+    if !memory_references.is_empty() {
+        snapshot.insert("memoryReferences".to_string(), json!(memory_references));
+    }
+    if payload
+        .get("llm_selection")
+        .is_some_and(|selection| !selection.is_null())
+    {
+        snapshot.insert("llmSelection".to_string(), payload["llm_selection"].clone());
+    }
+
+    Value::Object(snapshot)
+}
+
+fn insert_non_empty_array(snapshot: &mut Map<String, Value>, key: &str, value: &Value) {
+    if value.as_array().is_some_and(|items| !items.is_empty()) {
+        snapshot.insert(key.to_string(), value.clone());
+    }
+}
+
+fn public_chat_request_config(payload: &Value) -> Option<Value> {
+    let object = payload["config"].as_object()?;
+    let mut public = object.clone();
+    for key in [
+        "_persist_user_message",
+        "_regenerate",
+        "_regenerated_from_message_id",
+        "_superseded_turn_id",
+        "answer_now_context",
+        "followup_question_context",
+    ] {
+        public.remove(key);
+    }
+    (!public.is_empty()).then_some(Value::Object(public))
+}
+
+fn memory_references_from_payload(payload: &Value) -> Vec<String> {
+    let mut references = Vec::new();
+    for item in payload["memory_references"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(value) = item.as_str() else {
+            continue;
+        };
+        if matches!(value, "summary" | "profile") && !references.iter().any(|seen| seen == value) {
+            references.push(value.to_string());
+        }
+    }
+    references
 }
 
 fn assistant_message_metadata(turn_id: &str, events: &[Value]) -> Value {
@@ -14148,6 +29093,42 @@ async fn retrieve_chat_context(
     dedupe_chunks(chunks).into_iter().take(5).collect()
 }
 
+async fn retrieve_chat_context_for_auth(
+    state: &AppState,
+    goal: &str,
+    selected_knowledge_bases: &[String],
+    payload: &AuthTokenPayload,
+) -> Result<Vec<RetrievalChunk>, ApiError> {
+    if selected_knowledge_bases.is_empty() {
+        if payload.role == "admin" {
+            return Ok(retrieve(goal));
+        }
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "No knowledge base selected. Pass kb_name explicitly or set a default.",
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    for name in selected_knowledge_bases {
+        let access = resolve_knowledge_access(state, payload, name)?;
+        match access {
+            KnowledgeAccess::Builtin => chunks.extend(retrieve(goal)),
+            KnowledgeAccess::Admin { name, .. } => {
+                chunks.extend(retrieve_uploaded_knowledge_base(state, goal, &name).await);
+            }
+            KnowledgeAccess::User { name, user_id } => {
+                let dir = user_knowledge_base_dir(state, &user_id, &name);
+                chunks.extend(
+                    retrieve_uploaded_knowledge_base_from_dir(state, goal, &name, &dir).await,
+                );
+            }
+        }
+    }
+
+    Ok(dedupe_chunks(chunks).into_iter().take(5).collect())
+}
+
 async fn retrieve_uploaded_knowledge_base(
     state: &AppState,
     goal: &str,
@@ -14157,13 +29138,28 @@ async fn retrieve_uploaded_knowledge_base(
         return Vec::new();
     }
 
-    if let Some(chunks) = retrieve_indexed_knowledge_base(state, goal, name).await {
+    retrieve_uploaded_knowledge_base_from_dir(state, goal, name, &knowledge_base_dir(state, name))
+        .await
+}
+
+async fn retrieve_uploaded_knowledge_base_from_dir(
+    state: &AppState,
+    goal: &str,
+    name: &str,
+    kb_dir: &FsPath,
+) -> Vec<RetrievalChunk> {
+    if !kb_dir.is_dir() {
+        return Vec::new();
+    }
+
+    if let Some(chunks) = retrieve_indexed_knowledge_base_from_dir(state, goal, name, kb_dir).await
+    {
         return chunks;
     }
 
     let query_terms = tokenize(goal);
     let mut scored = Vec::new();
-    let Ok(entries) = fs::read_dir(knowledge_files_dir(state, name)) else {
+    let Ok(entries) = fs::read_dir(knowledge_files_dir_at_dir(kb_dir)) else {
         return Vec::new();
     };
 
@@ -14220,32 +29216,28 @@ async fn retrieve_uploaded_knowledge_base(
     scored.into_iter().take(3).map(|(_, chunk)| chunk).collect()
 }
 
-async fn retrieve_indexed_knowledge_base(
+async fn retrieve_indexed_knowledge_base_from_dir(
     state: &AppState,
     goal: &str,
     name: &str,
+    kb_dir: &FsPath,
 ) -> Option<Vec<RetrievalChunk>> {
-    let metadata = read_knowledge_metadata(state, name).unwrap_or_else(|| json!({}));
-    let versions = knowledge_index_versions(&knowledge_base_dir(state, name), &metadata);
-    let active = find_active_index_version(state, &versions)?;
-    let version_dir = active["version_path"]
-        .as_str()
-        .or_else(|| active["storage_path"].as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            knowledge_base_dir(state, name).join(active["version"].as_str().unwrap_or("version-1"))
-        });
-    let chunk_index_path = version_dir.join("chunks.json");
-    let Ok(text) = fs::read_to_string(chunk_index_path) else {
-        return Some(Vec::new());
-    };
-    let Ok(index) = serde_json::from_str::<Value>(&text) else {
-        return Some(Vec::new());
-    };
+    let metadata = read_knowledge_metadata_at_dir(kb_dir).unwrap_or_else(|| json!({}));
+    let versions = knowledge_index_versions(kb_dir, &metadata);
+    let active = find_reusable_index_version(state, &versions, kb_dir)?;
+    let version_dir = index_version_dir(kb_dir, active);
     let query_terms = tokenize(goal);
     if query_terms.is_empty() {
         return Some(Vec::new());
     }
+
+    let chunk_index_path = version_dir.join("chunks.json");
+    let Ok(text) = fs::read_to_string(chunk_index_path) else {
+        return retrieve_llamaindex_docstore(name, &version_dir, &query_terms);
+    };
+    let Ok(index) = serde_json::from_str::<Value>(&text) else {
+        return retrieve_llamaindex_docstore(name, &version_dir, &query_terms);
+    };
 
     let indexed_chunks = index["chunks"]
         .as_array()
@@ -14366,6 +29358,105 @@ async fn retrieve_indexed_knowledge_base(
             .map(|(_, _, chunk)| chunk)
             .collect(),
     )
+}
+
+fn find_reusable_index_version<'a>(
+    state: &AppState,
+    versions: &'a [Value],
+    kb_dir: &FsPath,
+) -> Option<&'a Value> {
+    find_active_index_version(state, versions).or_else(|| {
+        versions.iter().rev().find(|version| {
+            version["ready"].as_bool().unwrap_or(false) && {
+                let version_dir = index_version_dir(kb_dir, version);
+                version_dir.join("chunks.json").is_file()
+                    || version_dir.join("docstore.json").is_file()
+            }
+        })
+    })
+}
+
+fn index_version_dir(kb_dir: &FsPath, version: &Value) -> PathBuf {
+    version["version_path"]
+        .as_str()
+        .or_else(|| version["storage_path"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| kb_dir.join(version["version"].as_str().unwrap_or("version-1")))
+}
+
+fn retrieve_llamaindex_docstore(
+    name: &str,
+    version_dir: &FsPath,
+    query_terms: &HashSet<String>,
+) -> Option<Vec<RetrievalChunk>> {
+    let text = fs::read_to_string(version_dir.join("docstore.json")).ok()?;
+    let docstore = serde_json::from_str::<Value>(&text).ok()?;
+    let nodes = docstore["docstore/data"].as_object()?;
+    let mut scored = nodes
+        .iter()
+        .filter_map(|(node_key, node)| {
+            let data = llamaindex_node_data(node)?;
+            let content = data["text"].as_str()?;
+            let metadata = &data["metadata"];
+            let source = metadata["file_name"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+                .or_else(|| {
+                    metadata["file_path"]
+                        .as_str()
+                        .and_then(|path| FsPath::new(path).file_name())
+                        .and_then(|name| name.to_str())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| format!("{node_key}.txt"));
+            let score = query_terms
+                .intersection(&tokenize(&format!("{source} {content}")))
+                .count();
+            if score == 0 {
+                return None;
+            }
+            let node_id = data["id_"]
+                .as_str()
+                .or_else(|| data["id"].as_str())
+                .unwrap_or(node_key)
+                .to_string();
+            let source_id = format!("{name}/{source}");
+            let focused_content = query_focused_excerpt(content, query_terms, 900);
+            Some((
+                score,
+                source_id.clone(),
+                RetrievalChunk {
+                    source_id,
+                    title: source.clone(),
+                    content: focused_content,
+                    confidence: confidence_for_score(score).to_string(),
+                    source: Some(source),
+                    page: None,
+                    chunk_id: Some(node_id),
+                    score: Some(score as f64),
+                    provider: Some(DEFAULT_RAG_PROVIDER.to_string()),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    Some(
+        scored
+            .into_iter()
+            .take(5)
+            .map(|(_, _, chunk)| chunk)
+            .collect(),
+    )
+}
+
+fn llamaindex_node_data(node: &Value) -> Option<Value> {
+    let data = &node["__data__"];
+    if data.is_object() {
+        return Some(data.clone());
+    }
+    data.as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
 }
 
 fn dedupe_chunks(chunks: Vec<RetrievalChunk>) -> Vec<RetrievalChunk> {
@@ -14734,4 +29825,117 @@ fn is_stopword(token: &str) -> bool {
             | "what"
             | "with"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn knowledge_task_stream_delivers_events_emitted_after_subscription() {
+        let runtime = KnowledgeTaskRuntimeState {
+            tasks: Mutex::new(HashMap::new()),
+        };
+        let task_id = "kb_reindex_20260530_120000_live";
+        let mut stream = runtime.sse_stream(task_id).await;
+
+        runtime
+            .record_completed(
+                task_id,
+                "kb_reindex",
+                "Live reindex complete".to_string(),
+                json!({
+                    "task_id": task_id,
+                    "stage": "completed",
+                    "percent": 100
+                }),
+            )
+            .await;
+
+        let mut body = String::new();
+        for _ in 0..3 {
+            let chunk = timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("stream event")
+                .expect("stream item")
+                .expect("stream chunk");
+            body.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+        }
+
+        assert!(body.contains("event: process_log"));
+        assert!(body.contains("event: progress"));
+        assert!(body.contains("event: complete"));
+        assert!(body.contains("\"detail\":\"Live reindex complete\""));
+        assert!(
+            timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("stream closed after complete")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_task_backlog_keeps_only_last_500_events() {
+        let runtime = KnowledgeTaskRuntimeState {
+            tasks: Mutex::new(HashMap::new()),
+        };
+        let task_id = "kb_upload_20260530_120000_backlog";
+
+        for index in 0..501 {
+            runtime
+                .emit(task_id, "progress", json!({ "index": index }))
+                .await;
+        }
+
+        let (backlog, _receiver) = runtime.subscribe(task_id).await;
+        assert_eq!(backlog.len(), KNOWLEDGE_TASK_BACKLOG_LIMIT);
+        assert_eq!(backlog.first().unwrap().payload["index"], 1);
+        assert_eq!(backlog.last().unwrap().payload["index"], 500);
+    }
+
+    #[tokio::test]
+    async fn knowledge_task_stream_replays_failed_payload_and_then_ends() {
+        let runtime = KnowledgeTaskRuntimeState {
+            tasks: Mutex::new(HashMap::new()),
+        };
+        let task_id = "kb_init_20260530_120000_failed";
+
+        runtime
+            .emit(task_id, "process_log", json!({ "message": "starting" }))
+            .await;
+        runtime
+            .emit_failed(task_id, "Short failure", Some("stack trace".to_string()))
+            .await;
+
+        let mut stream = runtime.sse_stream(task_id).await;
+        let first = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("first event")
+            .expect("first item")
+            .expect("first chunk");
+        let second = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("failed event")
+            .expect("failed item")
+            .expect("failed chunk");
+        let body = format!(
+            "{}{}",
+            std::str::from_utf8(&first).expect("utf8"),
+            std::str::from_utf8(&second).expect("utf8")
+        );
+
+        assert!(body.contains("event: process_log"));
+        assert!(body.contains("event: failed"));
+        assert!(body.contains("\"detail\":\"Short failure\""));
+        assert!(body.contains("\"task_id\":\"kb_init_20260530_120000_failed\""));
+        assert!(body.contains("\"details\":\"stack trace\""));
+        assert!(
+            timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("stream closed after failed")
+                .is_none()
+        );
+    }
 }
