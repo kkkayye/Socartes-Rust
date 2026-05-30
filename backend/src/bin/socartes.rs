@@ -624,6 +624,8 @@ async fn chat_repl(api: &ApiClient, args: ChatArgs) -> CliResult {
         config: json!({}),
     };
 
+    load_existing_chat_session(api, &mut state).await?;
+
     println!("Socartes chat. Type /quit to exit, /session for state.");
     loop {
         print!("socartes> ");
@@ -678,19 +680,8 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
     let parts = raw.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         ["/quit"] | ["/exit"] => Ok(false),
-        ["/session"] => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "session_id": &state.session_id,
-                    "capability": &state.capability,
-                    "tools": &state.tools,
-                    "knowledge_bases": &state.knowledge_bases,
-                    "history_references": &state.history_references,
-                    "notebook_references": &state.notebook_references,
-                    "config": &state.config
-                }))?
-            );
+        ["/session"] | ["/refs"] => {
+            print_chat_state(state)?;
             Ok(true)
         }
         ["/new"] => {
@@ -758,6 +749,89 @@ fn apply_chat_command(raw: &str, state: &mut ChatState) -> CliResult<bool> {
             Ok(true)
         }
     }
+}
+
+async fn load_existing_chat_session(api: &ApiClient, state: &mut ChatState) -> CliResult {
+    let Some(session_id) = state
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let session = api
+        .get_json(&format!("/api/v1/sessions/{session_id}"))
+        .await
+        .map_err(|error| format!("Session not found: {session_id}: {error}"))?;
+    apply_chat_session_preferences(state, &session);
+    Ok(())
+}
+
+fn apply_chat_session_preferences(state: &mut ChatState, session: &Value) {
+    let preferences = &session["preferences"];
+    if let Some(capability) = preferences["capability"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state.capability = capability.to_string();
+    }
+    let tools = string_array(&preferences["tools"]);
+    if !tools.is_empty() {
+        state.tools = tools;
+    }
+    let knowledge_bases = string_array(&preferences["knowledge_bases"]);
+    if !knowledge_bases.is_empty() {
+        state.knowledge_bases = knowledge_bases;
+    }
+    if let Some(language) = preferences["language"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state.language = language.to_string();
+    }
+    let notebook_references = preferences["notebook_references"]
+        .as_array()
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    if !notebook_references.is_empty() {
+        state.notebook_references = notebook_references;
+    }
+    let history_references = string_array(&preferences["history_references"]);
+    if !history_references.is_empty() {
+        state.history_references = history_references;
+    }
+}
+
+fn string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn print_chat_state(state: &ChatState) -> CliResult {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "session_id": &state.session_id,
+            "capability": &state.capability,
+            "tools": &state.tools,
+            "knowledge_bases": &state.knowledge_bases,
+            "language": &state.language,
+            "history_references": &state.history_references,
+            "notebook_references": &state.notebook_references,
+            "config": &state.config
+        }))?
+    );
+    Ok(())
 }
 
 async fn book_command(api: &ApiClient, command: BookCommand) -> CliResult {

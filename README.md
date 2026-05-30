@@ -65,6 +65,33 @@ Expected behavior:
 - If the database contains the supporting chunk, the answer includes `grounded: true` and the matching `source_ids`.
 - If the database does not contain evidence, the answer refuses with `grounded: false` instead of guessing from general model knowledge.
 
+## CLI
+
+The Rust workspace includes a `socartes` CLI binary that mirrors the Python `socartes_cli` command surface:
+
+```bash
+cd backend
+cargo run --bin socartes -- --help
+cargo run --bin socartes -- run chat "Explain retrieval-augmented generation" --tool rag --kb course-ai
+cargo run --bin socartes -- chat --session <session-id>
+```
+
+Implemented command groups:
+
+- `run`, `start`, `serve`, `chat`
+- `book list|health|refresh-fingerprints`
+- `bot list|start|stop|create`
+- `kb list|info|set-default|create|add|delete|search`
+- `notebook list|create|show|remove-record|add-md|replace-md`
+- `memory show|clear`
+- `plugin list|info`
+- `config show`
+- `session list|show|open|delete|rename`
+- `provider login`
+- `init wizard`
+
+`chat --session` reloads saved session preferences before entering the REPL, matching the Python CLI behavior for capability, tools, knowledge bases, language, notebook references, and history references.
+
 ## Repository Structure
 
 ```text
