@@ -1582,6 +1582,39 @@ fn config_show_merges_env_model_catalog_and_main_yaml_like_python_cli() {
 }
 
 #[test]
+fn config_show_only_reads_system_language_from_main_yaml_like_python_cli() {
+    let home = unique_temp_dir("config-system-language");
+    let user_settings = home.join("data/user/settings");
+    fs::create_dir_all(&user_settings).expect("user settings directory should be created");
+    fs::write(
+        user_settings.join("main.yaml"),
+        "system:\n  language: zh\nassistant:\n  language: ko\ntools:\n  rag: {}\n",
+    )
+    .expect("main.yaml should be written");
+
+    let output = socartes_cmd()
+        .env_clear()
+        .env("HOME", &home)
+        .args(["config", "show", "--home"])
+        .arg(&home)
+        .output()
+        .expect("socartes config show should execute");
+
+    let _ = fs::remove_dir_all(home);
+
+    assert!(
+        output.status.success(),
+        "config show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("config output should be JSON");
+    assert_eq!(value["language"], "zh");
+    assert_eq!(value["tools"], json!(["rag"]));
+}
+
+#[test]
 fn init_accepts_non_interactive_runtime_settings_like_python_wizard() {
     let home = unique_temp_dir("init-config");
     let output = socartes_cmd()

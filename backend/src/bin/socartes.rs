@@ -2435,6 +2435,7 @@ fn read_main_yaml_summary(paths: &[PathBuf]) -> CliResult<Option<MainYamlSummary
 
 fn parse_main_yaml_summary(text: &str) -> MainYamlSummary {
     let mut summary = MainYamlSummary::default();
+    let mut in_system = false;
     let mut in_tools = false;
     let mut tools = Vec::new();
     for raw_line in text.lines() {
@@ -2447,15 +2448,20 @@ fn parse_main_yaml_summary(text: &str) -> MainYamlSummary {
             .chars()
             .take_while(|value| value.is_whitespace())
             .count();
-        if indent == 0 && trimmed == "tools:" {
-            in_tools = true;
-            summary.tools = Some(Vec::new());
-            continue;
-        }
         if indent == 0 {
             in_tools = false;
+            in_system = false;
+            if let Some((key, _)) = trimmed.split_once(':') {
+                let key = clean_yaml_scalar(key);
+                in_system = key == "system";
+                if key == "tools" {
+                    in_tools = true;
+                    summary.tools = Some(Vec::new());
+                }
+            }
+            continue;
         }
-        if let Some(value) = trimmed.strip_prefix("language:") {
+        if in_system && let Some(value) = trimmed.strip_prefix("language:") {
             let language = clean_yaml_scalar(value);
             if !language.is_empty() {
                 summary.language = Some(language);
