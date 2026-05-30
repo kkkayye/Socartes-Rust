@@ -29177,7 +29177,7 @@ async fn chat_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !migration::is_shadow_native_ws_request(&headers) {
+    if !state.migration.is_shadow_native_ws_request(&headers) {
         match state.migration.mode_for_path(uri.path()) {
             migration::MigrationMode::Native => {}
             migration::MigrationMode::Proxy => {

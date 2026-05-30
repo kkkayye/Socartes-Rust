@@ -83,6 +83,35 @@ fn websocket_upgrade_requests_bypass_http_proxy_gate() {
     assert!(!is_websocket_upgrade_request(&plain_headers));
 }
 
+#[test]
+fn shadow_native_ws_bypass_requires_runtime_token() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-socartes-migration-shadow-native", "1".parse().unwrap());
+    assert!(!is_shadow_native_ws_request(
+        &headers,
+        "socartes-test-shadow-token"
+    ));
+
+    headers.insert(
+        "x-socartes-migration-shadow-native",
+        "wrong-token".parse().unwrap(),
+    );
+    assert!(!is_shadow_native_ws_request(
+        &headers,
+        "socartes-test-shadow-token"
+    ));
+
+    headers.insert(
+        "x-socartes-migration-shadow-native",
+        "socartes-test-shadow-token".parse().unwrap(),
+    );
+    assert!(is_shadow_native_ws_request(
+        &headers,
+        "socartes-test-shadow-token"
+    ));
+    assert!(!is_shadow_native_ws_request(&headers, ""));
+}
+
 #[tokio::test]
 async fn proxy_preserves_sse_headers_and_streams_chunks() {
     let upstream = Router::new().route("/api/v1/stream", get(delayed_sse));
@@ -361,7 +390,10 @@ async fn shadow_ws_returns_python_frames_and_tees_client_frames_to_native_ws() {
                     native_header_seen
                         .lock()
                         .await
-                        .push(is_shadow_native_ws_request(&headers));
+                        .push(is_shadow_native_ws_request(
+                            &headers,
+                            "socartes-test-shadow-token",
+                        ));
                     observed_native_ws(ws, native_messages).await
                 }
             }

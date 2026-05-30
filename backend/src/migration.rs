@@ -37,6 +37,8 @@ use tokio_tungstenite::{
 
 const SHADOW_OBSERVATION_BODY_LIMIT: usize = 1024 * 1024;
 const SHADOW_NATIVE_WS_HEADER: &str = "x-socartes-migration-shadow-native";
+const SHADOW_NATIVE_WS_TOKEN_ENV: &str = "SOCARTES_SHADOW_NATIVE_WS_TOKEN";
+const TEST_SHADOW_NATIVE_WS_TOKEN: &str = "socartes-test-shadow-token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -149,6 +151,7 @@ pub struct MigrationRuntime {
     config: ArcSwap<MigrationConfig>,
     config_path: PathBuf,
     client: reqwest::Client,
+    shadow_native_ws_token: Arc<str>,
 }
 
 impl std::fmt::Debug for MigrationRuntime {
@@ -172,14 +175,22 @@ impl MigrationRuntime {
         } else {
             MigrationConfig::default()
         };
-        Self::new(config_path, config)
+        Self::new(config_path, config, shadow_native_ws_token_from_env())
     }
 
     pub fn from_config_for_tests(config: MigrationConfig) -> Self {
-        Self::new(PathBuf::from("migration.toml"), config)
+        Self::new(
+            PathBuf::from("migration.toml"),
+            config,
+            TEST_SHADOW_NATIVE_WS_TOKEN.to_string(),
+        )
     }
 
-    fn new(config_path: PathBuf, mut config: MigrationConfig) -> Self {
+    fn new(
+        config_path: PathBuf,
+        mut config: MigrationConfig,
+        shadow_native_ws_token: String,
+    ) -> Self {
         config.normalize();
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -189,6 +200,7 @@ impl MigrationRuntime {
             config: ArcSwap::from_pointee(config),
             config_path,
             client,
+            shadow_native_ws_token: normalize_shadow_native_ws_token(shadow_native_ws_token),
         }
     }
 
@@ -213,6 +225,10 @@ impl MigrationRuntime {
 
     pub fn fallback_should_proxy(&self) -> bool {
         self.config().fallback_should_proxy()
+    }
+
+    pub fn is_shadow_native_ws_request(&self, headers: &HeaderMap) -> bool {
+        is_shadow_native_ws_request(headers, self.shadow_native_ws_token.as_ref())
     }
 }
 
@@ -261,11 +277,14 @@ pub fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
     })
 }
 
-pub fn is_shadow_native_ws_request(headers: &HeaderMap) -> bool {
+pub fn is_shadow_native_ws_request(headers: &HeaderMap, shadow_native_ws_token: &str) -> bool {
+    if shadow_native_ws_token.is_empty() {
+        return false;
+    }
     headers
         .get(SHADOW_NATIVE_WS_HEADER)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| matches!(value, "1" | "true" | "yes"))
+        .is_some_and(|value| value == shadow_native_ws_token)
 }
 
 pub async fn proxy_to_python(runtime: Arc<MigrationRuntime>, request: Request) -> Response {
@@ -528,8 +547,13 @@ async fn shadow_ws_inner(
 ) -> Result<(), ProxyError> {
     let config = runtime.config();
     let python_request =
-        upstream_ws_request(&config.python_ws_base_url, &path_and_query, &headers, false)?;
-    let native_request = upstream_ws_request(&native_ws_base_url, &path_and_query, &headers, true)?;
+        upstream_ws_request(&config.python_ws_base_url, &path_and_query, &headers, None)?;
+    let native_request = upstream_ws_request(
+        &native_ws_base_url,
+        &path_and_query,
+        &headers,
+        Some(runtime.shadow_native_ws_token.as_ref()),
+    )?;
 
     let (python_socket, _) = connect_async(python_request)
         .await
@@ -1002,7 +1026,7 @@ fn upstream_ws_request(
     base_url: &str,
     path_and_query: &str,
     headers: &HeaderMap,
-    shadow_native: bool,
+    shadow_native_ws_token: Option<&str>,
 ) -> Result<axum::http::Request<()>, ProxyError> {
     let url = upstream_ws_url(base_url, path_and_query)?;
     let mut upstream_request = url
@@ -1017,11 +1041,13 @@ fn upstream_ws_request(
             .headers_mut()
             .append(name.clone(), value.clone());
     }
-    if shadow_native {
-        upstream_request.headers_mut().insert(
-            HeaderName::from_static(SHADOW_NATIVE_WS_HEADER),
-            HeaderValue::from_static("1"),
-        );
+    if let Some(token) = shadow_native_ws_token.filter(|token| !token.is_empty()) {
+        let token = HeaderValue::from_str(token).map_err(|error| {
+            ProxyError::WebSocket(format!("invalid shadow native websocket token: {error}"))
+        })?;
+        upstream_request
+            .headers_mut()
+            .insert(HeaderName::from_static(SHADOW_NATIVE_WS_HEADER), token);
     }
     Ok(upstream_request)
 }
@@ -1117,6 +1143,27 @@ fn default_config_path() -> PathBuf {
         return PathBuf::from(path);
     }
     PathBuf::from("migration.toml")
+}
+
+fn shadow_native_ws_token_from_env() -> String {
+    env::var(SHADOW_NATIVE_WS_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(generate_shadow_native_ws_token)
+}
+
+fn normalize_shadow_native_ws_token(token: String) -> Arc<str> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        Arc::from(generate_shadow_native_ws_token())
+    } else {
+        Arc::from(token)
+    }
+}
+
+fn generate_shadow_native_ws_token() -> String {
+    format!("shadow-{}", uuid::Uuid::new_v4().simple())
 }
 
 fn axum_to_tungstenite(message: Message) -> Option<TungsteniteMessage> {
