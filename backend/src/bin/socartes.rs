@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     io::{self, Write},
-    net::SocketAddr,
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
@@ -533,6 +533,7 @@ async fn start_launcher(args: StartArgs) -> CliResult {
         return print_json(&plan);
     }
     cleanup_previous_start_state(&plan);
+    ensure_start_ports_available(&plan)?;
 
     let frontend_dir = PathBuf::from(plan["frontend"]["cwd"].as_str().unwrap_or_default());
     let api_base = plan["frontend"]["env"]["NEXT_PUBLIC_API_BASE"]
@@ -966,6 +967,92 @@ async fn wait_for_http(
         }
     }
     Err(format!("{name} did not become ready at {url} within {timeout:?}.").into())
+}
+
+struct StartPortOwner {
+    command: String,
+    pid: Option<u32>,
+}
+
+struct StartPortConflict {
+    name: &'static str,
+    port: u16,
+    owners: Vec<StartPortOwner>,
+}
+
+fn ensure_start_ports_available(plan: &Value) -> CliResult {
+    let ports = [
+        ("Backend", value_u16(&plan["backend"]["port"])),
+        ("Frontend", value_u16(&plan["frontend"]["port"])),
+    ];
+    let conflicts = ports
+        .into_iter()
+        .filter_map(|(name, port)| port.map(|port| (name, port)))
+        .filter_map(|(name, port)| {
+            let owners = listening_port_owners(port);
+            (!owners.is_empty() || port_accepts_connection(port)).then_some(StartPortConflict {
+                name,
+                port,
+                owners,
+            })
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    for conflict in conflicts {
+        eprintln!(
+            "{} port {} is already in use.",
+            conflict.name, conflict.port
+        );
+        if conflict.owners.is_empty() {
+            eprintln!("owner: unknown process");
+        } else {
+            for owner in conflict.owners {
+                match owner.pid {
+                    Some(pid) => eprintln!("owner: {} (PID {})", owner.command, pid),
+                    None => eprintln!("owner: {} (PID unknown)", owner.command),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "Stop the existing process or run `python scripts/stop_web.py` if it is a stale Socartes launch."
+    );
+    Err("Port conflict detected.".into())
+}
+
+fn value_u16(value: &Value) -> Option<u16> {
+    value.as_u64().and_then(|value| u16::try_from(value).ok())
+}
+
+fn port_accepts_connection(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+}
+
+fn listening_port_owners(port: u16) -> Vec<StartPortOwner> {
+    let output = match std::process::Command::new("lsof")
+        .args(["-n", "-P", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let command = parts.next()?.to_string();
+            let pid = parts.next().and_then(|value| value.parse::<u32>().ok());
+            Some(StartPortOwner { command, pid })
+        })
+        .collect()
 }
 
 fn write_start_state(

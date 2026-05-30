@@ -766,6 +766,10 @@ fn start_cleans_backend_and_state_when_backend_readiness_times_out() {
     let frontend_stub = project.join("frontend-stub.sh");
     let backend_pid = project.join("backend.pid");
     let state_path = project.join("data/user/settings/start_web_state.json");
+    let backend_port = free_tcp_port();
+    let frontend_port = free_tcp_port();
+    let backend_port_arg = backend_port.to_string();
+    let frontend_port_arg = frontend_port.to_string();
     fs::create_dir_all(&frontend).expect("frontend dir should be created");
     fs::write(
         &backend_stub,
@@ -784,7 +788,13 @@ fn start_cleans_backend_and_state_when_backend_readiness_times_out() {
         .env("SOCARTES_START_BACKEND_COMMAND", &backend_stub)
         .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
         .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "25")
-        .args(["start"])
+        .args([
+            "start",
+            "--port",
+            &backend_port_arg,
+            "--frontend-port",
+            &frontend_port_arg,
+        ])
         .output()
         .expect("socartes start should execute");
 
@@ -904,6 +914,77 @@ fn start_cleans_stale_recorded_processes_before_launch_like_python_launcher() {
         "state file should be removed after failed launch cleanup"
     );
 
+    let _ = fs::remove_dir_all(project);
+}
+
+#[test]
+fn start_reports_port_owner_before_spawning_like_python_launcher() {
+    let project = unique_temp_dir("start-port-conflict");
+    let frontend = project.join("web");
+    let backend_stub = project.join("backend-stub.sh");
+    let frontend_stub = project.join("frontend-stub.sh");
+    let backend_pid = project.join("backend.pid");
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(
+        &backend_stub,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            backend_pid.display()
+        ),
+    )
+    .expect("backend stub should be written");
+    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    make_executable(&backend_stub);
+    make_executable(&frontend_stub);
+
+    let occupied_backend =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("backend conflict listener should bind");
+    let backend_port = occupied_backend
+        .local_addr()
+        .expect("backend listener should have address")
+        .port();
+    let frontend_port = free_tcp_port();
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .env("SOCARTES_START_BACKEND_COMMAND", &backend_stub)
+        .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
+        .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "25")
+        .args([
+            "start",
+            "--port",
+            &backend_port.to_string(),
+            "--frontend-port",
+            &frontend_port.to_string(),
+        ])
+        .output()
+        .expect("socartes start should execute");
+
+    assert!(
+        !output.status.success(),
+        "port conflict should fail before launch:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("Backend port {backend_port} is already in use.")),
+        "start should report the occupied backend port like Python launcher:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("owner:"),
+        "start should report the port owner or unknown owner:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Stop the existing process"),
+        "start should print the Python launcher conflict hint:\n{stderr}"
+    );
+    assert!(
+        !backend_pid.exists(),
+        "backend command should not be spawned when the selected port is already occupied"
+    );
+
+    drop(occupied_backend);
     let _ = fs::remove_dir_all(project);
 }
 

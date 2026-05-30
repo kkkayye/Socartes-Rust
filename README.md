@@ -118,7 +118,7 @@ assistant metadata.
 The contract suite for this surface is `backend/tests/cli_contract.rs`. It
 checks more than help text: API paths, payload shapes, SSE rendering, REPL state
 mutation, `init wizard` filesystem side effects, provider login behavior, and
-`start` launcher cleanup semantics are covered there.
+`start` launcher cleanup and port-conflict diagnostics are covered there.
 
 ## Repository Structure
 
