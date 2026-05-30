@@ -23458,78 +23458,183 @@ async fn execute_deep_research_capability_stream(
         prepare_chat_turn_payload(state, &session_id, &request, content);
     let normalized_config =
         normalize_deep_research_config(&request["config"], &request["knowledge_bases"]);
-    let result = build_deep_research_outline_preview(&effective_content, &normalized_config);
+    let has_confirmed_outline = normalized_config["confirmed_outline"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty());
+    let result = if has_confirmed_outline {
+        build_deep_research_confirmed_report(&effective_content, &normalized_config)
+    } else {
+        build_deep_research_outline_preview(&effective_content, &normalized_config)
+    };
     let response = result["response"].as_str().unwrap_or_default().to_string();
     let trace = deep_research_trace(&effective_content, &response, &result);
     let ids = StreamIds::new(&session_id, &turn_id);
-    let events = vec![
-        stream_event(
-            "session",
-            "deep_research",
-            "",
-            "",
-            json!({ "session_id": session_id, "turn_id": turn_id }),
-            ids,
-            1,
-        ),
-        stream_event(
-            "stage_start",
-            "research_planner",
-            "decomposing",
-            "Generating an outline preview before running the full research pipeline.",
-            json!({
-                "capability": "deep_research",
-                "outline_preview": true,
-                "research_config": normalized_config
-            }),
-            ids,
-            2,
-        ),
-        stream_event(
-            "thinking",
-            "research_planner",
-            "decomposing",
-            "Prepared research subtopics from the requested mode, depth, and sources.",
-            json!({ "sub_topics": result["sub_topics"].clone() }),
-            ids,
-            3,
-        ),
-        stream_event(
-            "content",
-            "research_planner",
-            "decomposing",
-            &response,
-            json!({
-                "capability": "deep_research",
-                "outline_preview": true,
-                "sub_topics": result["sub_topics"].clone(),
-                "research_config": result["research_config"].clone()
-            }),
-            ids,
-            4,
-        ),
-        stream_event(
-            "stage_end",
-            "research_planner",
-            "decomposing",
-            "Outline preview is ready for confirmation.",
-            json!({
-                "outline_preview": true,
-                "sub_topics": result["sub_topics"].clone()
-            }),
-            ids,
-            5,
-        ),
-        stream_event(
-            "done",
-            "deep_research",
-            "",
-            "",
-            json!({ "status": "completed" }),
-            ids,
-            6,
-        ),
-    ];
+    let events = if has_confirmed_outline {
+        vec![
+            stream_event(
+                "session",
+                "deep_research",
+                "",
+                "",
+                json!({ "session_id": session_id, "turn_id": turn_id }),
+                ids,
+                1,
+            ),
+            stream_event(
+                "stage_start",
+                "research_engine",
+                "researching",
+                "Running the confirmed outline through the research pipeline.",
+                json!({
+                    "capability": "deep_research",
+                    "confirmed_outline_used": true,
+                    "research_config": normalized_config
+                }),
+                ids,
+                2,
+            ),
+            stream_event(
+                "thinking",
+                "research_engine",
+                "researching",
+                "Seeded the research queue from the confirmed outline.",
+                json!({
+                    "confirmed_outline_used": true,
+                    "sub_topics": result["sub_topics"].clone()
+                }),
+                ids,
+                3,
+            ),
+            stream_event(
+                "stage_end",
+                "research_engine",
+                "researching",
+                "Research pass completed for the confirmed outline.",
+                json!({
+                    "confirmed_outline_used": true,
+                    "sub_topics": result["sub_topics"].clone()
+                }),
+                ids,
+                4,
+            ),
+            stream_event(
+                "stage_start",
+                "report_writer",
+                "reporting",
+                "Synthesizing the confirmed research outline into a report.",
+                json!({
+                    "confirmed_outline_used": true,
+                    "research_config": result["research_config"].clone()
+                }),
+                ids,
+                5,
+            ),
+            stream_event(
+                "content",
+                "report_writer",
+                "reporting",
+                &response,
+                json!({
+                    "capability": "deep_research",
+                    "confirmed_outline_used": true,
+                    "sub_topics": result["sub_topics"].clone(),
+                    "research_config": result["research_config"].clone()
+                }),
+                ids,
+                6,
+            ),
+            stream_event(
+                "stage_end",
+                "report_writer",
+                "reporting",
+                "Report is ready.",
+                json!({
+                    "confirmed_outline_used": true,
+                    "sub_topics": result["sub_topics"].clone()
+                }),
+                ids,
+                7,
+            ),
+            stream_event(
+                "done",
+                "deep_research",
+                "",
+                "",
+                json!({ "status": "completed" }),
+                ids,
+                8,
+            ),
+        ]
+    } else {
+        vec![
+            stream_event(
+                "session",
+                "deep_research",
+                "",
+                "",
+                json!({ "session_id": session_id, "turn_id": turn_id }),
+                ids,
+                1,
+            ),
+            stream_event(
+                "stage_start",
+                "research_planner",
+                "decomposing",
+                "Generating an outline preview before running the full research pipeline.",
+                json!({
+                    "capability": "deep_research",
+                    "outline_preview": true,
+                    "research_config": normalized_config
+                }),
+                ids,
+                2,
+            ),
+            stream_event(
+                "thinking",
+                "research_planner",
+                "decomposing",
+                "Prepared research subtopics from the requested mode, depth, and sources.",
+                json!({ "sub_topics": result["sub_topics"].clone() }),
+                ids,
+                3,
+            ),
+            stream_event(
+                "content",
+                "research_planner",
+                "decomposing",
+                &response,
+                json!({
+                    "capability": "deep_research",
+                    "outline_preview": true,
+                    "sub_topics": result["sub_topics"].clone(),
+                    "research_config": result["research_config"].clone()
+                }),
+                ids,
+                4,
+            ),
+            stream_event(
+                "stage_end",
+                "research_planner",
+                "decomposing",
+                "Outline preview is ready for confirmation.",
+                json!({
+                    "outline_preview": true,
+                    "sub_topics": result["sub_topics"].clone()
+                }),
+                ids,
+                5,
+            ),
+            stream_event(
+                "done",
+                "deep_research",
+                "",
+                "",
+                json!({ "status": "completed" }),
+                ids,
+                6,
+            ),
+        ]
+    };
     let _ = persist_chat_turn(
         state,
         &persistence_payload,
@@ -23916,6 +24021,27 @@ fn build_deep_research_outline_preview(effective_content: &str, config: &Value) 
     })
 }
 
+fn build_deep_research_confirmed_report(effective_content: &str, config: &Value) -> Value {
+    let topic = deep_research_topic(effective_content);
+    let sub_topics = deep_research_sub_topics(&topic, config);
+    let response = deep_research_report_markdown(&topic, &sub_topics, config);
+    json!({
+        "response": response,
+        "content": response,
+        "outline_preview": false,
+        "sub_topics": sub_topics,
+        "topic": topic,
+        "research_config": config,
+        "metadata": {
+            "confirmed_outline_used": true,
+            "sub_topics": sub_topics,
+            "sources": config["sources"].clone(),
+            "mode": config["mode"].clone(),
+            "depth": config["depth"].clone()
+        }
+    })
+}
+
 fn deep_research_topic(effective_content: &str) -> String {
     let topic = effective_content
         .lines()
@@ -24050,6 +24176,54 @@ fn deep_research_outline_markdown(topic: &str, sub_topics: &[Value], config: &Va
     lines.join("\n").trim_end().to_string()
 }
 
+fn deep_research_report_markdown(topic: &str, sub_topics: &[Value], config: &Value) -> String {
+    let sources = config["sources"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "web".to_string());
+    let mut lines = vec![
+        format!("# Research Report: {topic}"),
+        String::new(),
+        format!(
+            "Mode: {} | Depth: {} | Sources: {}",
+            config["mode"].as_str().unwrap_or("report"),
+            config["depth"].as_str().unwrap_or("standard"),
+            sources
+        ),
+        String::new(),
+        "This report was generated from a user-confirmed outline and keeps the confirmed section order.".to_string(),
+        String::new(),
+    ];
+    for (index, item) in sub_topics.iter().enumerate() {
+        let title = item["title"].as_str().unwrap_or("Research section");
+        let overview = item["overview"].as_str().unwrap_or_default();
+        lines.push(format!("## {}. {title}", index + 1));
+        if !overview.is_empty() {
+            lines.push(overview.to_string());
+        }
+        lines.push(format!(
+            "Finding: {title} frames the requested topic, `{topic}`, using the selected research sources."
+        ));
+        lines.push(format!(
+            "Evidence plan: validate claims against {sources} sources before using this section in downstream answers."
+        ));
+        lines.push(String::new());
+    }
+    lines.push("## Synthesis".to_string());
+    lines.push(format!(
+        "The confirmed outline yields {} section(s) that can be researched, cited, and revised independently.",
+        sub_topics.len()
+    ));
+    lines.join("\n").trim_end().to_string()
+}
+
 fn deep_research_trace(effective_content: &str, response: &str, result: &Value) -> StudyTrace {
     let mut trace =
         SocartesOrchestrator::new().run_with_retrieved_context(effective_content, "", Vec::new());
@@ -24058,11 +24232,16 @@ fn deep_research_trace(effective_content: &str, response: &str, result: &Value) 
     trace.draft.open_gaps = Vec::new();
     trace.review.status = "approved".to_string();
     trace.review.approved = true;
+    let result_kind = if result["outline_preview"].as_bool().unwrap_or(false) {
+        "outline preview"
+    } else {
+        "confirmed report"
+    };
     trace.reflection_events.push(ReflectionEvent {
         event_type: "self_correction".to_string(),
         agent: "research_planner".to_string(),
         message: format!(
-            "Generated {} deep_research outline preview sections.",
+            "Generated {} deep_research {result_kind} sections.",
             result["sub_topics"]
                 .as_array()
                 .map(Vec::len)

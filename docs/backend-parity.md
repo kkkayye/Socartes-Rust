@@ -287,6 +287,7 @@ python3 tools/api_parity_scan.py \
 ## 2026-05-30 Chat Streaming 与 Book Runtime 增量
 
 - Python unified WS 的 selected LLM + native tool call 语义经只读审计确认：tool-call planning 请求本身是非流式，RAG/tool 执行通过 Socartes 事件流报告进度，工具结果注入后最终回答才走 provider streaming。Rust 新增合同 `chat_ws_start_turn_streams_final_chunks_after_selected_llm_tool_call`，锁定第一段 `stream=false/tools/tool_choice=auto`、第二段 `stream=true/stream_options.include_usage=true`、RAG tool result 注入 second request、最终 WebSocket 输出两个 `content` chunk。
+- Deep Research confirmed outline 二阶段已补：无 `confirmed_outline` 仍返回 Python 风格 outline preview；非空 `confirmed_outline` 现在跳过 preview，发出 `researching -> reporting` 阶段事件，按已确认 section 顺序生成 `response/content/metadata.confirmed_outline_used/sub_topics/research_config`，合同 `deep_research_execute_stream_with_confirmed_outline_runs_report_contract` 覆盖该路径。
 - Book runtime 新增同页 active compile claim：`AppState.book_runtime.compiling_pages` 会让同一 `book_id/page_id` 的并发 compile 请求共享首个 active compile；等待者在首个请求完成后读取已写入 page，不再重复生成和写日志。合同 `book_compile_page_concurrent_force_requests_share_active_claim_like_python` 先确认旧行为会对 8 个并发 force compile 写 8 条 `compile_page` log，再验证现在只写 1 条，覆盖 Python `BookEngine._claim_page_compile` 的核心并发语义。
 - 这次只补了 active page claim 和最终回答 SSE 合同；Book 仍未完成 Python `BookCompiler` 的 LLM-first planner、逐 block provider/RAG generator、后台 auto_compile queue、block concurrency 和 generator 质量迁移。
 

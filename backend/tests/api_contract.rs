@@ -12248,6 +12248,90 @@ async fn deep_research_execute_stream_returns_outline_preview_contract() {
 }
 
 #[tokio::test]
+async fn deep_research_execute_stream_with_confirmed_outline_runs_report_contract() {
+    let response = app()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/capabilities/deep_research/execute-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "content": "Agentic RAG vs traditional RAG",
+                        "tools": ["rag", "web_search", "paper_search"],
+                        "knowledge_bases": [],
+                        "language": "en",
+                        "config": {
+                            "mode": "report",
+                            "depth": "quick",
+                            "sources": ["web"],
+                            "confirmed_outline": [
+                                {
+                                    "title": "Confirmed Alpha",
+                                    "overview": "Use this first confirmed section."
+                                },
+                                {
+                                    "title": "Confirmed Beta",
+                                    "overview": "Use this second confirmed section."
+                                }
+                            ]
+                        },
+                        "attachments": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(response).await;
+    let events = parse_sse_data_events(&stream);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "stage_start" && event["stage"] == "researching"),
+        "confirmed deep_research should enter researching stage: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "content"
+                && event["stage"] == "reporting"
+                && event["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Confirmed Alpha"))
+        }),
+        "confirmed deep_research should stream a report using the confirmed outline: {events:?}"
+    );
+
+    let result = events
+        .iter()
+        .find(|event| event["success"] == true && event["data"]["result"].is_object())
+        .expect("deep_research result event");
+    let result_data = &result["data"]["result"];
+    assert_ne!(result_data["outline_preview"], true);
+    assert_eq!(result_data["response"], result_data["content"]);
+    assert!(
+        result_data["response"]
+            .as_str()
+            .is_some_and(|content| content.contains("Confirmed Alpha"))
+    );
+    assert_eq!(result_data["metadata"]["confirmed_outline_used"], true);
+    assert_eq!(
+        result_data["metadata"]["sub_topics"][0]["title"],
+        "Confirmed Alpha"
+    );
+    assert_eq!(result_data["research_config"]["mode"], "report");
+    assert_eq!(result_data["research_config"]["depth"], "quick");
+    assert_eq!(result_data["research_config"]["sources"], json!(["web"]));
+}
+
+#[tokio::test]
 async fn plugins_capability_stream_forwards_config_and_attachments_into_turn_request_snapshot() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
