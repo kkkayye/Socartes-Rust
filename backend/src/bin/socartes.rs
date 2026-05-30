@@ -266,7 +266,15 @@ enum PluginCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    Show,
+    Show(ConfigShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigShowArgs {
+    #[arg(long)]
+    home: Option<PathBuf>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    api: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1377,7 +1385,176 @@ async fn plugin_command(api: &ApiClient, command: PluginCommand) -> CliResult {
 
 async fn config_command(api: &ApiClient, command: ConfigCommand) -> CliResult {
     match command {
-        ConfigCommand::Show => print_json(&api.get_json("/api/v1/settings").await?),
+        ConfigCommand::Show(args) => {
+            if args.api {
+                return print_json(&api.get_json("/api/v1/settings").await?);
+            }
+            print_json(&local_config_summary(args.home)?)
+        }
+    }
+}
+
+fn local_config_summary(home: Option<PathBuf>) -> CliResult<Value> {
+    let data_root = data_root_from_home(home);
+    let settings_root = data_root.join("settings");
+    let catalog = read_json_or_default(&settings_root.join("catalog.json"), default_cli_catalog())?;
+    let ui = read_json_or_default(&settings_root.join("ui.json"), default_cli_ui_settings())?;
+    Ok(json!({
+        "ports": local_ports_summary(&ui),
+        "llm": local_llm_summary(&catalog),
+        "embedding": local_embedding_summary(&catalog),
+        "search": local_search_summary(&catalog),
+        "language": ui["language"].as_str().unwrap_or("en"),
+        "tools": local_tools_summary(&ui)
+    }))
+}
+
+fn data_root_from_home(home: Option<PathBuf>) -> PathBuf {
+    match home {
+        Some(home) => home.join("data"),
+        None => env::var("SOCARTES_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data")),
+    }
+}
+
+fn read_json_or_default(path: &Path, default: Value) -> CliResult<Value> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn local_ports_summary(ui: &Value) -> Value {
+    json!({
+        "backend": ui.pointer("/ports/backend")
+            .or_else(|| ui.get("backend_port"))
+            .cloned()
+            .unwrap_or_else(|| json!(8000)),
+        "frontend": ui.pointer("/ports/frontend")
+            .or_else(|| ui.get("frontend_port"))
+            .cloned()
+            .unwrap_or_else(|| json!(3000))
+    })
+}
+
+fn local_llm_summary(catalog: &Value) -> Value {
+    let service = &catalog["services"]["llm"];
+    let profile = active_service_profile(catalog, "llm");
+    let model = active_service_model(service, profile);
+    let binding = profile_string(profile, "binding");
+    json!({
+        "binding_hint": binding,
+        "provider": binding,
+        "provider_mode": local_provider_mode(&binding),
+        "model": model_string(model, "model")
+            .or_else(|| model_string(model, "id"))
+            .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+            .unwrap_or_default(),
+        "base_url": profile_string(profile, "base_url"),
+        "api_version": profile_string(profile, "api_version"),
+        "extra_headers": profile
+            .and_then(|value| value.get("extra_headers"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        "api_key": masked_secret(profile_string(profile, "api_key"))
+    })
+}
+
+fn local_embedding_summary(catalog: &Value) -> Value {
+    let service = &catalog["services"]["embedding"];
+    let profile = active_service_profile(catalog, "embedding");
+    let model = active_service_model(service, profile);
+    let binding = profile_string(profile, "binding");
+    json!({
+        "binding_hint": binding,
+        "provider": binding,
+        "provider_mode": local_provider_mode(&binding),
+        "model": model_string(model, "model")
+            .or_else(|| model_string(model, "id"))
+            .or_else(|| service["active_model_id"].as_str().map(str::to_string))
+            .unwrap_or_default(),
+        "base_url": profile_string(profile, "base_url"),
+        "api_version": profile_string(profile, "api_version"),
+        "extra_headers": profile
+            .and_then(|value| value.get("extra_headers"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        "api_key": masked_secret(profile_string(profile, "api_key")),
+        "dimension": model
+            .and_then(|value| value.get("dimension"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    })
+}
+
+fn local_search_summary(catalog: &Value) -> Value {
+    let profile = active_service_profile(catalog, "search");
+    let provider = profile_string(profile, "provider");
+    json!({
+        "provider": if provider.is_empty() { "(optional)" } else { provider.as_str() },
+        "requested_provider": if provider.is_empty() { "(optional)" } else { provider.as_str() },
+        "status": if provider.is_empty() { "optional" } else { "configured" },
+        "fallback_reason": Value::Null,
+        "base_url": profile_string(profile, "base_url"),
+        "proxy": profile_string(profile, "proxy"),
+        "api_key": masked_secret(profile_string(profile, "api_key"))
+    })
+}
+
+fn active_service_profile<'a>(catalog: &'a Value, service_name: &str) -> Option<&'a Value> {
+    let service = &catalog["services"][service_name];
+    let active_profile_id = service["active_profile_id"].as_str();
+    let profiles = service["profiles"].as_array()?;
+    profiles
+        .iter()
+        .find(|profile| profile["id"].as_str() == active_profile_id)
+        .or_else(|| profiles.first())
+}
+
+fn active_service_model<'a>(service: &'a Value, profile: Option<&'a Value>) -> Option<&'a Value> {
+    let active_model_id = service["active_model_id"].as_str();
+    let models = profile?.get("models")?.as_array()?;
+    models
+        .iter()
+        .find(|model| model["id"].as_str() == active_model_id)
+        .or_else(|| models.first())
+}
+
+fn local_provider_mode(binding: &str) -> &str {
+    match binding {
+        "" => "",
+        "openai" | "openai-compatible" => "openai-compatible",
+        "anthropic" => "anthropic",
+        "local" => "local",
+        _ => "custom",
+    }
+}
+
+fn profile_string(profile: Option<&Value>, key: &str) -> String {
+    profile
+        .and_then(|value| value[key].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn model_string(model: Option<&Value>, key: &str) -> Option<String> {
+    model.and_then(|value| value[key].as_str().map(str::to_string))
+}
+
+fn masked_secret(secret: String) -> &'static str {
+    if secret.trim().is_empty() {
+        "(not set)"
+    } else {
+        "***"
+    }
+}
+
+fn local_tools_summary(ui: &Value) -> Value {
+    match ui.get("tools").and_then(Value::as_object) {
+        Some(tools) => Value::Array(tools.keys().map(|key| json!(key)).collect()),
+        None => json!([]),
     }
 }
 

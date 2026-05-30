@@ -348,6 +348,100 @@ fn init_top_level_wizard_creates_runtime_layout_and_settings() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[test]
+fn config_show_reads_local_runtime_settings_without_api_like_python() {
+    let home = unique_temp_dir("config");
+    let settings_root = home.join("data/settings");
+    fs::create_dir_all(&settings_root).expect("settings directory should be created");
+    fs::write(
+        settings_root.join("catalog.json"),
+        serde_json::to_vec_pretty(&json!({
+            "services": {
+                "llm": {
+                    "active_profile_id": "llm-main",
+                    "active_model_id": "model-main",
+                    "profiles": [{
+                        "id": "llm-main",
+                        "binding": "openai",
+                        "base_url": "https://llm.example/v1",
+                        "api_key": "sk-llm-secret",
+                        "api_version": "2026-05-30",
+                        "extra_headers": {"X-Trace": "yes"},
+                        "models": [{"id": "model-main", "model": "gpt-test"}]
+                    }]
+                },
+                "embedding": {
+                    "active_profile_id": "embedding-main",
+                    "active_model_id": "embedding-model",
+                    "profiles": [{
+                        "id": "embedding-main",
+                        "binding": "openai",
+                        "base_url": "https://embedding.example/v1",
+                        "api_key": "sk-embedding-secret",
+                        "api_version": "",
+                        "models": [{"id": "embedding-model", "model": "text-embedding-test", "dimension": 1536}]
+                    }]
+                },
+                "search": {
+                    "active_profile_id": "search-main",
+                    "profiles": [{
+                        "id": "search-main",
+                        "provider": "brave",
+                        "base_url": "https://search.example",
+                        "proxy": "http://proxy.example",
+                        "api_key": "search-secret"
+                    }]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("catalog should be written");
+    fs::write(
+        settings_root.join("ui.json"),
+        serde_json::to_vec_pretty(&json!({
+            "language": "zh",
+            "ports": {"backend": 8123, "frontend": 3123},
+            "tools": {"rag": {}, "web_search": {}}
+        }))
+        .unwrap(),
+    )
+    .expect("ui settings should be written");
+
+    let output = socartes_cmd()
+        .args(["config", "show", "--home"])
+        .arg(&home)
+        .output()
+        .expect("socartes config show should execute");
+
+    assert!(
+        output.status.success(),
+        "config show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("sk-llm-secret") && !stdout.contains("sk-embedding-secret"),
+        "config output should not leak secrets:\n{stdout}"
+    );
+    let value: Value = serde_json::from_str(&stdout).expect("config output should be JSON");
+    assert_eq!(value["ports"]["backend"], 8123);
+    assert_eq!(value["ports"]["frontend"], 3123);
+    assert_eq!(value["llm"]["binding_hint"], "openai");
+    assert_eq!(value["llm"]["provider"], "openai");
+    assert_eq!(value["llm"]["model"], "gpt-test");
+    assert_eq!(value["llm"]["api_key"], "***");
+    assert_eq!(value["embedding"]["model"], "text-embedding-test");
+    assert_eq!(value["embedding"]["dimension"], 1536);
+    assert_eq!(value["search"]["provider"], "brave");
+    assert_eq!(value["search"]["api_key"], "***");
+    assert_eq!(value["language"], "zh");
+    assert_eq!(value["tools"], json!(["rag", "web_search"]));
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_json_posts_capability_stream_payload_and_prints_sse_payloads() {
     let captured = Arc::new(Mutex::new(None));
