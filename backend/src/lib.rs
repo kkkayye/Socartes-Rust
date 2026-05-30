@@ -25,7 +25,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{Stream, stream};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode as jwt_decode,
@@ -1796,6 +1796,10 @@ fn router_with_state(state: AppState) -> Router {
         .route("/api/v1/sessions/{session_id}", patch(update_session_title))
         .route("/api/v1/sessions/{session_id}", delete(delete_session))
         .route(
+            "/api/v1/sessions/{session_id}/regenerate-stream",
+            post(regenerate_session_stream),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/quiz-results",
             post(record_quiz_results),
         )
@@ -3250,7 +3254,9 @@ async fn handle_knowledge_progress_socket(
         if !send_knowledge_progress_event(&mut socket, progress.clone()).await {
             return;
         }
-        if expected_task_id.is_none() || progress_is_terminal(&progress) {
+        if progress_is_terminal(&progress)
+            || (expected_task_id.is_none() && !progress_is_recent_active(&progress))
+        {
             let _ = socket.send(Message::Close(None)).await;
             return;
         }
@@ -3337,6 +3343,39 @@ fn progress_is_terminal(progress: &Value) -> bool {
         progress["stage"].as_str(),
         Some("completed") | Some("error")
     )
+}
+
+fn progress_is_recent_active(progress: &Value) -> bool {
+    if progress_is_terminal(progress) {
+        return false;
+    }
+    if progress["stage"]
+        .as_str()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let Some(timestamp) = progress_timestamp_seconds(progress) else {
+        return false;
+    };
+    let age_seconds = now_seconds() - timestamp;
+    (0.0..120.0).contains(&age_seconds)
+}
+
+fn progress_timestamp_seconds(progress: &Value) -> Option<f64> {
+    if let Some(timestamp) = progress["timestamp"].as_f64() {
+        return Some(timestamp);
+    }
+    let raw = progress["timestamp"].as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<f64>().ok().or_else(|| {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|datetime| datetime.timestamp() as f64)
+    })
 }
 
 async fn send_knowledge_progress_event(socket: &mut WebSocket, progress: Value) -> bool {
@@ -22635,6 +22674,74 @@ async fn execute_plugin_capability_stream(
         }),
     ));
 
+    sse_response(body).into_response()
+}
+
+async fn regenerate_session_stream(
+    State(state): State<AppState>,
+    Extension(auth_payload): Extension<AuthTokenPayload>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> axum::response::Response {
+    let mut body = String::new();
+    body.push_str(&sse(
+        "process_log",
+        json!({
+            "level": "INFO",
+            "message": format!("Regenerating session {session_id}"),
+            "logger": "deeptutor.cli.stdout",
+            "timestamp": now_seconds(),
+            "context": { "capability": "chat", "sink": "cli" }
+        }),
+    ));
+    let regenerate_request = json!({
+        "type": "regenerate",
+        "session_id": session_id,
+        "overrides": payload["overrides"].clone()
+    });
+    let regenerate_payload = match regenerate_chat_payload(&state, &regenerate_request).await {
+        Ok(payload) => payload,
+        Err(reason) => {
+            body.push_str(&sse(
+                "error",
+                json!({
+                    "type": "error",
+                    "content": reason,
+                    "metadata": {
+                        "turn_terminal": true,
+                        "status": "rejected",
+                        "reason": reason
+                    },
+                    "elapsed_ms": 1
+                }),
+            ));
+            return sse_response(body).into_response();
+        }
+    };
+    let (session_id, turn_id, events) =
+        execute_chat_turn(&state, &regenerate_payload, Some(&auth_payload)).await;
+    let mut final_data = json!({});
+    for event in events {
+        if event["type"] == "done" {
+            continue;
+        }
+        if event["type"] == "content" {
+            final_data["content"] = event["content"].clone();
+        }
+        body.push_str(&sse("stream", event));
+    }
+    body.push_str(&sse(
+        "result",
+        json!({
+            "success": true,
+            "data": {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "result": final_data
+            },
+            "elapsed_ms": 1
+        }),
+    ));
     sse_response(body).into_response()
 }
 

@@ -8548,6 +8548,96 @@ Progress websocket notes for course indexing.\r\n\
 }
 
 #[tokio::test]
+async fn knowledge_progress_ws_without_task_id_follows_recent_active_task_like_python() {
+    let root = unique_test_knowledge_root();
+    let course_dir = root.join("bases").join("active-progress-course");
+    fs::create_dir_all(course_dir.join("files")).unwrap();
+    let task_id = "kb_upload_20260530_120000_active";
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs()
+        .to_string();
+    fs::write(
+        course_dir.join("progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "task_id": task_id,
+            "stage": "processing",
+            "message": "Indexing uploaded documents",
+            "percent": 40,
+            "progress_percent": 40,
+            "timestamp": timestamp
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!(
+        "ws://{addr}/api/v1/knowledge/active-progress-course/progress/ws"
+    ))
+    .await
+    .expect("knowledge progress websocket should connect");
+
+    let initial = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("initial progress websocket event")
+        .expect("initial socket message")
+        .expect("valid initial socket message");
+    let TungsteniteMessage::Text(initial_text) = initial else {
+        panic!("expected text progress event");
+    };
+    let initial_event: Value = serde_json::from_str(&initial_text).unwrap();
+    assert_eq!(initial_event["type"], "progress");
+    assert_eq!(initial_event["data"]["task_id"], task_id);
+    assert_eq!(initial_event["data"]["stage"], "processing");
+
+    fs::write(
+        course_dir.join("progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "task_id": task_id,
+            "stage": "completed",
+            "message": "Knowledge base initialization complete!",
+            "percent": 100,
+            "progress_percent": 100,
+            "timestamp": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs()
+                .to_string()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let terminal = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("terminal progress websocket event")
+        .expect("terminal socket message")
+        .expect("valid terminal socket message");
+    let TungsteniteMessage::Text(terminal_text) = terminal else {
+        panic!("expected terminal text progress event, got {terminal:?}");
+    };
+    let terminal_event: Value = serde_json::from_str(&terminal_text).unwrap();
+    assert_eq!(terminal_event["type"], "progress");
+    assert_eq!(terminal_event["data"]["task_id"], task_id);
+    assert_eq!(terminal_event["data"]["stage"], "completed");
+    assert_eq!(terminal_event["data"]["percent"], 100);
+
+    let _ = socket.close(None).await;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn knowledge_reindex_failure_returns_task_and_failed_sse_like_python_background_task() {
     let root = unique_test_knowledge_root();
     let app = app_with_knowledge_root(&root);
@@ -21778,6 +21868,98 @@ async fn chat_ws_regenerate_reuses_last_user_without_duplicating_message() {
     assert_eq!(user_messages.len(), 1);
     assert_eq!(assistant_messages.len(), 1);
     assert_eq!(user_messages[0]["content"], original_question);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn session_regenerate_stream_matches_python_cli_regenerate_contract() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let original_question = "Explain the CLI regenerate contract from the previous user turn.";
+    let turn_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "start_turn",
+                        "content": original_question,
+                        "language": "en",
+                        "capability": "chat",
+                        "tools": ["rag"],
+                        "knowledge_bases": ["socartes-rust-rag"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_response.status(), http::StatusCode::OK);
+    let first_turn = json_response(turn_response).await;
+    let session_id = first_turn["session_id"].as_str().unwrap().to_string();
+
+    let regenerate_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/sessions/{session_id}/regenerate-stream"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "overrides": {
+                            "capability": "chat",
+                            "tools": ["rag"],
+                            "knowledge_bases": ["socartes-rust-rag"],
+                            "language": "en"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(regenerate_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        regenerate_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let stream = text_response(regenerate_response).await;
+    let events = parse_sse_events(&stream);
+    assert!(
+        events.iter().any(|(event, _)| event == "result"),
+        "regenerate stream should end with result event: {stream}"
+    );
+    let session_event = events
+        .iter()
+        .map(|(_, payload)| payload)
+        .find(|payload| payload["type"] == "session")
+        .expect("session stream event");
+    assert_eq!(session_event["metadata"]["regenerate"], true);
+    assert!(
+        session_event["metadata"]["regenerated_from_message_id"]
+            .as_u64()
+            .is_some()
+    );
+    let content_event = events
+        .iter()
+        .map(|(_, payload)| payload)
+        .find(|payload| payload["type"] == "content")
+        .expect("content stream event");
+    assert!(
+        content_event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(original_question))
+    );
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }

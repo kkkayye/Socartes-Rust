@@ -47,6 +47,17 @@ async fn capture_capability_stream(
     )
 }
 
+async fn capture_new_session_stream(
+    State(captured): State<Arc<Mutex<Vec<Value>>>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    captured.lock().await.push(payload);
+    (
+        [("content-type", "text/event-stream")],
+        "event: stream\ndata: {\"type\":\"session\",\"session_id\":\"session-new\",\"turn_id\":\"turn-new\",\"metadata\":{\"session_id\":\"session-new\",\"turn_id\":\"turn-new\"}}\n\nevent: stream\ndata: {\"type\":\"content\",\"stage\":\"executor\",\"content\":\"first answer\"}\n\nevent: result\ndata: {\"success\":true,\"data\":{\"session_id\":\"session-new\",\"turn_id\":\"turn-new\",\"result\":{\"content\":\"first answer\"}},\"elapsed_ms\":1}\n\n",
+    )
+}
+
 async fn existing_cli_session() -> Json<Value> {
     Json(json!({
         "id": "session-existing",
@@ -63,6 +74,17 @@ async fn existing_cli_session() -> Json<Value> {
         },
         "messages": []
     }))
+}
+
+async fn capture_regenerate_stream(
+    State(captured): State<Arc<Mutex<Vec<Value>>>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    captured.lock().await.push(payload);
+    (
+        [("content-type", "text/event-stream")],
+        "event: stream\ndata: {\"type\":\"content\",\"stage\":\"executor\",\"content\":\"regenerated answer\"}\n\nevent: result\ndata: {\"success\":true,\"data\":{\"turn_id\":\"turn-regenerated\",\"result\":{\"content\":\"regenerated answer\"}},\"elapsed_ms\":1}\n\n",
+    )
 }
 
 #[test]
@@ -219,6 +241,121 @@ async fn run_json_posts_capability_stream_payload_and_prints_sse_payloads() {
     assert_eq!(payload["language"], "zh");
     assert_eq!(payload["config"]["temperature"], 0);
     assert_eq!(payload["config"]["render_mode"], "auto");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_first_message_updates_session_and_enables_retry_like_python() {
+    let captured_turns = Arc::new(Mutex::new(Vec::new()));
+    let captured_regenerates = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/plugins/capabilities/chat/execute-stream",
+            post(capture_new_session_stream),
+        )
+        .with_state(captured_turns.clone())
+        .route(
+            "/api/v1/sessions/session-new/regenerate-stream",
+            post(capture_regenerate_stream),
+        )
+        .with_state(captured_regenerates.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["chat"])
+        .write_stdin("hello\n/session\n/retry\n/quit\n")
+        .output()
+        .expect("socartes chat should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "socartes chat failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(
+        &stdout,
+        &["first answer", "session-new", "regenerated answer"],
+    );
+    assert!(
+        !stdout.contains("No active session yet"),
+        "retry should use the session created by the first chat turn:\n{stdout}"
+    );
+    let turns = captured_turns.lock().await;
+    assert_eq!(turns.len(), 1);
+    assert!(turns[0].get("session_id").is_none());
+    let regenerates = captured_regenerates.lock().await;
+    assert_eq!(regenerates.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_regenerate_and_retry_match_python_repl_commands() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/v1/sessions/session-existing",
+            get(existing_cli_session),
+        )
+        .route(
+            "/api/v1/sessions/session-existing/regenerate-stream",
+            post(capture_regenerate_stream),
+        )
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = socartes_cmd()
+        .env("SOCARTES_API_URL", format!("http://{address}"))
+        .args(["chat", "--session", "session-existing"])
+        .write_stdin("/regenerate\n/retry\n/quit\n")
+        .output()
+        .expect("socartes chat should execute");
+    server.abort();
+
+    assert!(
+        output.status.success(),
+        "socartes chat failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_contains_all(&stdout, &["regenerated answer", "turn-regenerated"]);
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Unknown chat command"),
+        "/regenerate and /retry must be first-class Python-compatible chat commands"
+    );
+    let calls = captured.lock().await;
+    assert_eq!(
+        calls.len(),
+        2,
+        "both /regenerate and /retry should call the backend"
+    );
+    for payload in calls.iter() {
+        assert_eq!(payload["overrides"]["capability"], "deep_solve");
+        assert_eq!(payload["overrides"]["tools"], json!(["rag", "web_search"]));
+        assert_eq!(
+            payload["overrides"]["knowledge_bases"],
+            json!(["course-ai"])
+        );
+        assert_eq!(payload["overrides"]["language"], "zh");
+        assert_eq!(
+            payload["overrides"]["history_references"],
+            json!(["history-1"])
+        );
+        assert_eq!(
+            payload["overrides"]["notebook_references"],
+            json!([{"notebook_id":"nb1","record_ids":["r1"]}])
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

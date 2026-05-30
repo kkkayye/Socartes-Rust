@@ -478,7 +478,8 @@ async fn run_capability(api: &ApiClient, args: &RunArgs) -> CliResult {
             format: args.format,
         },
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 struct CapabilityTurn<'a> {
@@ -494,7 +495,10 @@ struct CapabilityTurn<'a> {
     format: OutputFormat,
 }
 
-async fn execute_capability(api: &ApiClient, turn: CapabilityTurn<'_>) -> CliResult {
+async fn execute_capability(
+    api: &ApiClient,
+    turn: CapabilityTurn<'_>,
+) -> CliResult<Option<StreamIdentity>> {
     let mut payload = json!({
         "content": turn.content,
         "tools": turn.tools,
@@ -517,7 +521,9 @@ async fn execute_capability(api: &ApiClient, turn: CapabilityTurn<'_>) -> CliRes
             &payload,
         )
         .await?;
-    render_sse(&text, turn.format)
+    let identity = stream_identity_from_sse(&text);
+    render_sse(&text, turn.format)?;
+    Ok(identity)
 }
 
 fn render_sse(text: &str, format: OutputFormat) -> CliResult {
@@ -639,12 +645,17 @@ async fn chat_repl(api: &ApiClient, args: ChatArgs) -> CliResult {
             continue;
         }
         if line.starts_with('/') {
+            let command = line.split_whitespace().next().unwrap_or_default();
+            if matches!(command, "/regenerate" | "/retry") {
+                regenerate_chat_turn(api, &mut state).await?;
+                continue;
+            }
             if apply_chat_command(line, &mut state)? {
                 continue;
             }
             break;
         }
-        execute_capability(
+        let identity = execute_capability(
             api,
             CapabilityTurn {
                 capability: &state.capability,
@@ -660,9 +671,85 @@ async fn chat_repl(api: &ApiClient, args: ChatArgs) -> CliResult {
             },
         )
         .await?;
+        if let Some(identity) = identity
+            && let Some(session_id) = identity.session_id
+        {
+            state.session_id = Some(session_id);
+        }
         println!();
     }
     Ok(())
+}
+
+async fn regenerate_chat_turn(api: &ApiClient, state: &mut ChatState) -> CliResult {
+    let Some(session_id) = state
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        println!("No active session yet - send a message first.");
+        return Ok(());
+    };
+    let payload = json!({
+        "overrides": {
+            "capability": state.capability,
+            "tools": state.tools,
+            "knowledge_bases": state.knowledge_bases,
+            "language": state.language,
+            "notebook_references": state.notebook_references,
+            "history_references": state.history_references,
+            "config": state.config
+        }
+    });
+    let text = api
+        .post_sse_text(
+            &format!("/api/v1/sessions/{session_id}/regenerate-stream"),
+            &payload,
+        )
+        .await?;
+    render_sse(&text, OutputFormat::Rich)?;
+    if let Some(identity) = stream_identity_from_sse(&text) {
+        if let Some(session_id) = identity.session_id {
+            state.session_id = Some(session_id);
+        }
+        if let Some(turn_id) = identity.turn_id {
+            let session_label = state.session_id.as_deref().unwrap_or(&session_id);
+            println!(
+                "\nsession={session_label} turn={turn_id} capability={} (regenerated)",
+                state.capability
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StreamIdentity {
+    session_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+fn stream_identity_from_sse(text: &str) -> Option<StreamIdentity> {
+    let mut identity = StreamIdentity::default();
+    for (_, payload) in parse_sse_events(text) {
+        if identity.session_id.is_none() {
+            identity.session_id = payload["session_id"]
+                .as_str()
+                .or_else(|| payload["metadata"]["session_id"].as_str())
+                .or_else(|| payload["data"]["session_id"].as_str())
+                .map(ToString::to_string);
+        }
+        if identity.turn_id.is_none() {
+            identity.turn_id = payload["turn_id"]
+                .as_str()
+                .or_else(|| payload["metadata"]["turn_id"].as_str())
+                .or_else(|| payload["data"]["turn_id"].as_str())
+                .map(ToString::to_string);
+        }
+    }
+    (identity.session_id.is_some() || identity.turn_id.is_some()).then_some(identity)
 }
 
 struct ChatState {
