@@ -26,7 +26,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, SecondsFormat, Utc};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode as jwt_decode,
     encode as jwt_encode,
@@ -12284,6 +12284,7 @@ fn should_use_openai_responses_api(selection: &ChatRuntimeSelection) -> bool {
 
 struct ChatCompletionBodyOptions<'a> {
     enabled_tools: &'a [String],
+    knowledge_bases: &'a [String],
     additional_messages: &'a [Value],
     stream_response: bool,
 }
@@ -12299,7 +12300,7 @@ fn chat_completion_body(
 ) -> Value {
     let mut messages = vec![json!({
         "role": "system",
-        "content": chat_system_prompt(learner_context, trace)
+        "content": chat_system_prompt(learner_context, trace, options.knowledge_bases)
     })];
     messages.extend(chat_history_messages(state, session_id, 12));
     messages.push(json!({
@@ -12471,13 +12472,31 @@ fn responses_tool_definitions(tools: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn chat_system_prompt(learner_context: &str, trace: &StudyTrace) -> String {
+fn chat_system_prompt(
+    learner_context: &str,
+    trace: &StudyTrace,
+    knowledge_bases: &[String],
+) -> String {
     let mut prompt = String::from(
         "You are Socartes, an agentic learning assistant. Answer the learner directly, cite or name retrieved course evidence when it is relevant, and do not invent facts outside the supplied context.",
+    );
+    prompt.push_str(
+        "\n\nStreaming protocol: start each assistant step with exactly one label on the first line: THINK for visible reasoning or progress, TOOL for an intended tool action, or FINISH for the learner-facing answer. Do not include these labels in the final answer text.",
     );
     if !learner_context.trim().is_empty() {
         prompt.push_str("\n\nLearner context:\n");
         prompt.push_str(learner_context.trim());
+    }
+    if !knowledge_bases.is_empty() {
+        prompt.push_str("\n\nCurrent selected course / knowledge base:\n");
+        for name in knowledge_bases
+            .iter()
+            .filter(|name| !name.trim().is_empty())
+        {
+            prompt.push_str("- ");
+            prompt.push_str(name.trim());
+            prompt.push('\n');
+        }
     }
     if !trace.retrieved_context.is_empty() {
         prompt.push_str("\n\nRetrieved context:\n");
@@ -13346,6 +13365,14 @@ async fn call_chat_completion_provider(
     selection: &ChatRuntimeSelection,
     body: Value,
 ) -> Result<ChatProviderResponse, String> {
+    call_chat_completion_provider_with_stream(selection, body, None).await
+}
+
+async fn call_chat_completion_provider_with_stream(
+    selection: &ChatRuntimeSelection,
+    body: Value,
+    stream_sender: Option<mpsc::UnboundedSender<Value>>,
+) -> Result<ChatProviderResponse, String> {
     let use_responses_api = should_use_openai_responses_api(selection);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -13355,25 +13382,45 @@ async fn call_chat_completion_provider(
     if use_responses_api {
         let responses_endpoint = openai_responses_endpoint(selection)?;
         let responses_body = responses_body_from_chat_completion(selection, &body);
-        let (status, text) = send_openai_compatible_request(
+        let (status, text, streamed_response) = send_openai_compatible_request_maybe_streaming(
             &client,
             selection,
             &responses_endpoint,
             &responses_body,
+            true,
+            stream_sender.clone(),
         )
         .await?;
         if status.is_success() {
+            if let Some(response) = streamed_response
+                && (response.content.is_some() || !response.tool_calls.is_empty())
+            {
+                return Ok(response);
+            }
             return parse_chat_provider_response_text(selection, &text, true);
         }
         if should_fallback_from_responses_error(status, &text) {
             let chat_endpoint = chat_completion_endpoint(selection)?;
-            let (chat_status, chat_text) =
-                send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+            let (chat_status, chat_text, chat_streamed_response) =
+                send_openai_compatible_request_maybe_streaming(
+                    &client,
+                    selection,
+                    &chat_endpoint,
+                    &body,
+                    false,
+                    stream_sender,
+                )
+                .await?;
             if !chat_status.is_success() {
                 return Err(format!(
                     "HTTP {} from {chat_endpoint}: {chat_text}",
                     chat_status.as_u16()
                 ));
+            }
+            if let Some(response) = chat_streamed_response
+                && (response.content.is_some() || !response.tool_calls.is_empty())
+            {
+                return Ok(response);
             }
             return parse_chat_provider_response_text(selection, &chat_text, false);
         }
@@ -13384,15 +13431,111 @@ async fn call_chat_completion_provider(
     }
 
     let chat_endpoint = chat_completion_endpoint(selection)?;
-    let (status, text) =
-        send_openai_compatible_request(&client, selection, &chat_endpoint, &body).await?;
+    let (status, text, streamed_response) = send_openai_compatible_request_maybe_streaming(
+        &client,
+        selection,
+        &chat_endpoint,
+        &body,
+        false,
+        stream_sender,
+    )
+    .await?;
     if !status.is_success() {
         return Err(format!(
             "HTTP {} from {chat_endpoint}: {text}",
             status.as_u16()
         ));
     }
+    if let Some(response) = streamed_response
+        && (response.content.is_some() || !response.tool_calls.is_empty())
+    {
+        return Ok(response);
+    }
     parse_chat_provider_response_text(selection, &text, false)
+}
+
+async fn send_openai_compatible_request_maybe_streaming(
+    client: &reqwest::Client,
+    selection: &ChatRuntimeSelection,
+    endpoint: &str,
+    body: &Value,
+    use_responses_api: bool,
+    stream_sender: Option<mpsc::UnboundedSender<Value>>,
+) -> Result<(StatusCode, String, Option<ChatProviderResponse>), String> {
+    if body["stream"].as_bool().unwrap_or(false) && stream_sender.is_some() {
+        return send_openai_compatible_streaming_request(
+            client,
+            selection,
+            endpoint,
+            body,
+            use_responses_api,
+            stream_sender.as_ref(),
+        )
+        .await;
+    }
+    let (status, text) = send_openai_compatible_request(client, selection, endpoint, body).await?;
+    Ok((status, text, None))
+}
+
+async fn send_openai_compatible_streaming_request(
+    client: &reqwest::Client,
+    selection: &ChatRuntimeSelection,
+    endpoint: &str,
+    body: &Value,
+    use_responses_api: bool,
+    stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+) -> Result<(StatusCode, String, Option<ChatProviderResponse>), String> {
+    let request = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let request = apply_openai_compatible_request_headers(
+        request,
+        &selection.api_key,
+        &selection.api_version,
+        &selection.extra_headers,
+    );
+    let response = request
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.map_err(|error| error.to_string())?;
+        return Ok((status, text, None));
+    }
+
+    let mut raw_text = String::new();
+    let mut buffer = String::new();
+    let mut accumulator = ChatCompletionStreamAccumulator::default();
+    let mut byte_stream = response.bytes_stream();
+    while let Some(chunk) = byte_stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        let text = String::from_utf8_lossy(&chunk);
+        raw_text.push_str(&text);
+        buffer.push_str(&text);
+        for block in drain_sse_blocks(&mut buffer) {
+            if let Some((event, payload)) = parse_sse_json_payload_block(&block) {
+                if use_responses_api {
+                    accumulator.handle_responses_payload(event.as_deref(), &payload, stream_sender);
+                } else {
+                    accumulator.handle_chat_payload(&payload, stream_sender);
+                }
+            }
+        }
+    }
+    if !buffer.trim().is_empty()
+        && let Some((event, payload)) = parse_sse_json_payload_block(&buffer)
+    {
+        if use_responses_api {
+            accumulator.handle_responses_payload(event.as_deref(), &payload, stream_sender);
+        } else {
+            accumulator.handle_chat_payload(&payload, stream_sender);
+        }
+    }
+    accumulator.flush_pending_delta(stream_sender);
+    let response = accumulator.into_response();
+    Ok((status, raw_text, Some(response)))
 }
 
 async fn send_openai_compatible_request(
@@ -13482,29 +13625,41 @@ fn looks_like_sse(text: &str) -> bool {
 
 fn parse_sse_json_payloads(text: &str) -> Vec<(Option<String>, Value)> {
     text.split("\n\n")
-        .filter_map(|block| {
-            let mut event = None::<String>;
-            let mut data_lines = Vec::new();
-            for line in block.lines() {
-                let line = line.trim_start();
-                if let Some(value) = line.strip_prefix("event:") {
-                    event = Some(value.trim().to_string());
-                } else if let Some(value) = line.strip_prefix("data:") {
-                    let value = value.trim_start();
-                    if value == "[DONE]" {
-                        return None;
-                    }
-                    data_lines.push(value);
-                }
-            }
-            if data_lines.is_empty() {
+        .filter_map(parse_sse_json_payload_block)
+        .collect()
+}
+
+fn parse_sse_json_payload_block(block: &str) -> Option<(Option<String>, Value)> {
+    let mut event = None::<String>;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        let line = line.trim_start();
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            let value = value.trim_start();
+            if value == "[DONE]" {
                 return None;
             }
-            serde_json::from_str::<Value>(&data_lines.join("\n"))
-                .ok()
-                .map(|payload| (event, payload))
-        })
-        .collect()
+            data_lines.push(value);
+        }
+    }
+    if data_lines.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(&data_lines.join("\n"))
+        .ok()
+        .map(|payload| (event, payload))
+}
+
+fn drain_sse_blocks(buffer: &mut String) -> Vec<String> {
+    let mut blocks = Vec::new();
+    while let Some(index) = buffer.find("\n\n") {
+        let block = buffer[..index].to_string();
+        buffer.drain(..index + 2);
+        blocks.push(block);
+    }
+    blocks
 }
 
 #[derive(Debug, Default)]
@@ -13515,38 +13670,150 @@ struct StreamingToolCall {
     arguments: String,
 }
 
-fn parse_chat_completion_stream_response(text: &str) -> Option<ChatProviderResponse> {
-    let mut content_chunks = Vec::new();
-    let mut reasoning_parts = Vec::new();
-    let mut tool_calls = BTreeMap::<usize, StreamingToolCall>::new();
-    let mut usage = None;
-    let mut finish_reason = None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelSegmentKind {
+    Thinking,
+    Content,
+    Tool,
+}
 
-    for (_, payload) in parse_sse_json_payloads(text) {
+#[derive(Debug, Default)]
+struct LabelStreamRouter {
+    current: Option<LabelSegmentKind>,
+    pending_prefix: String,
+}
+
+impl LabelStreamRouter {
+    fn route(&mut self, text: &str) -> Vec<(LabelSegmentKind, String)> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let text = if self.pending_prefix.is_empty() {
+            text.to_string()
+        } else {
+            let mut text_with_pending = std::mem::take(&mut self.pending_prefix);
+            text_with_pending.push_str(text);
+            text_with_pending
+        };
+        match labelled_stream_prefix(&text) {
+            LabelPrefixMatch::Complete(kind, content) => {
+                self.current = Some(kind);
+                return (!content.is_empty())
+                    .then(|| (kind, content.to_string()))
+                    .into_iter()
+                    .collect();
+            }
+            LabelPrefixMatch::Partial => {
+                self.pending_prefix = text;
+                return Vec::new();
+            }
+            LabelPrefixMatch::None => {}
+        }
+        let kind = self.current.unwrap_or(LabelSegmentKind::Content);
+        vec![(kind, text)]
+    }
+
+    fn flush_pending(&mut self) -> Option<(LabelSegmentKind, String)> {
+        if self.pending_prefix.is_empty() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.pending_prefix);
+        if let LabelPrefixMatch::Complete(kind, content) = labelled_stream_prefix(&text) {
+            self.current = Some(kind);
+            return (!content.is_empty())
+                .then(|| (kind, content.to_string()))
+                .into_iter()
+                .next();
+        }
+        let kind = self.current.unwrap_or(LabelSegmentKind::Content);
+        Some((kind, text))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelPrefixMatch<'a> {
+    Complete(LabelSegmentKind, &'a str),
+    Partial,
+    None,
+}
+
+fn labelled_stream_prefix(text: &str) -> LabelPrefixMatch<'_> {
+    let trimmed = text.trim_start_matches([' ', '\t', '\r', '\n']);
+    if trimmed.is_empty() {
+        return LabelPrefixMatch::None;
+    }
+    let labels = [
+        ("THINK", LabelSegmentKind::Thinking),
+        ("FINISH", LabelSegmentKind::Content),
+        ("TOOL", LabelSegmentKind::Tool),
+    ];
+    if labels
+        .iter()
+        .any(|(label, _)| label.starts_with(trimmed) && trimmed.len() < label.len())
+    {
+        return LabelPrefixMatch::Partial;
+    }
+    for (label, kind) in labels {
+        let Some(rest) = trimmed.strip_prefix(label) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return LabelPrefixMatch::Complete(kind, "");
+        }
+        let mut chars = rest.chars();
+        let separator = chars.next().unwrap_or_default();
+        if !matches!(separator, ':' | ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        let content = rest.trim_start_matches([':', ' ', '\t', '\r', '\n']);
+        return LabelPrefixMatch::Complete(kind, content);
+    }
+    LabelPrefixMatch::None
+}
+
+#[derive(Debug, Default)]
+struct ChatCompletionStreamAccumulator {
+    content_chunks: Vec<String>,
+    reasoning_parts: Vec<String>,
+    tool_calls: BTreeMap<usize, StreamingToolCall>,
+    usage: Option<Value>,
+    finish_reason: Option<String>,
+    router: LabelStreamRouter,
+}
+
+impl ChatCompletionStreamAccumulator {
+    fn handle_chat_payload(
+        &mut self,
+        payload: &Value,
+        stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+    ) {
         if !payload["usage"].is_null() {
-            usage = Some(payload["usage"].clone());
+            self.usage = Some(payload["usage"].clone());
         }
         for choice in payload["choices"].as_array().into_iter().flatten() {
             if let Some(reason) = parse_chat_textish_field(&choice["delta"]["reasoning_content"])
                 .or_else(|| parse_chat_textish_field(&choice["delta"]["reasoning"]))
             {
-                reasoning_parts.push(reason);
+                self.reasoning_parts.push(reason.clone());
+                send_provider_stream_event(stream_sender, "thinking", "thinking", &reason);
             }
             if let Some(content) = parse_chat_textish_field(&choice["delta"]["content"]) {
-                content_chunks.push(content);
+                self.route_content_delta(&content, stream_sender);
             }
             if let Some(reason) = choice["finish_reason"].as_str()
                 && !reason.trim().is_empty()
             {
-                finish_reason = Some(reason.to_string());
+                self.finish_reason = Some(reason.to_string());
             }
             for call in choice["delta"]["tool_calls"]
                 .as_array()
                 .into_iter()
                 .flatten()
             {
-                let index = call["index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
-                let entry = tool_calls.entry(index).or_default();
+                let index = call["index"]
+                    .as_u64()
+                    .unwrap_or(self.tool_calls.len() as u64) as usize;
+                let entry = self.tool_calls.entry(index).or_default();
                 if let Some(id) = call["id"].as_str().filter(|value| !value.is_empty()) {
                     entry.id = id.to_string();
                 }
@@ -13566,102 +13833,174 @@ fn parse_chat_completion_stream_response(text: &str) -> Option<ChatProviderRespo
         }
     }
 
-    let content = (!content_chunks.is_empty()).then(|| content_chunks.join(""));
-    let normalized_tool_calls = tool_calls
-        .into_iter()
-        .filter_map(|(index, call)| {
-            (!call.name.is_empty()).then(|| {
-                json!({
-                    "id": if call.id.is_empty() { format!("call_{index}") } else { call.id },
-                    "type": if call.kind.is_empty() { "function" } else { call.kind.as_str() },
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments
-                    }
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    Some(ChatProviderResponse {
-        content,
-        content_chunks,
-        tool_calls: normalized_tool_calls,
-        usage,
-        reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("")),
-        finish_reason,
-    })
-}
-
-fn parse_responses_provider_stream_response(text: &str) -> Option<ChatProviderResponse> {
-    let mut content_chunks = Vec::new();
-    let mut reasoning_parts = Vec::new();
-    let mut completed_response = None::<ChatProviderResponse>;
-    let mut usage = None;
-    let mut finish_reason = None;
-
-    for (event, payload) in parse_sse_json_payloads(text) {
+    fn handle_responses_payload(
+        &mut self,
+        event: Option<&str>,
+        payload: &Value,
+        stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+    ) {
         let event_type = event
-            .as_deref()
             .or_else(|| payload["type"].as_str())
             .unwrap_or_default();
         match event_type {
             "response.output_text.delta" | "response.text.delta" => {
                 if let Some(delta) = payload["delta"].as_str() {
-                    content_chunks.push(delta.to_string());
+                    self.route_content_delta(delta, stream_sender);
                 }
             }
             "response.reasoning_summary_text.delta"
             | "response.reasoning_text.delta"
             | "response.reasoning.delta" => {
                 if let Some(delta) = payload["delta"].as_str() {
-                    reasoning_parts.push(delta.to_string());
-                }
-            }
-            "response.completed" => {
-                if let Some(response) = parse_responses_provider_response(&payload["response"]) {
-                    completed_response = Some(response);
+                    self.reasoning_parts.push(delta.to_string());
+                    send_provider_stream_event(stream_sender, "thinking", "thinking", delta);
                 }
             }
             _ => {}
         }
         if !payload["response"]["usage"].is_null() {
-            usage = responses_usage_as_chat_usage(&payload["response"]["usage"]);
+            self.usage = responses_usage_as_chat_usage(&payload["response"]["usage"]);
         } else if !payload["usage"].is_null() {
-            usage = responses_usage_as_chat_usage(&payload["usage"]);
+            self.usage = responses_usage_as_chat_usage(&payload["usage"]);
         }
         if let Some(status) = payload["response"]["status"]
             .as_str()
             .or_else(|| payload["status"].as_str())
         {
-            finish_reason = Some(status.to_string());
+            self.finish_reason = Some(status.to_string());
         }
     }
 
+    fn route_content_delta(
+        &mut self,
+        content: &str,
+        stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+    ) {
+        for (kind, routed) in self.router.route(content) {
+            self.push_routed_delta(kind, routed, stream_sender);
+        }
+    }
+
+    fn flush_pending_delta(&mut self, stream_sender: Option<&mpsc::UnboundedSender<Value>>) {
+        if let Some((kind, routed)) = self.router.flush_pending() {
+            self.push_routed_delta(kind, routed, stream_sender);
+        }
+    }
+
+    fn push_routed_delta(
+        &mut self,
+        kind: LabelSegmentKind,
+        routed: String,
+        stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+    ) {
+        match kind {
+            LabelSegmentKind::Thinking => {
+                send_provider_stream_event(stream_sender, "thinking", "thinking", &routed);
+            }
+            LabelSegmentKind::Content => {
+                self.content_chunks.push(routed.clone());
+                send_provider_stream_event(stream_sender, "content", "responding", &routed);
+            }
+            LabelSegmentKind::Tool => {
+                send_provider_stream_event(stream_sender, "tool_call", "tool", &routed);
+            }
+        }
+    }
+
+    fn into_response(mut self) -> ChatProviderResponse {
+        self.flush_pending_delta(None);
+        let content = (!self.content_chunks.is_empty()).then(|| self.content_chunks.join(""));
+        let normalized_tool_calls = self
+            .tool_calls
+            .into_iter()
+            .filter_map(|(index, call)| {
+                (!call.name.is_empty()).then(|| {
+                    json!({
+                        "id": if call.id.is_empty() { format!("call_{index}") } else { call.id },
+                        "type": if call.kind.is_empty() { "function" } else { call.kind.as_str() },
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        ChatProviderResponse {
+            content,
+            content_chunks: self.content_chunks,
+            tool_calls: normalized_tool_calls,
+            usage: self.usage,
+            reasoning_content: (!self.reasoning_parts.is_empty())
+                .then(|| self.reasoning_parts.join("")),
+            finish_reason: self.finish_reason,
+        }
+    }
+}
+
+fn send_provider_stream_event(
+    stream_sender: Option<&mpsc::UnboundedSender<Value>>,
+    event_type: &str,
+    stage: &str,
+    content: &str,
+) {
+    let Some(sender) = stream_sender else {
+        return;
+    };
+    if content.is_empty() {
+        return;
+    }
+    let _ = sender.send(stream_event(
+        event_type,
+        "llm_provider",
+        stage,
+        content,
+        json!({ "status": "streaming", "source": "provider_stream" }),
+        StreamIds::empty(),
+        0,
+    ));
+}
+
+fn parse_chat_completion_stream_response(text: &str) -> Option<ChatProviderResponse> {
+    let mut accumulator = ChatCompletionStreamAccumulator::default();
+    for (_, payload) in parse_sse_json_payloads(text) {
+        accumulator.handle_chat_payload(&payload, None);
+    }
+    Some(accumulator.into_response())
+}
+
+fn parse_responses_provider_stream_response(text: &str) -> Option<ChatProviderResponse> {
+    let mut accumulator = ChatCompletionStreamAccumulator::default();
+    let mut completed_response = None::<ChatProviderResponse>;
+
+    for (event, payload) in parse_sse_json_payloads(text) {
+        if event.as_deref().or_else(|| payload["type"].as_str()) == Some("response.completed")
+            && let Some(response) = parse_responses_provider_response(&payload["response"])
+        {
+            completed_response = Some(response);
+        }
+        accumulator.handle_responses_payload(event.as_deref(), &payload, None);
+    }
+
+    let streamed_response = accumulator.into_response();
     if let Some(mut response) = completed_response {
-        if !content_chunks.is_empty() {
-            response.content = Some(content_chunks.join(""));
-            response.content_chunks = content_chunks;
+        if !streamed_response.content_chunks.is_empty() {
+            response.content = streamed_response.content;
+            response.content_chunks = streamed_response.content_chunks;
         }
-        if !reasoning_parts.is_empty() {
-            response.reasoning_content = Some(reasoning_parts.join(""));
+        if streamed_response.reasoning_content.is_some() {
+            response.reasoning_content = streamed_response.reasoning_content;
         }
-        if usage.is_some() {
-            response.usage = usage;
+        if streamed_response.usage.is_some() {
+            response.usage = streamed_response.usage;
         }
-        if finish_reason.is_some() {
-            response.finish_reason = finish_reason;
+        if streamed_response.finish_reason.is_some() {
+            response.finish_reason = streamed_response.finish_reason;
         }
         return Some(response);
     }
 
-    Some(ChatProviderResponse {
-        content: (!content_chunks.is_empty()).then(|| content_chunks.join("")),
-        content_chunks,
-        tool_calls: Vec::new(),
-        usage,
-        reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("")),
-        finish_reason,
-    })
+    Some(streamed_response)
 }
 
 fn apply_openai_compatible_request_headers(
@@ -24970,6 +25309,34 @@ async fn plugin_tool_result(
                 json!({ "tool": "brainstorm", "topic": topic, "context": context }),
             )
         }
+        "course_context" => {
+            let knowledge_bases = params
+                .get("knowledge_bases")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::trim))
+                        .filter(|name| !name.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let content = if knowledge_bases.is_empty() {
+                "No course or knowledge base is currently selected.".to_string()
+            } else {
+                format!(
+                    "Current selected course / knowledge base: {}",
+                    knowledge_bases.join(", ")
+                )
+            };
+            (
+                true,
+                content,
+                json!([]),
+                json!({ "tool": "course_context", "knowledge_bases": knowledge_bases }),
+            )
+        }
         "rag" => {
             let query = string_param(&params, "query").unwrap_or_default();
             let kb_names = string_param(&params, "kb_name")
@@ -25118,6 +25485,7 @@ fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
 fn plugin_tool_names() -> Vec<&'static str> {
     vec![
         "brainstorm",
+        "course_context",
         "rag",
         "web_search",
         "code_execution",
@@ -25136,6 +25504,11 @@ fn plugin_tool_definitions() -> Value {
                 tool_parameter("topic", "string", "The topic, goal, or problem to brainstorm about.", true, Value::Null, Value::Null),
                 tool_parameter("context", "string", "Optional supporting context, constraints, or background.", false, Value::Null, Value::Null)
             ]
+        },
+        {
+            "name": "course_context",
+            "description": "Return the current selected Socartes course or knowledge base for this chat turn. The backend injects the active course list.",
+            "parameters": []
         },
         {
             "name": "rag",
@@ -25787,6 +26160,11 @@ fn chat_provider_tool_params(
         Value::Object(_) => tool_call["function"]["arguments"].clone(),
         _ => json!({}),
     };
+    if tool_name == "course_context"
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert("knowledge_bases".to_string(), json!(knowledge_bases));
+    }
     if tool_name == "rag"
         && let Some(object) = params.as_object_mut()
     {
@@ -28516,8 +28894,10 @@ async fn run_chat_turn(
         config.insert("_stream_provider".to_string(), json!(true));
     }
 
-    let stream_process = should_stream_chat_process(&payload);
-    let seeded_identity = stream_process.then(|| {
+    let stream_prelude = should_stream_chat_process(&payload);
+    let provider_live_stream = should_stream_provider_tokens(&payload);
+    let stream_live_turn = stream_prelude || provider_live_stream;
+    let seeded_identity = stream_live_turn.then(|| {
         let identity = chat_turn_identity_from_payload(&payload);
         if payload["session_id"]
             .as_str()
@@ -28543,7 +28923,20 @@ async fn run_chat_turn(
     let mut final_persisted = false;
 
     if let Some(identity) = seeded_identity.as_ref() {
-        for event in chat_process_prelude_events(&payload, identity) {
+        let prelude_events = if stream_prelude {
+            chat_process_prelude_events(&payload, identity)
+        } else {
+            vec![stream_event(
+                "session",
+                "rust-backend",
+                "",
+                "",
+                chat_session_metadata(&payload, &identity.session_id, &identity.turn_id),
+                StreamIds::new(&identity.session_id, &identity.turn_id),
+                1,
+            )]
+        };
+        for event in prelude_events {
             let control =
                 drain_chat_control_messages(socket, state, &identity.turn_id, &live_turn).await;
             socket_open &= !control.socket_closed;
@@ -28558,8 +28951,79 @@ async fn run_chat_turn(
         }
     }
 
-    let turn = build_chat_turn_with_identity(state, &payload, auth_payload, seeded_identity).await;
-    let live_turn = if stream_process {
+    let (provider_stream_sender, mut provider_stream_receiver) = if provider_live_stream {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let mut build_future = Box::pin(build_chat_turn_with_identity_and_provider_stream(
+        state,
+        &payload,
+        auth_payload,
+        seeded_identity.clone(),
+        provider_stream_sender,
+    ));
+    let mut provider_streamed_content = false;
+    let mut next_live_seq = delivered_events
+        .iter()
+        .filter_map(|event| event["seq"].as_u64())
+        .max()
+        .unwrap_or_default()
+        + 1;
+    let turn = loop {
+        if let Some(receiver) = provider_stream_receiver.as_mut() {
+            tokio::select! {
+                maybe_event = receiver.recv() => {
+                    let Some(mut event) = maybe_event else {
+                        provider_stream_receiver = None;
+                        continue;
+                    };
+                    if let Some(identity) = seeded_identity.as_ref() {
+                        let control = drain_chat_control_messages(socket, state, &identity.turn_id, &live_turn).await;
+                        socket_open &= !control.socket_closed;
+                        if live_turn.cancel_requested.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        if event["type"] == "content" {
+                            provider_streamed_content = true;
+                        }
+                        event["session_id"] = json!(identity.session_id);
+                        event["turn_id"] = json!(identity.turn_id);
+                        event["seq"] = json!(next_live_seq);
+                        next_live_seq += 1;
+                        let _ = publish_chat_event(state, &payload, &live_turn, event.clone()).await;
+                        delivered_events.push(event.clone());
+                        if socket_open && send_stream_event(socket, event).await.is_err() {
+                            socket_open = false;
+                        }
+                    }
+                }
+                turn = &mut build_future => break turn,
+            }
+        } else {
+            break build_future.await;
+        }
+    };
+    if let Some(receiver) = provider_stream_receiver.as_mut() {
+        while let Ok(mut event) = receiver.try_recv() {
+            if let Some(identity) = seeded_identity.as_ref() {
+                if event["type"] == "content" {
+                    provider_streamed_content = true;
+                }
+                event["session_id"] = json!(identity.session_id);
+                event["turn_id"] = json!(identity.turn_id);
+                event["seq"] = json!(next_live_seq);
+                next_live_seq += 1;
+                let _ = publish_chat_event(state, &payload, &live_turn, event.clone()).await;
+                delivered_events.push(event.clone());
+                if socket_open && send_stream_event(socket, event).await.is_err() {
+                    socket_open = false;
+                }
+            }
+        }
+    }
+    let live_turn = if stream_live_turn {
         live_turn
     } else {
         state
@@ -28579,9 +29043,24 @@ async fn run_chat_turn(
         &turn.session_id,
         &turn.turn_id,
         next_seq,
-        stream_process,
+        stream_live_turn,
     );
     for event in events {
+        if provider_streamed_content && event["type"] == "content" {
+            if let Some(final_metadata) = event["metadata"].as_object() {
+                for delivered in delivered_events
+                    .iter_mut()
+                    .filter(|delivered| delivered["type"] == "content")
+                {
+                    if let Some(metadata) = delivered["metadata"].as_object_mut() {
+                        for (key, value) in final_metadata {
+                            metadata.entry(key.clone()).or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let control = drain_chat_control_messages(socket, state, &turn.turn_id, &live_turn).await;
         socket_open &= !control.socket_closed;
         if live_turn.cancel_requested.load(Ordering::SeqCst) {
@@ -28753,6 +29232,13 @@ fn should_stream_chat_process(payload: &Value) -> bool {
         .any(|tool| tool == "rag")
 }
 
+fn should_stream_provider_tokens(payload: &Value) -> bool {
+    payload["config"]["_stream_provider"]
+        .as_bool()
+        .unwrap_or(false)
+        && !payload["llm_selection"].is_null()
+}
+
 fn chat_process_prelude_events(payload: &Value, identity: &ChatTurnIdentity) -> Vec<Value> {
     let ids = StreamIds::new(&identity.session_id, &identity.turn_id);
     let content = payload["content"].as_str().unwrap_or_default();
@@ -28851,14 +29337,16 @@ async fn build_chat_turn(
     payload: &Value,
     auth_payload: Option<&AuthTokenPayload>,
 ) -> BuiltChatTurn {
-    build_chat_turn_with_identity(state, payload, auth_payload, None).await
+    build_chat_turn_with_identity_and_provider_stream(state, payload, auth_payload, None, None)
+        .await
 }
 
-async fn build_chat_turn_with_identity(
+async fn build_chat_turn_with_identity_and_provider_stream(
     state: &AppState,
     payload: &Value,
     auth_payload: Option<&AuthTokenPayload>,
     identity: Option<ChatTurnIdentity>,
+    provider_stream_sender: Option<mpsc::UnboundedSender<Value>>,
 ) -> BuiltChatTurn {
     let content = payload["content"]
         .as_str()
@@ -29018,11 +29506,18 @@ async fn build_chat_turn_with_identity(
             &trace,
             ChatCompletionBodyOptions {
                 enabled_tools: &enabled_tools,
+                knowledge_bases: &knowledge_bases,
                 additional_messages: &[],
                 stream_response: stream_first_response,
             },
         );
-        match call_chat_completion_provider(selection, body).await {
+        match call_chat_completion_provider_with_stream(
+            selection,
+            body,
+            provider_stream_sender.clone(),
+        )
+        .await
+        {
             Ok(response) => {
                 let mut metadata = json!({
                     "profile_id": selection.profile_id.as_str(),
@@ -29066,13 +29561,20 @@ async fn build_chat_turn_with_identity(
                         &trace,
                         ChatCompletionBodyOptions {
                             enabled_tools: &[],
+                            knowledge_bases: &knowledge_bases,
                             additional_messages: &additional_messages,
                             stream_response: payload["config"]["_stream_provider"]
                                 .as_bool()
                                 .unwrap_or(false),
                         },
                     );
-                    match call_chat_completion_provider(selection, body).await {
+                    match call_chat_completion_provider_with_stream(
+                        selection,
+                        body,
+                        provider_stream_sender.clone(),
+                    )
+                    .await
+                    {
                         Ok(final_response) => {
                             merge_chat_provider_response_metadata(&mut metadata, &final_response);
                             provider_content_chunks = final_response.content_chunks.clone();

@@ -43,6 +43,21 @@ SSE chunk：可见 `delta.content` 会按 chunk 逐条发 `content` 事件，完
 `delta.reasoning_content`/`delta.reasoning` 不进入可见答案，只进入 assistant metadata。
 带 native tool call 的首轮请求仍保持非流式，等 tool-call delta 聚合和 RAG 工具链事件完全补齐后再打开。
 
+同轮新增 `backend/tests/fixtures/llm_golden/` golden fixture 机制：
+`tools/record_python_chat_golden.py` 会从 Python Socartes chat pipeline 录制规范化事件投影，
+Rust contract test 再用 fixture 内的 OpenAI-compatible provider SSE 回放 selected LLM，
+逐事件比较 `thinking/content` 的 `type/stage/content` 顺序。当前首个 fixture 覆盖
+`THINK` / `FINISH` label 被 provider 按 token 分片时，Rust 不得把 label 碎片泄露为可见答案。
+在本机可用 DeepTutor venv 下可用下面命令校验录制结果没有漂移：
+
+```bash
+/home/coobabm/DeepTutor/.venv/bin/python tools/record_python_chat_golden.py --check
+```
+
+这仍不是完整 agentic parity：Python 的 native tool loop / observation / final response
+多阶段顺序还需要继续录制 tool-call golden fixture；Rust 当前的 `TOOL` label 只会流出
+`tool_call` 事件，不会驱动完整多轮工具执行循环。
+
 ## 2026-05-30 TutorBot MCP Runtime 增量
 
 TutorBot 的 MCP 支持从“配置可保存、工具名可放行”推进到 streamable HTTP

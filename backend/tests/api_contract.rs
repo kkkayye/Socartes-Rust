@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fs,
     io::{Cursor, Write},
     path::Path,
@@ -10,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -1099,6 +1100,112 @@ async fn spawn_sse_request_recorder(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), requests, task)
+}
+
+async fn spawn_delayed_sse_request_recorder(
+    chunks: Vec<(String, Duration)>,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let chunks = Arc::new(chunks);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let chunks = Arc::clone(&chunks);
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                let chunks = chunks.as_ref().clone();
+                let body_stream =
+                    futures_util::stream::iter(chunks).then(|(chunk, delay)| async move {
+                        if !delay.is_zero() {
+                            sleep(delay).await;
+                        }
+                        Ok::<_, Infallible>(Bytes::from(chunk))
+                    });
+                axum::response::Response::builder()
+                    .header(http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(body_stream))
+                    .unwrap()
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
+fn python_labelled_thinking_golden_fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "fixtures/llm_golden/python_labelled_thinking_chat.json"
+    ))
+    .expect("valid Python golden fixture")
+}
+
+fn golden_sse_chunks(fixture: &Value) -> Vec<(String, Duration)> {
+    fixture["provider_sse"]["chunks"]
+        .as_array()
+        .expect("provider SSE chunks")
+        .iter()
+        .map(|chunk| {
+            (
+                chunk["body"].as_str().expect("SSE body").to_string(),
+                Duration::from_millis(chunk["delay_ms"].as_u64().unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
+fn normalize_golden_event_stream(events: &[Value], fixture: &Value) -> Vec<Value> {
+    let event_types = fixture["projection"]["event_types"]
+        .as_array()
+        .expect("projected event types")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let fields = fixture["projection"]["fields"]
+        .as_array()
+        .expect("projected event fields")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    events
+        .iter()
+        .filter(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| event_types.iter().any(|expected| expected == &kind))
+        })
+        .map(|event| {
+            let mut object = serde_json::Map::new();
+            for field in &fields {
+                object.insert(
+                    (*field).to_string(),
+                    event.get(*field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            Value::Object(object)
+        })
+        .collect()
 }
 
 async fn spawn_sequential_raw_request_recorder(
@@ -20541,11 +20648,18 @@ async fn chat_ws_start_turn_streams_selected_llm_chat_completion_chunks() {
             .unwrap_or_default()
             .contains("Private provider reasoning")
     }));
-    assert_eq!(
-        content_events[0]["metadata"]["reasoning_content"],
-        "Private provider reasoning stays metadata-only."
+    let thinking_events = events
+        .iter()
+        .filter(|event| event["type"] == "thinking")
+        .collect::<Vec<_>>();
+    assert!(
+        thinking_events.iter().any(|event| {
+            event["content"].as_str() == Some("Private provider reasoning stays metadata-only.")
+        }),
+        "provider reasoning should stream through the thinking channel: {events:?}"
     );
-    assert_eq!(content_events[0]["metadata"]["usage"]["total_tokens"], 28);
+    assert!(content_events[0]["metadata"]["reasoning_content"].is_null());
+    assert!(content_events[0]["metadata"]["usage"].is_null());
     assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
 
     let recorded = requests.lock().await;
@@ -20587,6 +20701,217 @@ async fn chat_ws_start_turn_streams_selected_llm_chat_completion_chunks() {
         user["metadata"]["request_snapshot"]["config"]["_stream_provider"].is_null(),
         "internal streaming switch must not leak into persisted request snapshots"
     );
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_streams_labelled_thinking_before_delayed_finish_chunk() {
+    let root = unique_test_knowledge_root();
+    let think_prefix_chunk = concat!(
+        r#"data: {"id":"chatcmpl-label-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"TH"},"finish_reason":null}]}"#,
+        "\n\n"
+    )
+    .to_string();
+    let think_body_chunk = concat!(
+        r#"data: {"id":"chatcmpl-label-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"INK Checking the selected course before answering.\n"},"finish_reason":null}]}"#,
+        "\n\n"
+    )
+    .to_string();
+    let finish_prefix_chunk = concat!(
+        r#"data: {"id":"chatcmpl-label-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"FIN"},"finish_reason":null}]}"#,
+        "\n\n"
+    )
+    .to_string();
+    let finish_chunk = [
+        r#"data: {"id":"chatcmpl-label-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ISH The current course is orbital mirrors."},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":12,"total_tokens":29}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let (llm_base_url, requests, llm_server) = spawn_delayed_sse_request_recorder(vec![
+        (think_prefix_chunk, Duration::from_millis(0)),
+        (think_body_chunk, Duration::from_millis(0)),
+        (finish_prefix_chunk, Duration::from_millis(700)),
+        (finish_chunk, Duration::from_millis(700)),
+    ])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "What course am I studying right now?",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut early_events = Vec::new();
+    for _ in 0..3 {
+        let message = timeout(Duration::from_millis(250), socket.next())
+            .await
+            .expect("labelled provider thinking should stream before the delayed FINISH chunk")
+            .expect("socket message")
+            .expect("valid socket message");
+        let TungsteniteMessage::Text(text) = message else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        let saw_thinking = event["type"] == "thinking"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Checking the selected course"));
+        early_events.push(event);
+        if saw_thinking {
+            break;
+        }
+    }
+    assert!(
+        early_events.iter().any(|event| {
+            event["type"] == "thinking"
+                && event["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Checking the selected course"))
+        }),
+        "events before delayed FINISH chunk: {}",
+        serde_json::to_string_pretty(&early_events).unwrap()
+    );
+
+    let mut events = early_events;
+    events.extend(collect_ws_json_until(&mut socket, "done").await);
+    let answer = events
+        .iter()
+        .filter(|event| event["type"] == "content")
+        .filter_map(|event| event["content"].as_str())
+        .collect::<String>();
+    assert_eq!(answer, "The current course is orbital mirrors.");
+    assert!(
+        events
+            .iter()
+            .filter_map(|event| event["content"].as_str())
+            .all(|content| !content.contains("THINK") && !content.contains("FINISH")),
+        "label tokens should not be displayed as answer text: {events:?}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["payload"]["stream"], true);
+    let system_prompt = recorded[0]["payload"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("system prompt");
+    assert!(system_prompt.contains("THINK"));
+    assert!(system_prompt.contains("TOOL"));
+    assert!(system_prompt.contains("FINISH"));
+    drop(recorded);
+
+    server.abort();
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_replays_python_golden_llm_fixture_event_stream() {
+    let fixture = python_labelled_thinking_golden_fixture();
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) =
+        spawn_delayed_sse_request_recorder(golden_sse_chunks(&fixture)).await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            fixture["request"]["payload"].to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let actual = normalize_golden_event_stream(&events, &fixture);
+    let expected = fixture["expected_events"]
+        .as_array()
+        .expect("expected golden events")
+        .to_vec();
+    assert_eq!(
+        actual,
+        expected,
+        "Rust projected WS events differ from Python golden fixture {}",
+        fixture["name"].as_str().unwrap_or("<unnamed>")
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["payload"]["stream"], true);
+    drop(recorded);
 
     server.abort();
     llm_server.abort();
@@ -21293,6 +21618,108 @@ async fn chat_ws_start_turn_injects_text_attachment_into_selected_llm() {
         "Secret rubric phrase: amber lattice."
     );
 
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_selected_llm_receives_current_course_context_tool_and_system_prompt() {
+    let root = unique_test_knowledge_root();
+    let (llm_base_url, requests, llm_server) = spawn_sequential_request_recorder(vec![json!({
+        "id": "chatcmpl-course-context",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The current course is Course Context Astronomy."
+            },
+            "finish_reason": "stop"
+        }]
+    })])
+    .await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    create_markdown_knowledge_base(
+        app.clone(),
+        "course-context-astronomy",
+        "overview.md",
+        "This course studies orbital mirrors and telescope calibration.",
+    )
+    .await;
+
+    let chat_payload = json!({
+        "type": "start_turn",
+        "content": "What course am I studying right now?",
+        "language": "en",
+        "tools": ["course_context"],
+        "knowledge_bases": ["course-context-astronomy"],
+        "llm_selection": {
+            "profile_id": "mock-llm",
+            "model_id": "mock-model"
+        }
+    });
+    let chat_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/internal/test-chat-turn")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), http::StatusCode::OK);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
+    let system_prompt = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("system prompt");
+    assert!(
+        system_prompt.contains("Current selected course / knowledge base:"),
+        "system prompt should explicitly name the current course: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("- course-context-astronomy"),
+        "system prompt should include the selected course name: {system_prompt}"
+    );
+
+    let tools = recorded[0]["payload"]["tools"].as_array().expect("tools");
+    let course_context_tool = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "course_context")
+        .expect("course_context tool schema");
+    assert_eq!(course_context_tool["type"], "function");
+    assert!(
+        course_context_tool["function"]["parameters"]["required"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "course_context should not require model-provided course identifiers"
+    );
+
+    drop(recorded);
     llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }

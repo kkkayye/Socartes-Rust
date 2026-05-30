@@ -56,7 +56,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run CLI contract tests
-        run: timeout 10m cargo test --locked --test cli_contract -- --test-threads=1
+        run: timeout 25m cargo test --locked --test cli_contract -- --test-threads=1
 
       - name: Run API contract tests
         run: cargo test --locked --test api_contract

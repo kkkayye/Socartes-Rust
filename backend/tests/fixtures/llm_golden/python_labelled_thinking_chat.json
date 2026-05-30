@@ -1,0 +1,62 @@
+{
+  "name": "python_labelled_thinking_chat",
+  "source_runtime": "python-socartes",
+  "python_recorder": "tools/record_python_chat_golden.py",
+  "description": "Golden projection recorded from the Python Socartes chat pipeline for streamed thinking followed by a final answer. Rust replays the provider SSE below and must produce the same projected event order.",
+  "request": {
+    "payload": {
+      "type": "start_turn",
+      "content": "What course am I studying right now?",
+      "language": "en",
+      "tools": [],
+      "knowledge_bases": [],
+      "llm_selection": {
+        "profile_id": "mock-llm",
+        "model_id": "mock-model"
+      }
+    }
+  },
+  "provider_sse": {
+    "chunks": [
+      {
+        "body": "data: {\"id\":\"chatcmpl-python-golden\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"TH\"},\"finish_reason\":null}]}\n\n",
+        "delay_ms": 0
+      },
+      {
+        "body": "data: {\"id\":\"chatcmpl-python-golden\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"INK Checking the selected course before answering.\\n\"},\"finish_reason\":null}]}\n\n",
+        "delay_ms": 0
+      },
+      {
+        "body": "data: {\"id\":\"chatcmpl-python-golden\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"FIN\"},\"finish_reason\":null}]}\n\n",
+        "delay_ms": 0
+      },
+      {
+        "body": "data: {\"id\":\"chatcmpl-python-golden\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ISH The current course is orbital mirrors.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":12,\"total_tokens\":29}}\n\ndata: [DONE]\n\n",
+        "delay_ms": 0
+      }
+    ]
+  },
+  "projection": {
+    "event_types": [
+      "thinking",
+      "content"
+    ],
+    "fields": [
+      "type",
+      "stage",
+      "content"
+    ]
+  },
+  "expected_events": [
+    {
+      "type": "thinking",
+      "stage": "thinking",
+      "content": "Checking the selected course before answering.\n"
+    },
+    {
+      "type": "content",
+      "stage": "responding",
+      "content": "The current course is orbital mirrors."
+    }
+  ]
+}
