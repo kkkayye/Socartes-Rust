@@ -62,9 +62,11 @@ knowledge = "proxy"
 
 Known capabilities can be switched between `native`, `proxy`, and `shadow`.
 `proxy` forwards the request to Python, `native` keeps the Rust handler, and
-`shadow` currently returns Python's response while marking the response with
-`x-socartes-migration-mode: shadow` for migration logs. Reload the file without
-restarting Rust:
+HTTP/SSE `shadow` returns Python's response while a Rust native copy runs in the
+background and logs status, content type, SSE event-type sequence, body length,
+hash, truncation, and error differences. The user-visible response is marked
+with `x-socartes-migration-mode: shadow`. Reload the file without restarting
+Rust:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/admin/migration/reload
@@ -73,7 +75,36 @@ curl -X POST http://127.0.0.1:8000/api/v1/admin/migration/reload
 HTTP and SSE responses are streamed byte-for-byte from Python. WebSocket
 endpoints such as `/api/v1/ws`, `/api/v1/book/ws`,
 `/api/v1/knowledge/{name}/progress/ws`, tutorbot, quiz, and vision routes use a
-bidirectional splice.
+bidirectional splice. WebSocket routes in `shadow` mode currently keep the
+Python splice as the user-visible transport; native WebSocket double-run/diff is
+tracked as the next migration step because Axum's upgraded `WebSocket` cannot be
+shared by the Python splice and the native handler at the same time.
+
+During migration, Rust and Python must read the same state. For a systemd
+deployment, load the Python `.env` first so auth, PocketBase, model, and search
+settings use one source of truth, then pin the Rust process to the same data
+directories Python mounts:
+
+```ini
+EnvironmentFile=-/path/to/DeepTutor/.env
+Environment=SOCARTES_MIGRATION_CONFIG=/path/to/Socartes-Rust/migration.toml
+Environment=SOCARTES_KNOWLEDGE_ROOT=/path/to/DeepTutor/data/knowledge_bases
+Environment=SOCARTES_SETTINGS_ROOT=/path/to/DeepTutor/data/user/settings
+Environment=SOCARTES_MEMORY_ROOT=/path/to/DeepTutor/data/memory
+Environment=SOCARTES_BOOK_ROOT=/path/to/DeepTutor/data/user/workspace/book
+Environment=SOCARTES_OUTPUT_ROOT=/path/to/DeepTutor/data/user
+Environment=SOCARTES_TUTORBOT_ROOT=/path/to/DeepTutor/data/tutorbot
+Environment=SOCARTES_NOTEBOOK_ROOT=/path/to/DeepTutor/data/user/workspace/notebook
+Environment=SOCARTES_QUESTION_NOTEBOOK_ROOT=/path/to/DeepTutor/data/user/question_notebook
+Environment=SOCARTES_SKILLS_ROOT=/path/to/DeepTutor/data/user/workspace/skills
+Environment=SOCARTES_CO_WRITER_DOCS_ROOT=/path/to/DeepTutor/data/user/workspace/co-writer/documents
+Environment=CHAT_ATTACHMENT_DIR=/path/to/DeepTutor/data/user/workspace/chat/attachments
+```
+
+If `AUTH_ENABLED=true`, both processes must use the same `AUTH_SECRET`; if
+`POCKETBASE_URL` is configured, both processes must point at the same
+PocketBase instance. Otherwise sessions, users, course access, and chat history
+can split between the two backends.
 
 ## Docker
 
