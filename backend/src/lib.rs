@@ -335,6 +335,17 @@ struct TutorBotDetailQuery {
     include_secrets: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SessionListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyChatSessionListQuery {
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoryRagIndex {
     chunks: Vec<StoryChunk>,
@@ -1803,7 +1814,7 @@ fn router_with_state(state: AppState) -> Router {
             "/api/v1/sessions/{session_id}/quiz-results",
             post(record_quiz_results),
         )
-        .route("/api/v1/chat/sessions", get(list_sessions))
+        .route("/api/v1/chat/sessions", get(list_legacy_chat_sessions))
         .route(
             "/api/v1/chat/sessions/{session_id}",
             get(get_session).delete(delete_legacy_session),
@@ -21968,14 +21979,40 @@ async fn get_solve_session(
     }
 }
 
-async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionListQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     if session_pocketbase_enabled(&state) {
         return match session_summaries_pocketbase(&state).await {
-            Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
+            Ok(sessions) => Json(json!({ "sessions": paginate_values(sessions, limit, offset) }))
+                .into_response(),
             Err(error) => error.into_response(),
         };
     }
-    Json(json!({ "sessions": session_summaries(&state) })).into_response()
+    Json(json!({ "sessions": paginate_values(session_summaries(&state), limit, offset) }))
+        .into_response()
+}
+
+async fn list_legacy_chat_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<LegacyChatSessionListQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    if session_pocketbase_enabled(&state) {
+        return match session_summaries_pocketbase(&state).await {
+            Ok(sessions) => Json(Value::Array(paginate_values(sessions, limit, 0))).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
+    Json(Value::Array(paginate_values(
+        session_summaries(&state),
+        limit,
+        0,
+    )))
+    .into_response()
 }
 
 async fn get_session(
@@ -22027,7 +22064,7 @@ async fn delete_session(
 ) -> impl IntoResponse {
     if session_pocketbase_enabled(&state) {
         return match delete_session_pocketbase(&state, &session_id).await {
-            Ok(()) => Json(json!({ "deleted": true })).into_response(),
+            Ok(()) => Json(json!({ "deleted": true, "session_id": session_id })).into_response(),
             Err(error) => error.into_response(),
         };
     }
@@ -22036,7 +22073,7 @@ async fn delete_session(
         return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
     }
     match fs::remove_file(path) {
-        Ok(()) => Json(json!({ "deleted": true })).into_response(),
+        Ok(()) => Json(json!({ "deleted": true, "session_id": session_id })).into_response(),
         Err(error) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to delete session: {error}"),
@@ -22049,6 +22086,16 @@ async fn delete_legacy_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
+    if session_pocketbase_enabled(&state) {
+        return match delete_session_pocketbase(&state, &session_id).await {
+            Ok(()) => Json(json!({
+                "status": "deleted",
+                "session_id": session_id
+            }))
+            .into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     let path = session_path(&state, &session_id);
     if !path.exists() {
         return api_error(StatusCode::NOT_FOUND, "Session not found").into_response();
@@ -27352,6 +27399,10 @@ fn session_summaries(state: &AppState) -> Vec<Value> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     summaries
+}
+
+fn paginate_values(values: Vec<Value>, limit: usize, offset: usize) -> Vec<Value> {
+    values.into_iter().skip(offset).take(limit).collect()
 }
 
 async fn session_summaries_pocketbase(state: &AppState) -> Result<Vec<Value>, ApiError> {

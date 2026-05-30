@@ -2695,7 +2695,7 @@ async fn pocketbase_auth_mode_test_chat_turn_persists_chat_records_to_pb_not_loc
     assert_eq!(delete_response.status(), http::StatusCode::OK);
     assert_eq!(
         json_response(delete_response).await,
-        json!({"deleted": true})
+        json!({"deleted": true, "session_id": session_id})
     );
     for collection in ["sessions", "messages", "turns", "turn_events"] {
         assert!(
@@ -27929,6 +27929,179 @@ async fn legacy_chat_and_solve_delete_aliases_match_python_contract() {
         json_response(missing_delete).await["detail"],
         "Session not found"
     );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn sessions_list_paginates_and_delete_payload_matches_python_contract() {
+    let root = unique_test_knowledge_root();
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    for (session_id, updated_at) in [
+        ("session-old", 10.0),
+        ("session-middle", 20.0),
+        ("session-new", 30.0),
+    ] {
+        fs::write(
+            session_root.join(format!("{session_id}.json")),
+            json!({
+                "id": session_id,
+                "session_id": session_id,
+                "title": session_id,
+                "created_at": updated_at - 1.0,
+                "updated_at": updated_at,
+                "status": "idle",
+                "messages": [{"role": "assistant", "content": format!("last {session_id}")}],
+                "preferences": {},
+                "active_turns": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let app = app_with_knowledge_root(&root);
+
+    let page_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/sessions?limit=1&offset=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_response.status(), http::StatusCode::OK);
+    let page_payload = json_response(page_response).await;
+    let sessions = page_payload["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "session-middle");
+
+    let delete_response = app
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/sessions/session-middle")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_response).await,
+        json!({"deleted": true, "session_id": "session-middle"})
+    );
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_chat_sessions_list_returns_bare_limited_array_like_python() {
+    let root = unique_test_knowledge_root();
+    let session_root = test_data_root(&root).join("sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    for (session_id, updated_at) in [
+        ("legacy-chat-old", 10.0),
+        ("legacy-chat-middle", 20.0),
+        ("legacy-chat-new", 30.0),
+    ] {
+        fs::write(
+            session_root.join(format!("{session_id}.json")),
+            json!({
+                "id": session_id,
+                "session_id": session_id,
+                "title": session_id,
+                "created_at": updated_at - 1.0,
+                "updated_at": updated_at,
+                "status": "idle",
+                "messages": [{"role": "assistant", "content": format!("last {session_id}")}],
+                "preferences": {},
+                "active_turns": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let app = app_with_knowledge_root(&root);
+
+    let list_response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/v1/chat/sessions?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), http::StatusCode::OK);
+    let payload = json_response(list_response).await;
+    let sessions = payload.as_array().expect("legacy chat list returns array");
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0]["session_id"], "legacy-chat-new");
+    assert_eq!(sessions[1]["session_id"], "legacy-chat-middle");
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn legacy_chat_delete_removes_pocketbase_session_like_python_contract() {
+    let root = unique_test_knowledge_root();
+    let (pocketbase_url, pocketbase_state) = start_mock_pocketbase().await;
+    {
+        let mut records = pocketbase_state.collection_records.lock().await;
+        records.insert(
+            "sessions".to_string(),
+            vec![json!({
+                "id": "sessions-legacy-chat-pb-delete",
+                "session_id": "legacy-chat-pb-delete",
+                "title": "Legacy chat PB delete",
+                "status": "idle",
+                "created": "2026-05-30 00:00:00.000Z",
+                "updated": "2026-05-30 00:00:00.000Z",
+                "preferences_json": {}
+            })],
+        );
+        records.insert(
+            "messages".to_string(),
+            vec![json!({
+                "id": "messages-legacy-chat-pb-delete",
+                "session_id": "legacy-chat-pb-delete",
+                "role": "assistant",
+                "content": "delete me",
+                "msg_created_at": 1.0,
+                "metadata_json": {}
+            })],
+        );
+    }
+    let app = app_with_knowledge_root_and_pocketbase_auth(&root, pocketbase_url);
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/chat/sessions/legacy-chat-pb-delete")
+                .header(http::header::AUTHORIZATION, "Bearer pb.existing.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), http::StatusCode::OK);
+    assert_eq!(
+        json_response(delete_response).await,
+        json!({"status": "deleted", "session_id": "legacy-chat-pb-delete"})
+    );
+    for collection in ["sessions", "messages"] {
+        assert!(
+            mock_pocketbase_collection_records(&pocketbase_state, collection)
+                .await
+                .is_empty(),
+            "{collection} records should be deleted with the chat session"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
