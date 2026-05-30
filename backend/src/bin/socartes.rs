@@ -2970,7 +2970,7 @@ fn print_collection(value: &Value, key: &str, format: OutputFormat) -> CliResult
     let collection = if key.is_empty() {
         value.as_array()
     } else {
-        value[key].as_array()
+        value[key].as_array().or_else(|| value.as_array())
     };
     if let Some(items) = collection {
         if items.is_empty() {

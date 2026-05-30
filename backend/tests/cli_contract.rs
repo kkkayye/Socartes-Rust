@@ -290,6 +290,46 @@ async fn plugins_list_response() -> Json<Value> {
     }))
 }
 
+struct RealCliServer {
+    api_url: String,
+    data_root: std::path::PathBuf,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_real_cli_server(label: &str) -> RealCliServer {
+    let data_root = unique_temp_dir(label).join("data");
+    let knowledge_root = data_root.join("knowledge");
+    fs::create_dir_all(&knowledge_root).expect("knowledge root should be created");
+    let app = socartes_backend::app_with_knowledge_root_and_auth(knowledge_root, false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    RealCliServer {
+        api_url: format!("http://{address}"),
+        data_root,
+        server,
+    }
+}
+
+async fn wait_for_knowledge_task(api_url: &str, task_id: &str) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        reqwest::get(format!(
+            "{}/api/v1/knowledge/tasks/{}/stream",
+            api_url.trim_end_matches('/'),
+            task_id
+        ))
+        .await
+        .expect("task stream request should complete")
+        .text()
+        .await
+        .expect("task stream should be utf-8")
+    })
+    .await
+    .expect("knowledge task stream should finish")
+}
+
 #[test]
 fn top_level_help_exposes_python_cli_command_surface() {
     let stdout = stdout_for(&["--help"]);
@@ -2038,4 +2078,223 @@ async fn plugin_info_reads_tool_and_capability_entries_like_python_cli() {
             "planner",
         ],
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_notebook_memory_and_plugin_work_against_real_rust_backend() {
+    let real = spawn_real_cli_server("real-notebook-memory-plugin").await;
+    let markdown = unique_temp_dir("real-notebook-record").with_extension("md");
+    fs::write(
+        &markdown,
+        "# Imported Lesson\n\nRust CLI end-to-end record.",
+    )
+    .expect("markdown should be written");
+    let memory_root = real.data_root.join("memory");
+    fs::create_dir_all(&memory_root).expect("memory root should be created");
+    fs::write(
+        memory_root.join("SUMMARY.md"),
+        "Socartes memory summary from disk.",
+    )
+    .expect("summary memory should be written");
+
+    let create_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args([
+            "notebook",
+            "create",
+            "Rust CLI E2E",
+            "--description",
+            "real backend",
+        ])
+        .output()
+        .expect("socartes notebook create should execute");
+    assert!(
+        create_output.status.success(),
+        "notebook create failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&create_output.stdout),
+        String::from_utf8_lossy(&create_output.stderr)
+    );
+    let created: Value =
+        serde_json::from_slice(&create_output.stdout).expect("notebook create should print JSON");
+    let notebook_id = created["notebook"]["id"]
+        .as_str()
+        .expect("real backend should return notebook id")
+        .to_string();
+
+    let add_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["notebook", "add-md", &notebook_id])
+        .arg(&markdown)
+        .args(["--title", "Imported Lesson", "--type", "chat"])
+        .output()
+        .expect("socartes notebook add-md should execute");
+    assert!(
+        add_output.status.success(),
+        "notebook add-md failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let show_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["notebook", "show", &notebook_id, "--format", "json"])
+        .output()
+        .expect("socartes notebook show should execute");
+    assert!(
+        show_output.status.success(),
+        "notebook show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&show_output.stdout),
+        String::from_utf8_lossy(&show_output.stderr)
+    );
+    let shown: Value =
+        serde_json::from_slice(&show_output.stdout).expect("notebook show should print JSON");
+    assert_eq!(shown["name"], "Rust CLI E2E");
+    assert_eq!(shown["records"][0]["type"], "chat");
+    assert_eq!(shown["records"][0]["title"], "Imported Lesson");
+    assert_eq!(
+        shown["records"][0]["output"],
+        "# Imported Lesson\n\nRust CLI end-to-end record."
+    );
+
+    let memory_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["memory", "show", "summary"])
+        .output()
+        .expect("socartes memory show should execute");
+    assert!(
+        memory_output.status.success(),
+        "memory show failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&memory_output.stdout),
+        String::from_utf8_lossy(&memory_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(memory_output.stdout).unwrap(),
+        &["Socartes memory summary from disk."],
+    );
+
+    let clear_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["memory", "clear", "summary", "--force"])
+        .output()
+        .expect("socartes memory clear should execute");
+    assert!(
+        clear_output.status.success(),
+        "memory clear failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clear_output.stdout),
+        String::from_utf8_lossy(&clear_output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(memory_root.join("SUMMARY.md")).unwrap_or_default(),
+        ""
+    );
+
+    let plugin_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["plugin", "info", "rag"])
+        .output()
+        .expect("socartes plugin info should execute");
+    assert!(
+        plugin_output.status.success(),
+        "plugin info failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plugin_output.stdout),
+        String::from_utf8_lossy(&plugin_output.stderr)
+    );
+    assert_contains_all(
+        &String::from_utf8(plugin_output.stdout).unwrap(),
+        &["\"name\": \"rag\"", "Retrieval-Augmented Generation"],
+    );
+
+    real.server.abort();
+    let _ = fs::remove_file(markdown);
+    let _ = fs::remove_dir_all(real.data_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_kb_create_task_stream_and_search_work_against_real_rust_backend() {
+    let real = spawn_real_cli_server("real-kb").await;
+    let document = unique_temp_dir("real-kb-doc").with_extension("md");
+    fs::write(
+        &document,
+        "# Hidden Lesson\n\nThe Socartes Rust CLI e2e keyword is orrery-quartz.",
+    )
+    .expect("knowledge document should be written");
+
+    let create_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["kb", "create", "course-ai", "--doc"])
+        .arg(&document)
+        .output()
+        .expect("socartes kb create should execute");
+    assert!(
+        create_output.status.success(),
+        "kb create failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&create_output.stdout),
+        String::from_utf8_lossy(&create_output.stderr)
+    );
+    let created: Value =
+        serde_json::from_slice(&create_output.stdout).expect("kb create should print JSON");
+    let task_id = created["task_id"]
+        .as_str()
+        .expect("real backend should return a knowledge task id");
+    assert!(
+        task_id.starts_with("kb_init_"),
+        "Python-style create task id expected, got {task_id}"
+    );
+
+    let task_stream = wait_for_knowledge_task(&real.api_url, task_id).await;
+    assert_contains_all(&task_stream, &["event: process_log", "event: complete"]);
+
+    let list_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args(["kb", "list", "--format", "json"])
+        .output()
+        .expect("socartes kb list should execute");
+    assert!(
+        list_output.status.success(),
+        "kb list failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&list_output.stdout),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let listed: Value =
+        serde_json::from_slice(&list_output.stdout).expect("kb list should print JSON");
+    let names = listed
+        .as_array()
+        .expect("kb list should return the Python-compatible KB array")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"course-ai"),
+        "real backend list should include created KB: {listed}"
+    );
+
+    let search_output = socartes_cmd()
+        .env("SOCARTES_API_URL", &real.api_url)
+        .args([
+            "kb",
+            "search",
+            "course-ai",
+            "What is the e2e keyword?",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("socartes kb search should execute");
+    assert!(
+        search_output.status.success(),
+        "kb search failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let searched: Value =
+        serde_json::from_slice(&search_output.stdout).expect("kb search should print JSON");
+    let search_text = searched.to_string();
+    assert!(
+        search_text.contains("orrery-quartz"),
+        "real backend RAG search should cite indexed document: {searched}"
+    );
+
+    real.server.abort();
+    let _ = fs::remove_file(document);
+    let _ = fs::remove_dir_all(real.data_root);
 }

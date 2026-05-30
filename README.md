@@ -67,11 +67,17 @@ Expected behavior:
 
 ## CLI
 
-The Rust workspace includes a `socartes` CLI binary that mirrors the Python `socartes_cli` command surface:
+The Rust workspace includes a Clap-based CLI implementation in
+`backend/src/bin/socartes.rs`. It mirrors the Python `socartes_cli` command
+surface and also keeps the old DeepTutor command names as compatibility
+aliases.
 
 ```bash
 cd backend
 cargo run --bin socartes -- --help
+cargo run --bin socartes-cli -- --help
+cargo run --bin deeptutor -- --help
+cargo run --bin deeptutor-cli -- --help
 cargo run --bin socartes -- run chat "Explain retrieval-augmented generation" --tool rag --kb course-ai
 cargo run --bin socartes -- chat --session <session-id>
 ```
@@ -90,7 +96,17 @@ Implemented command groups:
 - `provider login`
 - `init wizard`
 
+Compatibility binary names:
+
+- `socartes` and `socartes-cli`
+- `deeptutor` and `deeptutor-cli`
+
 `chat --session` reloads saved session preferences before entering the REPL, matching the Python CLI behavior for capability, tools, knowledge bases, language, notebook references, and history references.
+
+The contract suite for this surface is `backend/tests/cli_contract.rs`. It
+checks more than help text: API paths, payload shapes, SSE rendering, REPL state
+mutation, `init wizard` filesystem side effects, provider login behavior, and
+`start` launcher cleanup semantics are covered there.
 
 ## Repository Structure
 
@@ -102,8 +118,14 @@ Implemented command groups:
 |   +-- src/
 |   |   +-- lib.rs
 |   |   +-- main.rs
+|   |   +-- bin/
+|   |       +-- socartes.rs
+|   |       +-- socartes_cli.rs
+|   |       +-- deeptutor.rs
+|   |       +-- deeptutor_cli.rs
 |   +-- tests/
 |       +-- api_contract.rs
+|       +-- cli_contract.rs
 |       +-- orchestrator_contract.rs
 +-- .gitignore
 +-- LICENSE
