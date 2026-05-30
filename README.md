@@ -76,8 +76,10 @@ aliases.
 cd backend
 cargo run --bin socartes -- --help
 cargo run --bin socartes-cli -- --help
+cargo run --bin socartes_cli -- --help
 cargo run --bin deeptutor -- --help
 cargo run --bin deeptutor-cli -- --help
+cargo run --bin deeptutor_cli -- --help
 cargo run --bin socartes -- run chat "Explain retrieval-augmented generation" --tool rag --kb course-ai
 cargo run --bin socartes -- chat --session <session-id>
 ```
@@ -98,10 +100,15 @@ Implemented command groups:
 
 Compatibility binary names:
 
-- `socartes` and `socartes-cli`
-- `deeptutor` and `deeptutor-cli`
+- `socartes`, `socartes-cli`, and `socartes_cli`
+- `deeptutor`, `deeptutor-cli`, and `deeptutor_cli`
 
 `chat --session` reloads saved session preferences before entering the REPL, matching the Python CLI behavior for capability, tools, knowledge bases, language, notebook references, and history references.
+
+Selected OpenAI-compatible chat providers now stream visible `/api/v1/ws`
+assistant content chunks when no native tool call is pending. Provider
+reasoning chunks remain hidden from visible content and are persisted in
+assistant metadata.
 
 The contract suite for this surface is `backend/tests/cli_contract.rs`. It
 checks more than help text: API paths, payload shapes, SSE rendering, REPL state
@@ -121,8 +128,10 @@ mutation, `init wizard` filesystem side effects, provider login behavior, and
 |   |   +-- bin/
 |   |       +-- socartes.rs
 |   |       +-- socartes_cli.rs
+|   |       +-- socartes_cli_underscore.rs
 |   |       +-- deeptutor.rs
 |   |       +-- deeptutor_cli.rs
+|   |       +-- deeptutor_cli_underscore.rs
 |   +-- tests/
 |       +-- api_contract.rs
 |       +-- cli_contract.rs

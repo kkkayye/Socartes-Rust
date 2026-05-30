@@ -11502,6 +11502,7 @@ struct ChatRuntimeSelection {
 #[derive(Debug, Clone)]
 struct ChatProviderResponse {
     content: Option<String>,
+    content_chunks: Vec<String>,
     tool_calls: Vec<Value>,
     usage: Option<Value>,
     reasoning_content: Option<String>,
@@ -11794,6 +11795,7 @@ fn should_use_openai_responses_api(selection: &ChatRuntimeSelection) -> bool {
 struct ChatCompletionBodyOptions<'a> {
     enabled_tools: &'a [String],
     additional_messages: &'a [Value],
+    stream_response: bool,
 }
 
 fn chat_completion_body(
@@ -11818,8 +11820,11 @@ fn chat_completion_body(
     let mut body = json!({
         "model": selection.model.as_str(),
         "messages": messages,
-        "stream": false
+        "stream": options.stream_response
     });
+    if options.stream_response {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     let tool_definitions = openai_chat_tool_definitions(selection, options.enabled_tools);
     if !tool_definitions.is_empty() {
         body["tools"] = Value::Array(tool_definitions);
@@ -11872,7 +11877,7 @@ fn responses_body_from_chat_completion(
         "model": chat_body["model"].as_str().unwrap_or(selection.model.as_str()),
         "instructions": instructions.join("\n\n"),
         "input": input,
-        "stream": false,
+        "stream": chat_body["stream"].as_bool().unwrap_or(false),
         "store": false
     });
     if let Some(max_output_tokens) = chat_body
@@ -12953,6 +12958,19 @@ fn parse_chat_provider_response_text(
     text: &str,
     use_responses_api: bool,
 ) -> Result<ChatProviderResponse, String> {
+    if looks_like_sse(text) {
+        let response = if use_responses_api {
+            parse_responses_provider_stream_response(text)
+        } else {
+            parse_chat_completion_stream_response(text)
+        }
+        .ok_or_else(|| "Chat completion stream did not include assistant content".to_string())?;
+        if response.content.is_none() && response.tool_calls.is_empty() {
+            return Err("Chat completion stream did not include assistant content".to_string());
+        }
+        return Ok(response);
+    }
+
     let payload = serde_json::from_str::<Value>(text)
         .map_err(|error| format!("Invalid JSON response: {error}"))?;
     let response = if use_responses_api {
@@ -12965,6 +12983,195 @@ fn parse_chat_provider_response_text(
         return Err("Chat completion response did not include assistant content".to_string());
     }
     Ok(response)
+}
+
+fn looks_like_sse(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+fn parse_sse_json_payloads(text: &str) -> Vec<(Option<String>, Value)> {
+    text.split("\n\n")
+        .filter_map(|block| {
+            let mut event = None::<String>;
+            let mut data_lines = Vec::new();
+            for line in block.lines() {
+                let line = line.trim_start();
+                if let Some(value) = line.strip_prefix("event:") {
+                    event = Some(value.trim().to_string());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    let value = value.trim_start();
+                    if value == "[DONE]" {
+                        return None;
+                    }
+                    data_lines.push(value);
+                }
+            }
+            if data_lines.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(&data_lines.join("\n"))
+                .ok()
+                .map(|payload| (event, payload))
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct StreamingToolCall {
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+}
+
+fn parse_chat_completion_stream_response(text: &str) -> Option<ChatProviderResponse> {
+    let mut content_chunks = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_calls = BTreeMap::<usize, StreamingToolCall>::new();
+    let mut usage = None;
+    let mut finish_reason = None;
+
+    for (_, payload) in parse_sse_json_payloads(text) {
+        if !payload["usage"].is_null() {
+            usage = Some(payload["usage"].clone());
+        }
+        for choice in payload["choices"].as_array().into_iter().flatten() {
+            if let Some(reason) = parse_chat_textish_field(&choice["delta"]["reasoning_content"])
+                .or_else(|| parse_chat_textish_field(&choice["delta"]["reasoning"]))
+            {
+                reasoning_parts.push(reason);
+            }
+            if let Some(content) = parse_chat_textish_field(&choice["delta"]["content"]) {
+                content_chunks.push(content);
+            }
+            if let Some(reason) = choice["finish_reason"].as_str()
+                && !reason.trim().is_empty()
+            {
+                finish_reason = Some(reason.to_string());
+            }
+            for call in choice["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let index = call["index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
+                let entry = tool_calls.entry(index).or_default();
+                if let Some(id) = call["id"].as_str().filter(|value| !value.is_empty()) {
+                    entry.id = id.to_string();
+                }
+                if let Some(kind) = call["type"].as_str().filter(|value| !value.is_empty()) {
+                    entry.kind = kind.to_string();
+                }
+                if let Some(name) = call["function"]["name"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                {
+                    entry.name = name.to_string();
+                }
+                if let Some(arguments) = call["function"]["arguments"].as_str() {
+                    entry.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    let content = (!content_chunks.is_empty()).then(|| content_chunks.join(""));
+    let normalized_tool_calls = tool_calls
+        .into_iter()
+        .filter_map(|(index, call)| {
+            (!call.name.is_empty()).then(|| {
+                json!({
+                    "id": if call.id.is_empty() { format!("call_{index}") } else { call.id },
+                    "type": if call.kind.is_empty() { "function" } else { call.kind.as_str() },
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(ChatProviderResponse {
+        content,
+        content_chunks,
+        tool_calls: normalized_tool_calls,
+        usage,
+        reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("")),
+        finish_reason,
+    })
+}
+
+fn parse_responses_provider_stream_response(text: &str) -> Option<ChatProviderResponse> {
+    let mut content_chunks = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut completed_response = None::<ChatProviderResponse>;
+    let mut usage = None;
+    let mut finish_reason = None;
+
+    for (event, payload) in parse_sse_json_payloads(text) {
+        let event_type = event
+            .as_deref()
+            .or_else(|| payload["type"].as_str())
+            .unwrap_or_default();
+        match event_type {
+            "response.output_text.delta" | "response.text.delta" => {
+                if let Some(delta) = payload["delta"].as_str() {
+                    content_chunks.push(delta.to_string());
+                }
+            }
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning.delta" => {
+                if let Some(delta) = payload["delta"].as_str() {
+                    reasoning_parts.push(delta.to_string());
+                }
+            }
+            "response.completed" => {
+                if let Some(response) = parse_responses_provider_response(&payload["response"]) {
+                    completed_response = Some(response);
+                }
+            }
+            _ => {}
+        }
+        if !payload["response"]["usage"].is_null() {
+            usage = responses_usage_as_chat_usage(&payload["response"]["usage"]);
+        } else if !payload["usage"].is_null() {
+            usage = responses_usage_as_chat_usage(&payload["usage"]);
+        }
+        if let Some(status) = payload["response"]["status"]
+            .as_str()
+            .or_else(|| payload["status"].as_str())
+        {
+            finish_reason = Some(status.to_string());
+        }
+    }
+
+    if let Some(mut response) = completed_response {
+        if !content_chunks.is_empty() {
+            response.content = Some(content_chunks.join(""));
+            response.content_chunks = content_chunks;
+        }
+        if !reasoning_parts.is_empty() {
+            response.reasoning_content = Some(reasoning_parts.join(""));
+        }
+        if usage.is_some() {
+            response.usage = usage;
+        }
+        if finish_reason.is_some() {
+            response.finish_reason = finish_reason;
+        }
+        return Some(response);
+    }
+
+    Some(ChatProviderResponse {
+        content: (!content_chunks.is_empty()).then(|| content_chunks.join("")),
+        content_chunks,
+        tool_calls: Vec::new(),
+        usage,
+        reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("")),
+        finish_reason,
+    })
 }
 
 fn apply_openai_compatible_request_headers(
@@ -13057,6 +13264,7 @@ fn parse_chat_completion_response(payload: &Value) -> Option<ChatProviderRespons
         .unwrap_or_default();
     Some(ChatProviderResponse {
         content,
+        content_chunks: Vec::new(),
         tool_calls,
         usage: (!payload["usage"].is_null()).then(|| payload["usage"].clone()),
         reasoning_content: parse_chat_reasoning_content(message),
@@ -13123,6 +13331,7 @@ fn parse_responses_provider_response(payload: &Value) -> Option<ChatProviderResp
     let usage = responses_usage_as_chat_usage(&payload["usage"]);
     Some(ChatProviderResponse {
         content,
+        content_chunks: Vec::new(),
         tool_calls,
         usage,
         reasoning_content: (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n")),
@@ -26634,6 +26843,12 @@ async fn run_chat_turn(
         let _ = send_rejected_turn_error(socket, &payload, &reason, false).await;
         return;
     }
+    if !payload["config"].is_object() {
+        payload["config"] = json!({});
+    }
+    if let Some(config) = payload["config"].as_object_mut() {
+        config.insert("_stream_provider".to_string(), json!(true));
+    }
 
     let stream_process = should_stream_chat_process(&payload);
     let seeded_identity = stream_process.then(|| {
@@ -27122,7 +27337,12 @@ async fn build_chat_turn_with_identity(
         };
     let mut provider_metadata = None;
     let mut provider_error = None;
+    let mut provider_content_chunks = Vec::<String>::new();
     if let Some(selection) = chat_selection.as_ref() {
+        let stream_first_response = payload["config"]["_stream_provider"]
+            .as_bool()
+            .unwrap_or(false)
+            && enabled_tools.is_empty();
         let body = chat_completion_body(
             selection,
             state,
@@ -27133,6 +27353,7 @@ async fn build_chat_turn_with_identity(
             ChatCompletionBodyOptions {
                 enabled_tools: &enabled_tools,
                 additional_messages: &[],
+                stream_response: stream_first_response,
             },
         );
         match call_chat_completion_provider(selection, body).await {
@@ -27145,6 +27366,7 @@ async fn build_chat_turn_with_identity(
                 });
                 let final_answer = if response.tool_calls.is_empty() {
                     merge_chat_provider_response_metadata(&mut metadata, &response);
+                    provider_content_chunks = response.content_chunks.clone();
                     response.content.clone().ok_or_else(|| {
                         "Chat completion response did not include assistant content".to_string()
                     })
@@ -27178,11 +27400,15 @@ async fn build_chat_turn_with_identity(
                         ChatCompletionBodyOptions {
                             enabled_tools: &[],
                             additional_messages: &additional_messages,
+                            stream_response: payload["config"]["_stream_provider"]
+                                .as_bool()
+                                .unwrap_or(false),
                         },
                     );
                     match call_chat_completion_provider(selection, body).await {
                         Ok(final_response) => {
                             merge_chat_provider_response_metadata(&mut metadata, &final_response);
+                            provider_content_chunks = final_response.content_chunks.clone();
                             final_response.content.clone().ok_or_else(|| {
                                 "Chat completion response after tool execution did not include assistant content"
                                     .to_string()
@@ -27303,15 +27529,30 @@ async fn build_chat_turn_with_identity(
             6,
         ));
     } else {
-        events.push(stream_event(
-            "content",
-            "executor",
-            "executor",
-            &trace.final_answer,
-            content_metadata,
-            ids,
-            5,
-        ));
+        if provider_content_chunks.is_empty() {
+            events.push(stream_event(
+                "content",
+                "executor",
+                "executor",
+                &trace.final_answer,
+                content_metadata,
+                ids,
+                5,
+            ));
+        } else {
+            for (index, chunk) in provider_content_chunks.iter().enumerate() {
+                events.push(stream_event(
+                    "content",
+                    "executor",
+                    "executor",
+                    chunk,
+                    content_metadata.clone(),
+                    ids,
+                    5 + index as u64,
+                ));
+            }
+        }
+        let terminal_seq = 5 + provider_content_chunks.len().max(1) as u64;
         events.push(stream_event(
             "stage_end",
             "critic",
@@ -27319,7 +27560,7 @@ async fn build_chat_turn_with_identity(
             "Critic approved the cited answer and reflection trace.",
             json!({ "review": trace.review }),
             ids,
-            6,
+            terminal_seq,
         ));
         events.push(stream_event(
             "done",
@@ -27328,7 +27569,7 @@ async fn build_chat_turn_with_identity(
             "",
             json!({ "status": "completed" }),
             ids,
-            7,
+            terminal_seq + 1,
         ));
     }
 
@@ -29338,6 +29579,7 @@ fn public_chat_request_config(payload: &Value) -> Option<Value> {
         "_regenerate",
         "_regenerated_from_message_id",
         "_superseded_turn_id",
+        "_stream_provider",
         "answer_now_context",
         "followup_question_context",
     ] {

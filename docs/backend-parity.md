@@ -28,6 +28,21 @@
 
 这更适合做迁移前的 coverage 审计，而不是做最终兼容性证明。
 
+## 2026-05-30 CLI 与 Streaming 增量
+
+本轮对 Python `deeptutor_cli` 做了只读对照，当前 Python 顶层命令面为
+`run/serve/chat/book/bot/kb/memory/plugin/config/session/notebook/provider`。
+Rust CLI 已在单一实现文件 `backend/src/bin/socartes.rs` 中覆盖这些命令组，
+并额外保留 Socartes 需要的 `start` 和 `init wizard`。兼容入口现在包括
+`socartes`、`socartes-cli`、`socartes_cli`、`deeptutor`、`deeptutor-cli`、
+`deeptutor_cli`，避免 Python module-style 下划线命名在 Rust 包中缺可执行入口。
+
+`/api/v1/ws` selected OpenAI-compatible LLM 的无工具首轮响应现在发送
+`stream: true` 和 `stream_options.include_usage: true`，可以解析 chat-completions
+SSE chunk：可见 `delta.content` 会按 chunk 逐条发 `content` 事件，完整答案仍合并后持久化；
+`delta.reasoning_content`/`delta.reasoning` 不进入可见答案，只进入 assistant metadata。
+带 native tool call 的首轮请求仍保持非流式，等 tool-call delta 聚合和 RAG 工具链事件完全补齐后再打开。
+
 ## 如何运行
 
 在 `/home/coobabm/Socartes-Rust` 下运行：

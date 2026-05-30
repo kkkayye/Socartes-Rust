@@ -1022,6 +1022,49 @@ async fn spawn_embedding_request_recorder(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn spawn_sse_request_recorder(
+    body: String,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_requests = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |headers: http::HeaderMap, uri: http::Uri, axum::Json(payload): axum::Json<Value>| {
+            let requests = Arc::clone(&handler_requests);
+            let body = body.clone();
+            async move {
+                let headers = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), json!(value)))
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                requests.lock().await.push(json!({
+                    "uri": uri.path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+                    "headers": headers,
+                    "payload": payload
+                }));
+                axum::response::Response::builder()
+                    .header(http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests, task)
+}
+
 async fn spawn_searxng_search_mock() -> (
     String,
     Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -19227,7 +19270,7 @@ async fn chat_ws_start_turn_uses_selected_openai_compatible_llm() {
     assert_eq!(recorded[0]["headers"]["authorization"], "Bearer llm-key");
     assert_eq!(recorded[0]["headers"]["x-socartes-test"], "llm-chat");
     assert_eq!(recorded[0]["payload"]["model"], "provider-chat-model");
-    assert_eq!(recorded[0]["payload"]["stream"], false);
+    assert_eq!(recorded[0]["payload"]["stream"], true);
     let messages = recorded[0]["payload"]["messages"].as_array().unwrap();
     assert!(messages.iter().any(|message| {
         message["role"] == "user"
@@ -19396,6 +19439,136 @@ async fn chat_ws_start_turn_preserves_selected_llm_usage_and_reasoning_metadata(
     );
     assert_eq!(content_event["metadata"]["finish_reason"], "stop");
 
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn chat_ws_start_turn_streams_selected_llm_chat_completion_chunks() {
+    let root = unique_test_knowledge_root();
+    let stream_body = [
+        r#"data: {"id":"chatcmpl-stream-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl-stream-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"Private provider reasoning stays metadata-only."},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl-stream-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Streamed "},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl-stream-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"provider answer."},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":5,"total_tokens":28}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let (llm_base_url, requests, llm_server) = spawn_sse_request_recorder(stream_body).await;
+    let app = app_with_knowledge_root(&root);
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "start_turn",
+                "content": "Use selected provider streaming.",
+                "language": "en",
+                "llm_selection": {
+                    "profile_id": "mock-llm",
+                    "model_id": "mock-model"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let events = collect_ws_json_until(&mut socket, "done").await;
+    let content_events = events
+        .iter()
+        .filter(|event| event["type"] == "content")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        content_events
+            .iter()
+            .filter_map(|event| event["content"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["Streamed ", "provider answer."]
+    );
+    assert!(content_events.iter().all(|event| {
+        !event["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Private provider reasoning")
+    }));
+    assert_eq!(
+        content_events[0]["metadata"]["reasoning_content"],
+        "Private provider reasoning stays metadata-only."
+    );
+    assert_eq!(content_events[0]["metadata"]["usage"]["total_tokens"], 28);
+    assert_eq!(events.last().unwrap()["metadata"]["status"], "completed");
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["uri"], "/v1/chat/completions");
+    assert_eq!(recorded[0]["payload"]["stream"], true);
+    drop(recorded);
+
+    let session_id = events[0]["session_id"].as_str().unwrap().to_string();
+    let detail_response = app_with_knowledge_root(&root)
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), http::StatusCode::OK);
+    let detail = json_response(detail_response).await;
+    let assistant = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(assistant["content"], "Streamed provider answer.");
+    assert_eq!(
+        assistant["metadata"]["reasoning_content"],
+        "Private provider reasoning stays metadata-only."
+    );
+    let user = detail["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("user message");
+    assert!(
+        user["metadata"]["request_snapshot"]["config"]["_stream_provider"].is_null(),
+        "internal streaming switch must not leak into persisted request snapshots"
+    );
+
+    server.abort();
     llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }

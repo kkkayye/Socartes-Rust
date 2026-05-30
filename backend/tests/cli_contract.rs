@@ -24,12 +24,20 @@ fn socartes_cli_cmd() -> Command {
     Command::cargo_bin("socartes-cli").expect("socartes-cli binary alias should build")
 }
 
+fn socartes_cli_underscore_cmd() -> Command {
+    Command::cargo_bin("socartes_cli").expect("socartes_cli binary alias should build")
+}
+
 fn deeptutor_cmd() -> Command {
     Command::cargo_bin("deeptutor").expect("deeptutor compatibility binary should build")
 }
 
 fn deeptutor_cli_cmd() -> Command {
     Command::cargo_bin("deeptutor-cli").expect("deeptutor-cli compatibility binary should build")
+}
+
+fn deeptutor_cli_underscore_cmd() -> Command {
+    Command::cargo_bin("deeptutor_cli").expect("deeptutor_cli compatibility binary should build")
 }
 
 fn stdout_for(args: &[&str]) -> String {
@@ -412,6 +420,46 @@ fn deeptutor_compatibility_aliases_expose_same_cli_surface() {
                 "Socartes CLI",
                 "run",
                 "start",
+                "serve",
+                "chat",
+                "book",
+                "bot",
+                "kb",
+                "notebook",
+                "memory",
+                "plugin",
+                "config",
+                "session",
+                "provider",
+                "init",
+            ],
+        );
+    }
+}
+
+#[test]
+fn python_module_style_underscore_aliases_expose_same_cli_surface() {
+    for mut command in [
+        socartes_cli_underscore_cmd(),
+        deeptutor_cli_underscore_cmd(),
+    ] {
+        let output = command
+            .arg("--help")
+            .output()
+            .expect("underscore CLI compatibility alias should run");
+
+        assert!(
+            output.status.success(),
+            "underscore CLI compatibility alias --help failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+        assert_contains_all(
+            &stdout,
+            &[
+                "Socartes CLI",
+                "run",
                 "serve",
                 "chat",
                 "book",
