@@ -532,6 +532,7 @@ async fn start_launcher(args: StartArgs) -> CliResult {
     if args.dry_run {
         return print_json(&plan);
     }
+    cleanup_previous_start_state(&plan);
 
     let frontend_dir = PathBuf::from(plan["frontend"]["cwd"].as_str().unwrap_or_default());
     let api_base = plan["frontend"]["env"]["NEXT_PUBLIC_API_BASE"]
@@ -1049,6 +1050,111 @@ fn remove_start_state(plan: &Value) {
         let _ = fs::remove_file(path);
     }
 }
+
+fn cleanup_previous_start_state(plan: &Value) {
+    let Some(path) = plan["state_path"].as_str() else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let state = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let Some(state) = state else {
+        let _ = fs::remove_file(path);
+        return;
+    };
+    let records = start_state_process_records(&state);
+    if !records.is_empty() {
+        eprintln!("Found a stale Socartes launch state; cleaning it up first ...");
+        terminate_start_state_records(&records, Duration::from_secs(1));
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn start_state_process_records(state: &Value) -> Vec<(Option<u32>, Option<u32>)> {
+    state["processes"]
+        .as_object()
+        .into_iter()
+        .flat_map(|processes| processes.values())
+        .filter_map(|record| {
+            let pid = record["pid"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok());
+            let pgid = record["pgid"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok());
+            (pid.is_some() || pgid.is_some()).then_some((pid, pgid))
+        })
+        .collect()
+}
+
+fn terminate_start_state_records(records: &[(Option<u32>, Option<u32>)], grace: Duration) {
+    let mut seen = Vec::<(Option<u32>, Option<u32>)>::new();
+    for record in records {
+        if !seen.contains(record) {
+            seen.push(*record);
+        }
+    }
+    for (pid, pgid) in &seen {
+        signal_recorded_process(*pid, *pgid, "TERM");
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if seen.iter().all(|(pid, _)| !recorded_pid_alive(*pid)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for (pid, pgid) in &seen {
+        if recorded_pid_alive(*pid) {
+            signal_recorded_process(*pid, *pgid, "KILL");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn recorded_pid_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn recorded_pid_alive(_pid: Option<u32>) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn signal_recorded_process(pid: Option<u32>, pgid: Option<u32>, signal: &str) {
+    let current_pid = std::process::id();
+    if let Some(pgid) = pgid.filter(|pgid| *pgid != current_pid) {
+        let status = std::process::Command::new("kill")
+            .args([format!("-{signal}"), format!("-{pgid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
+            return;
+        }
+    }
+    if let Some(pid) = pid.filter(|pid| *pid != current_pid) {
+        let _ = std::process::Command::new("kill")
+            .args([format!("-{signal}"), pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_recorded_process(_pid: Option<u32>, _pgid: Option<u32>, _signal: &str) {}
 
 fn cleanup_started_processes(
     plan: &Value,

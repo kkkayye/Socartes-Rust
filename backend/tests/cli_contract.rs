@@ -805,6 +805,109 @@ fn start_cleans_backend_and_state_when_backend_readiness_times_out() {
 }
 
 #[test]
+fn start_cleans_stale_recorded_processes_before_launch_like_python_launcher() {
+    let project = unique_temp_dir("start-stale-state");
+    let frontend = project.join("web");
+    let backend_stub = project.join("backend-stub.sh");
+    let frontend_stub = project.join("frontend-stub.sh");
+    let backend_pid = project.join("backend.pid");
+    let state_path = project.join("data/user/settings/start_web_state.json");
+    let backend_port = free_tcp_port();
+    let frontend_port = free_tcp_port();
+    fs::create_dir_all(&frontend).expect("frontend dir should be created");
+    fs::write(
+        &backend_stub,
+        format!(
+            "#!/bin/sh\nexec >/dev/null 2>/dev/null\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            backend_pid.display()
+        ),
+    )
+    .expect("backend stub should be written");
+    fs::write(&frontend_stub, "#!/bin/sh\nsleep 30\n").expect("frontend stub should be written");
+    make_executable(&backend_stub);
+    make_executable(&frontend_stub);
+
+    let mut stale_backend = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("stale backend process should start");
+    let mut stale_frontend = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("stale frontend process should start");
+    fs::create_dir_all(state_path.parent().unwrap()).expect("state dir should be created");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "created_at": "2026-05-30T00:00:00Z",
+            "backend_port": backend_port,
+            "frontend_port": frontend_port,
+            "processes": {
+                "backend": {"pid": stale_backend.id(), "pgid": null},
+                "frontend": {"pid": stale_frontend.id(), "pgid": null}
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("stale state should be written");
+
+    let output = socartes_cmd()
+        .current_dir(&project)
+        .env("SOCARTES_START_BACKEND_COMMAND", &backend_stub)
+        .env("SOCARTES_START_FRONTEND_COMMAND", &frontend_stub)
+        .env("SOCARTES_START_BACKEND_READY_TIMEOUT_MS", "25")
+        .args([
+            "start",
+            "--port",
+            &backend_port.to_string(),
+            "--frontend-port",
+            &frontend_port.to_string(),
+        ])
+        .output()
+        .expect("socartes start should execute");
+
+    let stale_backend_exited = stale_backend
+        .try_wait()
+        .expect("stale backend status should be readable")
+        .is_some();
+    let stale_frontend_exited = stale_frontend
+        .try_wait()
+        .expect("stale frontend status should be readable")
+        .is_some();
+    if !stale_backend_exited {
+        let _ = stale_backend.kill();
+    }
+    if !stale_frontend_exited {
+        let _ = stale_frontend.kill();
+    }
+    let _ = stale_backend.wait();
+    let _ = stale_frontend.wait();
+
+    assert!(
+        !output.status.success(),
+        "backend readiness timeout should still fail after stale cleanup:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_process_stopped(read_pid(&backend_pid));
+    assert!(
+        stale_backend_exited,
+        "stale backend process should be stopped before new launch"
+    );
+    assert!(
+        stale_frontend_exited,
+        "stale frontend process should be stopped before new launch"
+    );
+    assert!(
+        !state_path.exists(),
+        "state file should be removed after failed launch cleanup"
+    );
+
+    let _ = fs::remove_dir_all(project);
+}
+
+#[test]
 fn start_cleans_started_processes_when_frontend_readiness_times_out() {
     let project = unique_temp_dir("start-frontend-timeout");
     let frontend = project.join("web");
