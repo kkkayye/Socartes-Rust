@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -52,7 +56,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run CLI contract tests
-        run: cargo test --locked --test cli_contract
+        run: timeout 10m cargo test --locked --test cli_contract -- --test-threads=1
 
       - name: Run API contract tests
         run: cargo test --locked --test api_contract
