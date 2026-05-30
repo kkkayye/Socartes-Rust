@@ -1318,6 +1318,12 @@ impl TutorbotRuntimeInstance {
     }
 }
 
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 impl AppState {
     fn new(knowledge_root: PathBuf, auth_config: AuthRuntimeConfig) -> Self {
         let data_root = knowledge_root
@@ -1331,9 +1337,7 @@ impl AppState {
         let session_root = env::var_os("SOCARTES_SESSION_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("sessions"));
-        let session_sqlite_db = env::var_os("SOCARTES_SESSION_SQLITE_DB")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty());
+        let session_sqlite_db = non_empty_env_path("SOCARTES_SESSION_SQLITE_DB");
         let book_root = env::var_os("SOCARTES_BOOK_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| user_data_root.join("workspace").join("book"));
@@ -1343,9 +1347,8 @@ impl AppState {
         let settings_root = env::var_os("SOCARTES_SETTINGS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| user_data_root.join("settings"));
-        let attachment_root = env::var_os("CHAT_ATTACHMENT_DIR")
-            .or_else(|| env::var_os("SOCARTES_ATTACHMENT_ROOT"))
-            .map(PathBuf::from)
+        let attachment_root = non_empty_env_path("CHAT_ATTACHMENT_DIR")
+            .or_else(|| non_empty_env_path("SOCARTES_ATTACHMENT_ROOT"))
             .unwrap_or_else(|| {
                 user_data_root
                     .join("workspace")

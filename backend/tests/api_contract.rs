@@ -38,6 +38,7 @@ static SEARCH_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static BOOK_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static MATH_ANIMATOR_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static SESSION_SQLITE_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static ATTACHMENT_ENV_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SEARCH_ENV_KEYS: &[&str] = &[
     "SEARCH_PROVIDER",
     "BRAVE_SEARCH_API_KEY",
@@ -68,6 +69,12 @@ struct MathAnimatorEnvGuard {
 
 struct SessionSqliteEnvGuard {
     saved_db: Option<String>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+struct AttachmentEnvGuard {
+    saved_chat_attachment_dir: Option<String>,
+    saved_socartes_attachment_root: Option<String>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -142,6 +149,43 @@ impl Drop for SessionSqliteEnvGuard {
             match &self.saved_db {
                 Some(value) => std::env::set_var("SOCARTES_SESSION_SQLITE_DB", value),
                 None => std::env::remove_var("SOCARTES_SESSION_SQLITE_DB"),
+            }
+        }
+    }
+}
+
+impl AttachmentEnvGuard {
+    async fn with_empty_chat_attachment_dir() -> Self {
+        let guard = ATTACHMENT_ENV_MUTEX
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let saved_chat_attachment_dir = std::env::var("CHAT_ATTACHMENT_DIR").ok();
+        let saved_socartes_attachment_root = std::env::var("SOCARTES_ATTACHMENT_ROOT").ok();
+        // SAFETY: tests that mutate attachment env vars hold ATTACHMENT_ENV_MUTEX.
+        unsafe {
+            std::env::set_var("CHAT_ATTACHMENT_DIR", "");
+            std::env::remove_var("SOCARTES_ATTACHMENT_ROOT");
+        }
+        Self {
+            saved_chat_attachment_dir,
+            saved_socartes_attachment_root,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for AttachmentEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: ATTACHMENT_ENV_MUTEX is still held while this guard restores variables.
+        unsafe {
+            match &self.saved_chat_attachment_dir {
+                Some(value) => std::env::set_var("CHAT_ATTACHMENT_DIR", value),
+                None => std::env::remove_var("CHAT_ATTACHMENT_DIR"),
+            }
+            match &self.saved_socartes_attachment_root {
+                Some(value) => std::env::set_var("SOCARTES_ATTACHMENT_ROOT", value),
+                None => std::env::remove_var("SOCARTES_ATTACHMENT_ROOT"),
             }
         }
     }
@@ -11272,6 +11316,36 @@ async fn attachment_preview_route_serves_local_chat_files_like_python_contract()
         .await
         .unwrap();
     assert_eq!(traversal_response.status(), http::StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn empty_chat_attachment_dir_uses_shared_default_attachment_root() {
+    let _env = AttachmentEnvGuard::with_empty_chat_attachment_dir().await;
+    let root = unique_test_knowledge_root();
+    let attachment_dir = test_data_root(&root)
+        .join("user")
+        .join("workspace")
+        .join("chat")
+        .join("attachments")
+        .join("session-empty-env");
+    fs::create_dir_all(&attachment_dir).unwrap();
+    fs::write(attachment_dir.join("att-empty_notes.txt"), b"default-root").unwrap();
+
+    let app = app_with_knowledge_root(&root);
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/attachments/session-empty-env/att-empty/notes.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(text_response(response).await, "default-root");
 
     let _ = std::fs::remove_dir_all(test_data_root(&root));
 }
