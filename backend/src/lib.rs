@@ -4489,7 +4489,7 @@ async fn regenerate_book_block(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    match regenerate_book_block_record(&state, &request) {
+    match regenerate_book_block_record(&state, &request).await {
         Ok(block) => Json(json!({ "block": block })).into_response(),
         Err(error) => error.into_response(),
     }
@@ -5995,7 +5995,7 @@ async fn handle_book_ws(state: AppState, mut socket: WebSocket) {
                         {
                             return;
                         }
-                        match regenerate_book_block_record(&state, &data) {
+                        match regenerate_book_block_record(&state, &data).await {
                             Ok(block) => {
                                 if !send_book_ws_json(
                                     &mut socket,
@@ -6027,6 +6027,20 @@ async fn handle_book_ws(state: AppState, mut socket: WebSocket) {
                                 }
                             }
                             Err(error) => {
+                                if error.0 == StatusCode::NOT_FOUND {
+                                    if !send_book_ws_json(
+                                        &mut socket,
+                                        json!({
+                                            "type": "regenerate_block_result",
+                                            "block": Value::Null
+                                        }),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 if !send_book_ws_api_error(
                                     &mut socket,
                                     "Book block regeneration failed",
@@ -9267,7 +9281,10 @@ fn mark_missing_concept_graph_payload(block: &mut Value) {
     block["updated_at"] = json!(now_seconds());
 }
 
-fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Value, ApiError> {
+async fn regenerate_book_block_record(
+    state: &AppState,
+    request: &Value,
+) -> Result<Value, ApiError> {
     let book_id = request["book_id"]
         .as_str()
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "book_id is required"))?;
@@ -9280,7 +9297,6 @@ fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Val
     let book = load_book_manifest(state, book_id)?;
     let spine = load_book_json(state, book_id, "spine.json")?;
     let mut page = load_book_page(state, book_id, page_id)?;
-    let page_context = page.clone();
     let chapter = book_chapter_for_page(&spine, &page, page_id).unwrap_or_else(|| {
         json!({
             "id": page["chapter_id"].as_str().unwrap_or("chapter-1"),
@@ -9294,7 +9310,7 @@ fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Val
         })
     });
 
-    let block = {
+    let (block_index, block) = {
         let blocks = page["blocks"]
             .as_array_mut()
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Block not found"))?;
@@ -9310,34 +9326,30 @@ fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Val
             merge_object_value(&mut block["params"], params);
         }
 
-        let block_type = block["type"].as_str().unwrap_or("text").to_string();
-        let title = block["title"].as_str().unwrap_or("Block").to_string();
-        let params = block["params"].clone();
-        if block_type == "concept_graph" && params["concept_graph"].is_null() {
-            mark_missing_concept_graph_payload(block);
-        } else {
-            block["status"] = json!("ready");
-            block["payload"] = generated_payload_for_existing_book_block(
-                &book,
-                &chapter,
-                &page_context,
-                &block_type,
-                &title,
-                &params,
-            );
-            block["error"] = json!("");
-            merge_object_value(
-                &mut block["metadata"],
-                &metadata_for_generated_existing_book_block(&book, &block_type, &params),
-            );
-            if let Some(metadata) = block["metadata"].as_object_mut() {
-                metadata.remove("failure");
-            }
-            block["updated_at"] = json!(now_seconds());
-        }
-        block["metadata"]["regenerated"] = json!(true);
-        block.clone()
+        (index, block.clone())
     };
+    let page_context = page.clone();
+    let mut regenerated_block =
+        if book_block_regenerate_can_use_llm_provider(&chapter, &page, &block)
+            && let Ok(Some(selection)) =
+                active_chat_selection(&load_settings_catalog(state), &request["llm_selection"])
+        {
+            generate_book_block_with_provider(&book, &chapter, &page_context, &block, &selection)
+                .await
+        } else {
+            regenerate_book_block_static(&book, &chapter, &page_context, block)
+        };
+    regenerated_block["metadata"]["regenerated"] = json!(true);
+
+    {
+        let blocks = page["blocks"]
+            .as_array_mut()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Block not found"))?;
+        if block_index >= blocks.len() {
+            return Err(api_error(StatusCode::NOT_FOUND, "Block not found"));
+        }
+        blocks[block_index] = regenerated_block.clone();
+    }
 
     let status = compiled_book_page_status(&page);
     page["status"] = json!(status);
@@ -9345,7 +9357,55 @@ fn regenerate_book_block_record(state: &AppState, request: &Value) -> Result<Val
     page["updated_at"] = json!(now_seconds());
     write_book_page(state, book_id, &page)?;
     refresh_book_counts(state, book_id)?;
-    Ok(block)
+    Ok(regenerated_block)
+}
+
+fn book_block_regenerate_can_use_llm_provider(
+    chapter: &Value,
+    page: &Value,
+    block: &Value,
+) -> bool {
+    if !book_page_can_use_llm_provider(chapter, page) {
+        return false;
+    }
+    !matches!(
+        block["type"].as_str().unwrap_or("text"),
+        "concept_graph" | "user_note"
+    )
+}
+
+fn regenerate_book_block_static(
+    book: &Value,
+    chapter: &Value,
+    page_context: &Value,
+    mut block: Value,
+) -> Value {
+    let block_type = block["type"].as_str().unwrap_or("text").to_string();
+    let title = block["title"].as_str().unwrap_or("Block").to_string();
+    let params = block["params"].clone();
+    if block_type == "concept_graph" && params["concept_graph"].is_null() {
+        mark_missing_concept_graph_payload(&mut block);
+    } else {
+        block["status"] = json!("ready");
+        block["payload"] = generated_payload_for_existing_book_block(
+            book,
+            chapter,
+            page_context,
+            &block_type,
+            &title,
+            &params,
+        );
+        block["error"] = json!("");
+        merge_object_value(
+            &mut block["metadata"],
+            &metadata_for_generated_existing_book_block(book, &block_type, &params),
+        );
+        if let Some(metadata) = block["metadata"].as_object_mut() {
+            metadata.remove("failure");
+        }
+        block["updated_at"] = json!(now_seconds());
+    }
+    block
 }
 
 fn metadata_for_generated_existing_book_block(

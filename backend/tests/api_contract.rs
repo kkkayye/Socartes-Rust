@@ -24433,6 +24433,123 @@ async fn book_ws_streams_python_results_for_remaining_generation_actions() {
 }
 
 #[tokio::test]
+async fn book_ws_regenerate_missing_block_returns_null_result_like_python() {
+    let root = unique_test_knowledge_root();
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_ws-missing-regenerate-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "ws-missing-regenerate-book",
+            "title": "WS Missing Regenerate Book",
+            "description": "Missing regenerate targets should return null over WS.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": [],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "ws-missing-regenerate-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Ready chapter",
+                "summary": "Already compiled.",
+                "content_type": "theory",
+                "learning_objectives": [],
+                "source_anchors": [],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "ws-missing-regenerate-book",
+            "chapter_id": "chapter-1",
+            "title": "Ready page",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": [],
+            "blocks": [{
+                "id": "block-1",
+                "type": "section",
+                "title": "Existing block",
+                "status": "ready",
+                "payload": { "body": "Existing content" },
+                "params": {},
+                "metadata": {},
+                "source_anchors": [],
+                "error": "",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app_with_knowledge_root(server_root))
+            .await
+            .unwrap();
+    });
+
+    let (mut socket, _) = connect_async(format!("ws://{addr}/api/v1/book/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(TungsteniteMessage::Text(
+            json!({
+                "type": "regenerate_block",
+                "book_id": "ws-missing-regenerate-book",
+                "page_id": "page-1",
+                "block_id": "missing-block"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let events = collect_book_ws_events_until(&mut socket, "regenerate_block_result").await;
+    assert!(
+        !events.iter().any(|event| event["type"] == "error"),
+        "Python book WS returns a null result instead of an error frame for missing regenerate targets: {events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "regenerate_block_result")
+        .expect("regenerate_block_result");
+    assert!(result["block"].is_null());
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
 async fn book_ws_compile_ready_page_without_force_is_idempotent_like_python() {
     let root = unique_test_knowledge_root();
     let book_root = test_book_root(&root);
@@ -24860,6 +24977,205 @@ async fn book_compile_page_calls_selected_provider_and_preserves_source_anchors_
         }),
         "provider-backed Book blocks should preserve chapter/source anchors: {blocks:?}"
     );
+
+    llm_server.abort();
+    let _ = std::fs::remove_dir_all(test_data_root(&root));
+}
+
+#[tokio::test]
+async fn book_regenerate_block_calls_selected_provider_and_preserves_source_anchors_like_python() {
+    let root = unique_test_knowledge_root();
+    let app = app_with_knowledge_root(&root);
+    let (llm_base_url, requests, llm_server) =
+        spawn_sequential_request_recorder(vec![json!({
+            "id": "book-regenerate-provider-response",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Provider-regenerated section: quorum clocks reconcile conflicting writes by comparing retrieved version evidence."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 51,
+                "completion_tokens": 17,
+                "total_tokens": 68
+            }
+        })])
+        .await;
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings/catalog")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "catalog": llm_test_catalog(&format!("{llm_base_url}/v1")) })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), http::StatusCode::OK);
+
+    let book_root = test_book_root(&root);
+    let book_dir = book_root.join("book_regenerate-provider-book");
+    fs::create_dir_all(book_dir.join("pages")).unwrap();
+    fs::write(
+        book_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "regenerate-provider-book",
+            "title": "Provider Regenerate Book",
+            "description": "Regenerate should use the selected model instead of static Rust filler.",
+            "status": "ready",
+            "proposal": {},
+            "knowledge_bases": ["tiny-course"],
+            "language": "en",
+            "page_count": 1,
+            "chapter_count": 1,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+            "metadata": { "page_chat_sessions": {} },
+            "kb_fingerprints": {},
+            "stale_page_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("spine.json"),
+        serde_json::to_vec_pretty(&json!({
+            "book_id": "regenerate-provider-book",
+            "chapters": [{
+                "id": "chapter-1",
+                "title": "Distributed Systems",
+                "summary": "Regenerate selected blocks with retrieved course evidence.",
+                "content_type": "theory",
+                "learning_objectives": ["Explain regenerated quorum evidence"],
+                "source_anchors": [{
+                    "kind": "kb",
+                    "ref": "tiny-course:regeneration-note",
+                    "snippet": "Regeneration must cite the same quorum version evidence used by the course note."
+                }],
+                "order": 1,
+                "page_ids": ["page-1"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        book_dir.join("pages").join("page-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "page-1",
+            "book_id": "regenerate-provider-book",
+            "chapter_id": "chapter-1",
+            "title": "Regenerate quorum clocks",
+            "content_type": "theory",
+            "order": 1,
+            "learning_objectives": ["Explain regenerated quorum evidence"],
+            "blocks": [{
+                "id": "section-block",
+                "type": "section",
+                "title": "Quorum evidence",
+                "status": "ready",
+                "payload": {
+                    "format": "section",
+                    "intro": "Static stale body",
+                    "subsections": []
+                },
+                "params": {
+                    "role": "explanation",
+                    "topic": "quorum clocks"
+                },
+                "metadata": {
+                    "generator": "rust_static_book_compiler",
+                    "failure": { "kind": "old_failure" }
+                },
+                "source_anchors": [],
+                "error": "old error",
+                "created_at": 1.0,
+                "updated_at": 2.0
+            }],
+            "status": "ready",
+            "error": "",
+            "created_at": 1.0,
+            "updated_at": 2.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/book/books/regenerate-block")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "book_id": "regenerate-provider-book",
+                        "page_id": "page-1",
+                        "block_id": "section-block",
+                        "params_override": { "role": "critic-loop" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let block = json_response(response).await["block"].clone();
+
+    let captured = requests.lock().await.clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "Book regenerate-block should call the selected LLM provider once"
+    );
+    let provider_request = captured[0]["payload"].to_string();
+    assert!(provider_request.contains("provider-chat-model"));
+    assert!(provider_request.contains("Provider Regenerate Book"));
+    assert!(provider_request.contains("Regenerate quorum clocks"));
+    assert!(provider_request.contains("Distributed Systems"));
+    assert!(provider_request.contains("critic-loop"));
+    assert!(provider_request.contains("tiny-course:regeneration-note"));
+    assert!(provider_request.contains("Regeneration must cite"));
+
+    assert_eq!(block["id"], "section-block");
+    assert_eq!(block["status"], "ready");
+    assert_eq!(block["error"], "");
+    assert_eq!(block["params"]["role"], "critic-loop");
+    assert_eq!(block["metadata"]["generator"], "selected_llm_provider");
+    assert_eq!(block["metadata"]["regenerated"], true);
+    assert_eq!(block["metadata"]["profile_id"], "mock-llm");
+    assert_eq!(block["metadata"]["model_id"], "mock-model");
+    assert_eq!(block["metadata"]["model"], "provider-chat-model");
+    assert_eq!(block["metadata"]["usage"]["total_tokens"], 68);
+    assert!(!json_object_has_key(&block["metadata"], "failure"));
+    assert!(
+        block["payload"]["subsections"][0]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Provider-regenerated section"))
+    );
+    assert_eq!(
+        block["source_anchors"],
+        json!([{
+            "kind": "kb",
+            "ref": "tiny-course:regeneration-note",
+            "snippet": "Regeneration must cite the same quorum version evidence used by the course note."
+        }])
+    );
+
+    let saved_page: Value =
+        serde_json::from_slice(&fs::read(book_dir.join("pages").join("page-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved_page["blocks"][0], block);
+    assert_eq!(saved_page["status"], "ready");
+    assert_eq!(saved_page["error"], "");
 
     llm_server.abort();
     let _ = std::fs::remove_dir_all(test_data_root(&root));
